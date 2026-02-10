@@ -9,8 +9,11 @@ dependencies = [
     "paddlepaddle-gpu==3.0.0",
     "setuptools>=80.9.0",
     "uvicorn>=0.34.3",
-    "opencv-python",
+    "opencv-contrib-python",
+    "pypdfium2",
+    "scikit-image",
     "pydantic",
+    "paddlex",
 ]
 
 [[tool.uv.index]]
@@ -24,3 +27,4 @@ url = "https://www.paddlepaddle.org.cn/packages/stable/cu126/"
 
 [tool.uv.sources]
 paddlepaddle-gpu = { index = "paddle" }
+paddlex = { path = "./PaddleX" }

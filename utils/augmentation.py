@@ -259,113 +259,131 @@ class DataAugmentor:
                 
         return image, annotations
 
-    def _apply_pitch_yaw(self, image: np.ndarray, annotations: List[Dict[str, Any]], pitch: float = None, yaw: float = None) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
+    def _apply_pitch_yaw(self, image, annotations, pitch=0, yaw=0):
         """
-        实现俯视 (Pitch) 和 仰视 (Yaw) 效果
-        :param pitch: 俯仰角 (度)
-        :param yaw: 偏航角 (度)
+        使用 3D 投影变换实现俯视 (pitch) 和 侧视 (yaw) 效果，并保持图像内容完整 (自适应缩放)
         """
-        if pitch is None:
-            cfg = self.config.get("pitch", {})
-            pitch = random.uniform(*cfg.get("range", [-20, 20])) if "range" in cfg else 0
-        if yaw is None:
-            cfg = self.config.get("yaw", {})
-            yaw = random.uniform(*cfg.get("range", [-20, 20])) if "range" in cfg else 0
-
         h, w = image.shape[:2]
         
-        # 1. 计算相机矩阵
-        # 焦距近似值
-        f = max(w, h)
-        # 相机内参矩阵
+        # 1. 转换为弧度
+        pitch_rad = np.deg2rad(pitch)
+        yaw_rad = np.deg2rad(yaw)
+        
+        # 2. 定义 3D 旋转矩阵
+        # Rx: 绕 X 轴旋转 (Pitch)
+        Rx = np.array([
+            [1, 0, 0],
+            [0, np.cos(pitch_rad), -np.sin(pitch_rad)],
+            [0, np.sin(pitch_rad), np.cos(pitch_rad)]
+        ])
+        
+        # Ry: 绕 Y 轴旋转 (Yaw)
+        Ry = np.array([
+            [np.cos(yaw_rad), 0, np.sin(yaw_rad)],
+            [0, 1, 0],
+            [-np.sin(yaw_rad), 0, np.cos(yaw_rad)]
+        ])
+        
+        R = Ry @ Rx # 先 Pitch 后 Yaw
+        
+        # 3. 定义相机内参 (假设主点在中心，焦距为宽度的 1.2 倍)
+        f = w * 1.2
         K = np.array([
             [f, 0, w/2],
             [0, f, h/2],
             [0, 0, 1]
-        ], dtype=np.float32)
-
-        # 2. 计算旋转矩阵 R
-        rad_p = np.deg2rad(pitch)
-        rad_y = np.deg2rad(yaw)
+        ])
         
-        # Pitch 旋转矩阵 (绕 X 轴)
-        R_p = np.array([
-            [1, 0, 0],
-            [0, np.cos(rad_p), -np.sin(rad_p)],
-            [0, np.sin(rad_p), np.cos(rad_p)]
+        # 4. 计算四个顶点的投影位置
+        pts_3d = np.array([
+            [0, 0, 0],
+            [w, 0, 0],
+            [w, h, 0],
+            [0, h, 0]
         ], dtype=np.float32)
         
-        # Yaw 旋转矩阵 (绕 Y 轴)
-        R_y = np.array([
-            [np.cos(rad_y), 0, np.sin(rad_y)],
-            [0, 1, 0],
-            [-np.sin(rad_y), 0, np.cos(rad_y)]
-        ], dtype=np.float32)
+        # 将原图中心移动到原点，进行旋转，再移回去
+        pts_3d[:, 0] -= w/2
+        pts_3d[:, 1] -= h/2
         
-        R = R_y @ R_p
+        # 应用旋转 (添加一个虚拟的 Z 距离，防止投影到无穷远)
+        dist = f
+        pts_rotated = (R @ pts_3d.T).T
+        pts_rotated[:, 2] += dist
         
-        # 3. 计算单应矩阵 H = K * R * K^-1
-        H = K @ R @ np.linalg.inv(K)
+        # 投影到 2D 屏幕
+        pts_2d = (K @ pts_rotated.T).T
+        pts_2d[:, 0] /= pts_2d[:, 2]
+        pts_2d[:, 1] /= pts_2d[:, 2]
         
-        # --- 新增：自动缩放以防止图像被裁切 ---
-        # 计算原始四个角点变换后的位置
-        src_corners = np.float32([[0, 0], [w, 0], [w, h], [0, h]]).reshape(-1, 1, 2)
-        dst_corners = cv2.perspectiveTransform(src_corners, H)
+        # 5. 自适应缩放逻辑：计算投影后的包围盒，并调整变换矩阵
+        min_x, min_y = np.min(pts_2d[:, :2], axis=0)
+        max_x, max_y = np.max(pts_2d[:, :2], axis=0)
         
-        # 获取变换后内容的边界
-        xmin, ymin = np.min(dst_corners, axis=0).ravel()
-        xmax, ymax = np.max(dst_corners, axis=0).ravel()
+        new_w = int(max_x - min_x)
+        new_h = int(max_y - min_y)
         
-        # 计算缩放比例，使得变换后的内容能适应原图大小
-        content_w = xmax - xmin
-        content_h = ymax - ymin
-        scale = min(w / content_w, h / content_h) * 0.95 # 留 5% 的边距
-        
-        # 构建平移和缩放矩阵来修正 H
-        # 目标：将变换后的中心移回原图中心，并按比例缩小
-        tx = (w / 2) - (xmin + xmax) / 2 * scale
-        ty = (h / 2) - (ymin + ymax) / 2 * scale
-        
-        M_scale = np.array([
-            [scale, 0, tx],
-            [0, scale, ty],
+        # 构造偏移矩阵，使图像平移到正坐标区域
+        T_offset = np.array([
+            [1, 0, -min_x],
+            [0, 1, -min_y],
             [0, 0, 1]
-        ], dtype=np.float32)
+        ])
         
-        # 最终变换矩阵
-        H_final = M_scale @ H
+        # 最终的透视变换矩阵 M
+        # 原始投影矩阵 P = K @ [R | t]
+        # 这里简化处理：直接计算原四个角到新四个角的透视变换
+        src_pts = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float32)
+        dst_pts = pts_2d[:, :2].astype(np.float32)
         
-        # 4. 执行图片变换
-        # 使用纯白色进行填充 (255, 255, 255)
-        image = cv2.warpPerspective(image, H_final, (w, h), borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
+        # 应用偏移，确保内容在可视范围内
+        dst_pts[:, 0] -= min_x
+        dst_pts[:, 1] -= min_y
         
-        # 5. 同步标注数据
+        M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+        
+        # 6. 应用变换
+        aug_image = cv2.warpPerspective(image, M, (new_w, new_h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+        
+        # 7. 同步标注数据
+        new_annotations = []
         for ann in annotations:
-            key = "bbox" if "bbox" in ann else "points"
+            new_ann = ann.copy()
             
-            if "segmentation" in ann and ann["segmentation"]:
-                for i in range(len(ann["segmentation"])):
-                    poly = np.array(ann["segmentation"][i]).reshape(-1, 2).astype(np.float32)
-                    poly_h = np.column_stack([poly, np.ones(len(poly))])
-                    transformed_poly_h = H_final.dot(poly_h.T).T
-                    # 归一化并处理 Z <= 0 的情况
-                    transformed_poly = transformed_poly_h[:, :2] / (transformed_poly_h[:, 2:3] + 1e-8)
-                    ann["segmentation"][i] = transformed_poly.flatten().tolist()
-                
-                all_pts = np.concatenate([np.array(p).reshape(-1, 2) for p in ann["segmentation"]])
-                new_x, new_y = np.min(all_pts, axis=0)
-                new_w, new_h = np.max(all_pts, axis=0) - [new_x, new_y]
-                ann[key] = [float(new_x), float(new_y), float(new_w), float(new_h)]
+            # 同步分割点
+            if "segmentation" in new_ann and new_ann["segmentation"]:
+                new_segs = []
+                for seg in new_ann["segmentation"]:
+                    pts = np.array(seg).reshape(-1, 2)
+                    ones = np.ones((pts.shape[0], 1))
+                    pts_homo = np.hstack([pts, ones])
+                    
+                    trans_pts = (M @ pts_homo.T).T
+                    trans_pts[:, 0] /= trans_pts[:, 2]
+                    trans_pts[:, 1] /= trans_pts[:, 2]
+                    
+                    new_segs.append(trans_pts[:, :2].flatten().tolist())
+                new_ann["segmentation"] = new_segs
             
-            elif key in ann:
-                x, y, bw, bh = ann[key][:4]
-                pts = np.array([[x, y], [x + bw, y], [x + bw, y + bh], [x, y + bh]], dtype=np.float32)
-                pts_h = np.column_stack([pts, np.ones(len(pts))])
-                transformed_pts_h = H_final.dot(pts_h.T).T
-                transformed_pts = transformed_pts_h[:, :2] / (transformed_pts_h[:, 2:3] + 1e-8)
+            # 同步 BBox (根据变换后的分割点或 BBox 角点重新计算)
+            if "bbox" in new_ann:
+                x, y, bw, bh = new_ann["bbox"]
+                bbox_pts = np.array([[x, y], [x + bw, y], [x + bw, y + bh], [x, y + bh]], dtype=np.float32)
+                ones = np.ones((4, 1))
+                bbox_homo = np.hstack([bbox_pts, ones])
                 
-                new_x, new_y = np.min(transformed_pts, axis=0)
-                new_w, new_h = np.max(transformed_pts, axis=0) - [new_x, new_y]
-                ann[key] = [float(new_x), float(new_y), float(new_w), float(new_h)]
+                trans_bbox_pts = (M @ bbox_homo.T).T
+                trans_bbox_pts[:, 0] /= trans_bbox_pts[:, 2]
+                trans_bbox_pts[:, 1] /= trans_bbox_pts[:, 2]
                 
-        return image, annotations
+                nx1 = np.min(trans_bbox_pts[:, 0])
+                ny1 = np.min(trans_bbox_pts[:, 1])
+                nx2 = np.max(trans_bbox_pts[:, 0])
+                ny2 = np.max(trans_bbox_pts[:, 1])
+                
+                new_ann["bbox"] = [float(nx1), float(ny1), float(nx2 - nx1), float(ny2 - ny1)]
+                new_ann["area"] = float((nx2 - nx1) * (ny2 - ny1))
+            
+            new_annotations.append(new_ann)
+            
+        return aug_image, new_annotations
