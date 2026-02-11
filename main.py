@@ -5,6 +5,8 @@ from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 import asyncio
 import json
+import time
+import logging
 import paddle
 import cv2
 import numpy as np
@@ -17,6 +19,13 @@ import platform
 from pathlib import Path
 from utils.augmentation import DataAugmentor
 from utils.trainer import trainer
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="One2All Paddle API")
 
@@ -82,7 +91,7 @@ class TrainRequest(BaseModel):
     version: str # 版本号
     data_version: str # 数据版本
     run_count: int = 1 # 运行次数
-    model_name: str = "STFPM" # 异常检测模型名称 (STFPM)
+    model_name: str = "STFPM"
     epochs: int = 50
     batch_size: int = 8
     learning_rate: float = 0.01
@@ -98,9 +107,6 @@ async def train_anomaly(request: TrainRequest):
     # 映射 category_id 到 label 名称
     cat_map = {cat.id: cat.name for cat in request.coco_data.categories} if request.coco_data.categories else {}
     
-    # 基础存储路径
-    # 1. 兼容 Windows 路径输入，将 \ 替换为 /
-    # 2. 如果是 Linux 环境，base_path 强制改为当前项目目录
     if platform.system().lower() == "linux":
         normalized_base = os.getcwd()
     else:
@@ -124,7 +130,7 @@ async def train_anomaly(request: TrainRequest):
                         image_id = idx + 1
                     decoded_images[image_id] = img
             except Exception as e:
-                print(f"Failed to decode image: {e}")
+                logger.error(f"Failed to decode image: {e}")
 
         # 3. 裁剪并分类存放
         crop_count = 0
@@ -202,6 +208,8 @@ async def train_anomaly(request: TrainRequest):
 
         # 4. 启动多个后台训练任务（每个 Label 一个模型）
         task_results = []
+        group_id = f"group_{int(time.time())}_{request.project_id}"
+        
         for label_name in labels_processed:
             label_dataset_path = storage_base / label_name
             
@@ -215,7 +223,7 @@ async def train_anomaly(request: TrainRequest):
                 "version": request.version
             }
             
-            task_id = trainer.run_training_async(str(label_dataset_path), train_config)
+            task_id = trainer.run_training_async(str(label_dataset_path), train_config, group_id=group_id)
             task_results.append({
                 "label": label_name,
                 "task_id": task_id
@@ -224,6 +232,7 @@ async def train_anomaly(request: TrainRequest):
         return {
             "status": "success",
             "project_id": request.project_id,
+            "group_id": group_id,
             "data_version": request.data_version,
             "storage_path": str(storage_base),
             "total_crops": crop_count,
@@ -236,10 +245,34 @@ async def train_anomaly(request: TrainRequest):
 @app.get("/train/status/{task_id}")
 async def get_train_status(task_id: str):
     """
-    查询训练任务状态
+    查询单个训练任务状态 (单个 label)
     """
     status = trainer.get_status(task_id)
     return status
+
+@app.get("/train/status/group/{group_id}")
+async def get_group_train_status(group_id: str):
+    """
+    查询任务组状态 (总进度)
+    """
+    status = trainer.get_group_status(group_id)
+    return status
+
+@app.post("/train/stop/{task_id}")
+async def stop_train_task(task_id: str):
+    """
+    停止单个训练任务
+    """
+    result = trainer.stop_task(task_id)
+    return result
+
+@app.post("/train/stop/group/{group_id}")
+async def stop_group_train(group_id: str):
+    """
+    停止整个任务组训练
+    """
+    result = trainer.stop_group(group_id)
+    return result
 
 @app.get("/train/events/{task_id}")
 async def train_events(task_id: str):

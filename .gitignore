@@ -162,7 +162,9 @@ output/
 results/
 temp/
 tmp/
-
+test_*/
+__pycache__/
+8/*
 # OS files
 .DS_Store
 Thumbs.db

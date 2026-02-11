@@ -2,7 +2,10 @@ import cv2
 import numpy as np
 import random
 import copy
+import logging
 from typing import List, Dict, Any, Tuple
+
+logger = logging.getLogger(__name__)
 
 class DataAugmentor:
     """
@@ -148,7 +151,7 @@ class DataAugmentor:
         prob = self.config[key].get("prob", 1.0)
         result = random.random() < prob
         if result:
-            print(f"[Augmentation] Applying {key}...")
+            logger.debug(f"[Augmentation] Applying {key}...")
         return result
 
     def _apply_brightness_contrast(self, image: np.ndarray, brightness: float = None, contrast: float = None) -> np.ndarray:
