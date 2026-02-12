@@ -7,8 +7,14 @@ import json
 import os
 import cv2
 import time
+import threading
 from pathlib import Path
+import sys
+
+sys.path.append(str(Path(__file__).resolve().parents[1]))
 from main import app
+from utils.trainer import AnomalyTrainer
+import types
 
 client = TestClient(app)
 
@@ -76,8 +82,7 @@ def test_train_anomaly_integration():
         
         # 5. 验证文件系统：检查裁剪后的图片是否真的生成了
         storage_path = Path(data["storage_path"])
-        # 根据 main.py 逻辑，路径应为: storage_path / "bolt" / "train" / "good"
-        crop_dir = storage_path / "bolt" / "train" / "good"
+        crop_dir = storage_path / "bolt" / "images"
         assert crop_dir.exists(), f"裁剪目录未创建: {crop_dir}"
         crops = list(crop_dir.glob("*.png"))
         assert len(crops) > 0, "没有生成裁剪后的图片"
@@ -116,6 +121,80 @@ def test_get_train_status_mock():
         assert response.status_code == 200
         assert response.json() == mock_status
         mock_get_status.assert_called_with("mock_task_123")
+
+def test_find_latest_resume_path(tmp_path: Path):
+    trainer = AnomalyTrainer(output_dir=str(tmp_path / "out"))
+    save_dir = tmp_path / "out" / "p" / "label" / "task_1"
+    iter_1 = save_dir / "iter_1"
+    iter_2 = save_dir / "iter_2"
+    iter_1.mkdir(parents=True)
+    iter_2.mkdir(parents=True)
+    (iter_1 / "model.pdparams").write_text("a")
+    (iter_1 / "model.pdopt").write_text("b")
+    (iter_2 / "model.pdparams").write_text("c")
+    (iter_2 / "model.pdopt").write_text("d")
+
+    older = time.time() - 10
+    newer = time.time()
+    os.utime(iter_1 / "model.pdparams", (older, older))
+    os.utime(iter_2 / "model.pdparams", (newer, newer))
+
+    resume_path = trainer._find_latest_resume_path(str(save_dir))
+    assert resume_path.endswith("iter_2/model.pdparams")
+
+def test_run_training_async_resumes_existing_task(tmp_path: Path):
+    trainer = AnomalyTrainer(output_dir=str(tmp_path / "out"))
+    dataset_dir = tmp_path / "dataset"
+    dataset_dir.mkdir()
+    (dataset_dir / "train.txt").write_text("images/a.png masks/a.png\n")
+
+    config = {
+        "project_id": "p",
+        "version": "v1",
+        "data_version": "dv1",
+        "run_count": 1,
+        "model_name": "STFPM",
+        "label_name": "label",
+        "epochs": 1,
+        "batch_size": 1,
+        "learning_rate": 0.001,
+    }
+
+    task_id = "task_1"
+    save_dir = tmp_path / "out" / "p" / "label" / task_id
+    iter_1 = save_dir / "iter_1"
+    iter_1.mkdir(parents=True)
+    (iter_1 / "model.pdparams").write_text("a")
+    (iter_1 / "model.pdopt").write_text("b")
+
+    task_key = trainer._make_task_key(str(dataset_dir), config)
+    trainer.training_status[task_id] = {
+        "status": "failed",
+        "progress": 50,
+        "label": "label",
+        "group_id": None,
+        "logs": [],
+        "metrics": [],
+        "total_epochs": 1,
+        "start_time": time.time(),
+        "dataset_dir": str(dataset_dir),
+        "save_dir": str(save_dir),
+        "config": config,
+        "task_key": task_key,
+    }
+    trainer.task_key_index[task_key] = task_id
+
+    started = threading.Event()
+
+    def fake_train_process(self, task_id_arg, dataset_dir_arg, config_arg, resume_arg):
+        assert task_id_arg == task_id
+        assert resume_arg is True
+        started.set()
+
+    trainer._train_process = types.MethodType(fake_train_process, trainer)
+    returned = trainer.run_training_async(str(dataset_dir), config, group_id="g1")
+    assert returned == task_id
+    assert started.wait(2)
 
 if __name__ == "__main__":
     pytest.main([__file__])

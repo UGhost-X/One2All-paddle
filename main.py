@@ -16,15 +16,22 @@ import shutil
 import tempfile
 import random
 import platform
+import warnings
+import logging
 from pathlib import Path
+
+# 屏蔽框架无关紧要的日志和警告
+os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
+os.environ["FLAGS_allocator_strategy"] = "auto_growth"
+warnings.filterwarnings("ignore", category=UserWarning, message=".*ccache.*")
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+logging.getLogger("paddle").setLevel(logging.WARNING)
+logging.getLogger("paddlex").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+
 from utils.augmentation import DataAugmentor
 from utils.trainer import trainer
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="One2All Paddle API")
@@ -92,10 +99,13 @@ class TrainRequest(BaseModel):
     data_version: str # 数据版本
     run_count: int = 1 # 运行次数
     model_name: str = "STFPM"
-    epochs: int = 50
+    train_epochs: Optional[int] = None # 建议使用 train_iters，若提供则自动换算
+    train_iters: Optional[int] = None  # 推荐：显式指定训练迭代次数
     batch_size: int = 8
     learning_rate: float = 0.01
-    label_names: Optional[List[str]] = None # 新增：指定要训练的 label 列表，不填则训练全部
+    label_names: Optional[List[str]] = None
+    resume_path: Optional[str] = None # 可选的恢复训练路径
+    parallel_train: bool = False # 是否开启多线程并行训练（默认为串行排队）
 
 @app.post("/train/anomaly")
 async def train_anomaly(request: TrainRequest):
@@ -188,15 +198,26 @@ async def train_anomaly(request: TrainRequest):
                         cv2.imwrite(str(mask_path), mask)
                         
                         # 记录到列表
-                        if label_name not in label_val_count or random.random() < 0.1:
+                        # 策略：前 2 个样本必入训练集，确保训练集不为空；后续样本 10% 概率入验证集
+                        train_list_path = label_dir / "train.txt"
+                        val_list_path = label_dir / "val.txt"
+                        
+                        # 统计当前 label 已有的训练样本数
+                        train_count = 0
+                        if train_list_path.exists():
+                            with open(train_list_path, "r") as f:
+                                train_count = sum(1 for line in f if line.strip())
+                        
+                        if train_count < 2:
+                            # 强制放入训练集
+                            with open(train_list_path, "a") as f:
+                                f.write(f"images/{img_filename} masks/{mask_filename}\n")
+                        elif random.random() < 0.1:
                             # 放入验证集
-                            val_list_path = label_dir / "val.txt"
                             with open(val_list_path, "a") as f:
                                 f.write(f"images/{img_filename} masks/{mask_filename}\n")
-                            label_val_count[label_name] = label_val_count.get(label_name, 0) + 1
                         else:
                             # 放入训练集
-                            train_list_path = label_dir / "train.txt"
                             with open(train_list_path, "a") as f:
                                 f.write(f"images/{img_filename} masks/{mask_filename}\n")
                             
@@ -206,9 +227,31 @@ async def train_anomaly(request: TrainRequest):
         if crop_count == 0:
             raise HTTPException(status_code=400, detail="No valid objects to crop")
 
-        # 4. 启动多个后台训练任务（每个 Label 一个模型）
+        # 4. 后处理：确保每个 label 的验证集都不为空，避免 PaddleSeg 报错
+        for label_name in labels_processed:
+            label_dir = storage_base / label_name
+            train_list_path = label_dir / "train.txt"
+            val_list_path = label_dir / "val.txt"
+            
+            # 如果验证集为空，从训练集中复制一个样本过去
+            if not val_list_path.exists() or os.path.getsize(val_list_path) == 0:
+                if train_list_path.exists() and os.path.getsize(train_list_path) > 0:
+                    with open(train_list_path, "r") as f_train:
+                        first_line = f_train.readline()
+                    if first_line:
+                        with open(val_list_path, "w") as f_val:
+                            f_val.write(first_line)
+                        logger.info(f"Label '{label_name}' has empty validation set. Copied one sample from train set.")
+
+        # 5. 启动多个后台训练任务（每个 Label 一个模型）
         task_results = []
         group_id = f"group_{int(time.time())}_{request.project_id}"
+        
+        # 检查是否有请求的类别未被处理（没有数据）
+        if request.label_names:
+            missing_labels = set(request.label_names) - labels_processed
+            if missing_labels:
+                logger.warning(f"The following requested labels have no valid annotations and will be skipped: {missing_labels}")
         
         for label_name in labels_processed:
             label_dataset_path = storage_base / label_name
@@ -216,11 +259,16 @@ async def train_anomaly(request: TrainRequest):
             train_config = {
                 "model_name": request.model_name,
                 "label_name": label_name, 
-                "epochs": request.epochs,
+                "train_epochs": request.train_epochs,
+                "train_iters": request.train_iters,
                 "batch_size": request.batch_size,
                 "learning_rate": request.learning_rate,
                 "project_id": request.project_id,
-                "version": request.version
+                "version": request.version,
+                "data_version": request.data_version,
+                "run_count": request.run_count,
+                "resume_path": request.resume_path,
+                "parallel_train": request.parallel_train
             }
             
             task_id = trainer.run_training_async(str(label_dataset_path), train_config, group_id=group_id)
@@ -275,16 +323,21 @@ async def stop_group_train(group_id: str):
     return result
 
 @app.get("/train/events/{task_id}")
-async def train_events(task_id: str):
+async def train_events(task_id: str, auto_delete: bool = True):
     """
     SSE 实时推送训练进度和日志
+    :param auto_delete: 是否在读取历史消息后自动删除数据库中的记录
     """
     async def event_generator():
         last_log_idx = 0
         while True:
+            # 1. 从 trainer 获取当前状态
             status = trainer.get_status(task_id)
             
-            # 准备要发送的数据
+            # 2. 从消息队列获取历史消息（如果需要自动删除，可以通过 messenger.get_history）
+            # 注意：这里的 status.logs 已经包含了内存中的日志
+            # 如果前端是通过 SSE 持续订阅，我们通常不需要在这里删除
+            
             data = {
                 "status": status.get("status"),
                 "progress": status.get("progress", 0),
@@ -293,22 +346,77 @@ async def train_events(task_id: str):
                 "metrics": status.get("metrics", [])
             }
             
-            # 获取新日志
             logs = status.get("logs", [])
             if len(logs) > last_log_idx:
                 data["new_logs"] = logs[last_log_idx:]
                 last_log_idx = len(logs)
             
-            # 发送 SSE 格式数据
             yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
             
-            # 如果训练完成或失败，发送最后一条消息后退出
             if status.get("status") in ["completed", "failed", "not_found"]:
+                # 如果开启了自动删除，可以在任务结束时清理该 topic 的所有消息
+                if auto_delete:
+                    from utils.messaging import messenger
+                    messenger.get_history(f"task_status_{task_id}", limit=9999, delete_after=True)
                 break
                 
-            await asyncio.sleep(1) # 每隔一秒检查一次更新
+            await asyncio.sleep(1)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+@app.get("/train/checkpoints/{task_id}")
+async def get_task_checkpoints(task_id: str):
+    """
+    获取某个任务下可用的检查点列表
+    """
+    status = trainer.get_status(task_id)
+    if status.get("status") == "not_found":
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    save_dir = status.get("save_dir")
+    if not save_dir or not os.path.exists(save_dir):
+        return {"checkpoints": []}
+    
+    checkpoints = []
+    for root, _, files in os.walk(save_dir):
+        if "model.pdparams" in files:
+            # 获取相对于 save_dir tel 路径，方便前端展示
+            rel_path = os.path.relpath(root, save_dir)
+            pdparams_path = os.path.join(root, "model.pdparams")
+            mtime = os.path.getmtime(pdparams_path)
+            checkpoints.append({
+                "name": rel_path if rel_path != "." else "latest",
+                "path": pdparams_path,
+                "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime))
+            })
+    
+    # 按时间倒序排列
+    checkpoints.sort(key=lambda x: x["time"], reverse=True)
+    return {"task_id": task_id, "checkpoints": checkpoints}
+
+@app.post("/train/resume/{task_id}")
+async def resume_train_task(task_id: str, resume_path: Optional[str] = None):
+    """
+    显式恢复某个训练任务
+    :param task_id: 任务 ID
+    :param resume_path: 可选，指定具体的检查点路径。如果不传，则自动寻找最新的。
+    """
+    result = trainer.resume_task(task_id, resume_path=resume_path)
+    if result.get("status") == "error":
+        raise HTTPException(status_code=400, detail=result.get("message"))
+    return result
+
+@app.get("/train/history/{task_id}")
+async def get_task_history(task_id: str, type: str = "log", since_ts: float = 0):
+    """
+    获取任务的历史消息（从持久化数据库中）
+    :param type: 'log' 或 'status'
+    :param since_ts: 获取该时间戳之后的消息
+    """
+    from utils.messaging import messenger
+    topic = f"task_{type}_{task_id}"
+    history = messenger.get_history(topic, since_ts=since_ts)
+    return {"task_id": task_id, "type": type, "history": history}
 
 @app.get("/")
 async def root():

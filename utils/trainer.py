@@ -7,7 +7,15 @@ import re
 import random
 import ctypes
 import logging
+import traceback
+import warnings
+from utils.messaging import messenger
 from pathlib import Path
+
+# 屏蔽无用警告
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+
 import paddlex as pdx
 from paddlex.utils.config import AttrDict
 
@@ -105,30 +113,50 @@ class TrainingMonitor:
                 "timestamp": time.time()
             }
             
-            # 更新进度 (iter 级别)
-            total_epochs = self.trainer.training_status[self.task_id].get("total_epochs", 50)
+            # 更新进度
+            status = self.trainer.training_status[self.task_id]
+            total_epochs = status.get("total_epochs", 1)
+            total_iters_overall = status.get("total_iters", 1)
+            use_iters_mode = status.get("use_iters_mode", False)
             
             # 改进进度计算：
-            # 0-5%: 初始化
-            # 5-10%: 模型准备
-            # 10-95%: 核心训练阶段
-            # 95-100%: 完成
+            # 0-5%: 初始化, 5-10%: 模型准备, 10-95%: 核心训练阶段, 95-100%: 完成
             
-            training_ratio = (epoch - 1) / total_epochs + (curr_iter / total_iters) / total_epochs
+            if use_iters_mode:
+                # 基于迭代次数的模式：直接用当前总 iteration 计算
+                # PaddleSeg 日志中的 epoch 可能会变，但我们关心的是总进度
+                # 计算当前总 iter = (epoch-1)*total_iters_in_this_epoch + curr_iter
+                # 但更简单的是：直接信任 PaddleSeg 最终会跑到我们设定的 total_iters_overall
+                # 我们假设每个 epoch 的 total_iters (即 total_iters 参数) 是一致的
+                current_overall_iter = (epoch - 1) * total_iters + curr_iter
+                training_ratio = min(1.0, current_overall_iter / total_iters_overall)
+                progress_desc = f"Iter: {current_overall_iter}/{total_iters_overall}"
+            else:
+                # 基于 Epoch 的模式
+                training_ratio = (epoch - 1) / total_epochs + (curr_iter / total_iters) / total_epochs
+                progress_desc = f"Epoch: {epoch}/{total_epochs} | Iter: {curr_iter}/{total_iters}"
+            
             progress = 10 + (training_ratio * 85)
-            
             new_progress = min(int(progress), 98)
-            old_progress = self.trainer.training_status[self.task_id].get("progress", 0)
+            old_progress = status.get("progress", 0)
             
             # 记录详细日志
             if new_progress > old_progress or curr_iter == total_iters:
-                log_msg = f"Training Progress: {new_progress}% | Epoch: {epoch}/{total_epochs} | Iter: {curr_iter}/{total_iters} | Loss: {loss:.4f} | LR: {lr:.6f}"
+                log_msg = f"Training Progress: {new_progress}% | {progress_desc} | Loss: {loss:.4f} | LR: {lr:.6f}"
                 self.trainer._add_log(self.task_id, log_msg)
             
             self.trainer.training_status[self.task_id]["progress"] = new_progress
             if "metrics" not in self.trainer.training_status[self.task_id]:
                 self.trainer.training_status[self.task_id]["metrics"] = []
             self.trainer.training_status[self.task_id]["metrics"].append(metrics)
+            
+            # 通过消息队列发布指标和进度
+            messenger.publish(f"task_status_{self.task_id}", {
+                "task_id": self.task_id,
+                "type": "status_update",
+                "progress": new_progress,
+                "metrics": metrics
+            })
             
             # 限制 metrics 数量
             if len(self.trainer.training_status[self.task_id]["metrics"]) > 1000:
@@ -173,32 +201,167 @@ class AnomalyTrainer:
         self.training_status = {} # 用于跟踪训练状态 task_id -> status
         self.groups = {} # 用于跟踪任务组 group_id -> [task_id1, task_id2, ...]
         self.threads = {} # 用于存储训练线程 task_id -> thread
+        self.processes = {} # task_id -> subprocess.Popen (新增加以支持强制停止)
+        self.task_key_index = {}
+        self.state_file = str(Path(self.output_dir) / "_one2all_trainer_state.json")
+        self._state_lock = threading.Lock()
+        self._gpu_semaphore = threading.Semaphore(1) # 限制同时只能有一个训练任务占用 GPU
+        self._last_persist_ts = 0.0
+        self._thread_local = threading.local()
+        Path(self.output_dir).mkdir(parents=True, exist_ok=True)
+        self._load_state()
+
+    def _load_state(self):
+        if not os.path.exists(self.state_file):
+            return
+        try:
+            with open(self.state_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.training_status = data.get("training_status", {}) or {}
+            self.groups = data.get("groups", {}) or {}
+            self.task_key_index = data.get("task_key_index", {}) or {}
+
+            now = time.time()
+            for task_id, s in self.training_status.items():
+                if s.get("status") in {"starting", "training"}:
+                    s["status"] = "interrupted"
+                    s["interrupted_at"] = now
+                    logs = s.setdefault("logs", [])
+                    logs.append(f"[{time.strftime('%H:%M:%S', time.localtime())}] Service restarted; task marked as interrupted.")
+                    if len(logs) > 500:
+                        s["logs"] = logs[-500:]
+        except Exception as e:
+            logger.error(f"Failed to load trainer state: {e}")
+
+    def _persist_state(self):
+        data = {
+            "version": 1,
+            "updated_at": time.time(),
+            "training_status": self.training_status,
+            "groups": self.groups,
+            "task_key_index": self.task_key_index,
+        }
+        tmp_path = f"{self.state_file}.tmp"
+        Path(self.output_dir).mkdir(parents=True, exist_ok=True)
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp_path, self.state_file)
+
+    def _persist_state_if_due(self, force: bool = False):
+        now = time.time()
+        if not force and now - self._last_persist_ts < 1.0:
+            return
+        with self._state_lock:
+            now = time.time()
+            if not force and now - self._last_persist_ts < 1.0:
+                return
+            try:
+                self._persist_state()
+                self._last_persist_ts = now
+            except Exception as e:
+                logger.error(f"Failed to persist trainer state: {e}")
+
+    def _make_task_key(self, dataset_dir: str, config: dict) -> str:
+        return "|".join(
+            [
+                str(config.get("project_id", "")),
+                str(config.get("version", "")),
+                str(config.get("data_version", "")),
+                str(config.get("run_count", "")),
+                str(config.get("model_name", "")),
+                str(config.get("label_name", "")),
+                str(dataset_dir),
+            ]
+        )
+
+    def _find_latest_resume_path(self, save_dir: str):
+        latest = None
+        latest_mtime = -1.0
+        for root, _, files in os.walk(save_dir):
+            if "model.pdparams" not in files:
+                continue
+            if "model.pdopt" not in files:
+                continue
+            pdparams = os.path.join(root, "model.pdparams")
+            try:
+                mtime = os.path.getmtime(pdparams)
+            except Exception:
+                continue
+            if mtime > latest_mtime:
+                latest_mtime = mtime
+                latest = pdparams
+        return latest
 
     def run_training_async(self, dataset_dir: str, config: dict, group_id: str = None):
         """
         启动后台线程执行训练
         """
+        task_key = self._make_task_key(dataset_dir, config)
+        existing_task_id = self.task_key_index.get(task_key)
+        if existing_task_id and existing_task_id in self.training_status:
+            existing = self.training_status[existing_task_id]
+            if group_id:
+                existing["group_id"] = group_id
+                if group_id not in self.groups:
+                    self.groups[group_id] = []
+                if existing_task_id not in self.groups[group_id]:
+                    self.groups[group_id].append(existing_task_id)
+
+            status = existing.get("status")
+            thread = self.threads.get(existing_task_id)
+            if status in {"starting", "training"} and thread and thread.is_alive():
+                self._persist_state_if_due()
+                return existing_task_id
+
+            save_dir = existing.get("save_dir")
+            resume_path = self._find_latest_resume_path(save_dir) if save_dir else None
+            if resume_path:
+                existing["status"] = "starting"
+                existing["progress"] = min(existing.get("progress", 0), 90)
+                existing["resume_path"] = resume_path
+                existing.setdefault("logs", []).append(
+                    f"[{time.strftime('%H:%M:%S', time.localtime())}] Resuming from checkpoint: {resume_path}"
+                )
+                if len(existing.get("logs", [])) > 500:
+                    existing["logs"] = existing["logs"][-500:]
+                thread = threading.Thread(
+                    target=self._train_process,
+                    args=(existing_task_id, existing.get("dataset_dir", dataset_dir), existing.get("config", config), True),
+                )
+                self.threads[existing_task_id] = thread
+                thread.start()
+                self._persist_state_if_due(force=True)
+                return existing_task_id
+
         task_id = f"task_{int(time.time())}_{config.get('label_name', 'unknown')}_{random.randint(1000, 9999)}"
+        label_name = config.get("label_name", "unknown")
+        save_dir = os.path.join(self.output_dir, config.get("project_id", "default"), label_name, task_id)
         self.training_status[task_id] = {
             "status": "starting", 
             "progress": 0,
-            "label": config.get("label_name", "unknown"),
+            "label": label_name,
             "group_id": group_id,
             "logs": [f"Task {task_id} initialized."],
             "metrics": [], # 存储 Epoch 级别的指标
             "total_epochs": config.get("epochs", 50),
-            "start_time": time.time()
+            "start_time": time.time(),
+            "dataset_dir": dataset_dir,
+            "save_dir": save_dir,
+            "config": config,
+            "task_key": task_key,
         }
+        self.task_key_index[task_key] = task_id
         
         # 记录到组
         if group_id:
             if group_id not in self.groups:
                 self.groups[group_id] = []
             self.groups[group_id].append(task_id)
+        self._persist_state_if_due(force=True)
         
         thread = threading.Thread(
             target=self._train_process,
-            args=(task_id, dataset_dir, config)
+            args=(task_id, dataset_dir, config, False)
         )
         self.threads[task_id] = thread
         thread.start()
@@ -215,10 +378,25 @@ class AnomalyTrainer:
         if status in ["completed", "failed", "cancelled"]:
             return {"status": "success", "message": f"Task already in {status} state"}
 
-        # 尝试停止线程
+        # 1. 尝试终止子进程 (PaddleSeg 训练进程)
+        proc = self.processes.get(task_id)
+        if proc:
+            try:
+                self._add_log(task_id, f"Terminating training subprocess (PID: {proc.pid})...")
+                proc.terminate()
+                # 给一点时间优雅退出，不行就 kill
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                self._add_log(task_id, "Subprocess terminated.")
+            except Exception as e:
+                self._add_log(task_id, f"Error terminating subprocess: {e}")
+
+        # 2. 终止 Python 管理线程
         thread = self.threads.get(task_id)
         if thread and thread.is_alive():
-            # 使用 ctypes 强制停止线程
+            # 使用 ctypes 强制抛出异常
             res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
                 ctypes.c_long(thread.ident), 
                 ctypes.py_object(SystemExit)
@@ -228,9 +406,19 @@ class AnomalyTrainer:
             
             self._add_log(task_id, "Task cancellation requested by user.")
             self.training_status[task_id]["status"] = "cancelled"
+            
+            # 发布停止消息
+            messenger.publish(f"task_status_{task_id}", {
+                "task_id": task_id,
+                "type": "cancelled",
+                "message": "Task stopped by user"
+            })
+            
+            self._persist_state_if_due(force=True)
             return {"status": "success", "message": "Cancellation requested"}
         else:
             self.training_status[task_id]["status"] = "cancelled"
+            self._persist_state_if_due(force=True)
             return {"status": "success", "message": "Task marked as cancelled"}
 
     def stop_group(self, group_id: str):
@@ -292,15 +480,71 @@ class AnomalyTrainer:
     def _add_log(self, task_id: str, message: str):
         """添加日志到任务状态"""
         if task_id in self.training_status:
-            timestamp = time.strftime("%H:%M:%S", time.localtime())
-            log_entry = f"[{timestamp}] {message}"
-            self.training_status[task_id].setdefault("logs", []).append(log_entry)
+            timestamp_str = time.strftime("%H:%M:%S", time.localtime())
+            log_entry = f"[{timestamp_str}] {message}"
+            logs = self.training_status[task_id].setdefault("logs", [])
+            logs.append(log_entry)
+            if len(logs) > 500:
+                self.training_status[task_id]["logs"] = logs[-500:]
+            
+            # 通过消息队列发布日志
+            messenger.publish(f"task_log_{task_id}", {
+                "task_id": task_id,
+                "type": "log",
+                "message": log_entry,
+                "raw_message": message
+            })
+            
             logger.info(f"[{task_id}] {message}")
+            self._persist_state_if_due()
 
-    def _train_process(self, task_id: str, dataset_dir: str, config: dict):
+    def _train_process(self, task_id: str, dataset_dir: str, config: dict, resume: bool = False):
         """
-        实际的训练进程 (运行在后台)
+        实际的训练进程 (运行在后台)，包含自动重试逻辑
         """
+        max_retries = 3
+        retry_count = 0
+        
+        while retry_count <= max_retries:
+            try:
+                if retry_count > 0:
+                    self._add_log(task_id, f"Auto-retrying training ({retry_count}/{max_retries})...")
+                    # 重试时强制开启续训模式
+                    resume = True
+                
+                self._do_train(task_id, dataset_dir, config, resume)
+                # 如果执行到这里没有抛出异常，说明训练成功，退出循环
+                break
+                
+            except Exception as e:
+                retry_count += 1
+                if retry_count > max_retries:
+                    tb = traceback.format_exc()
+                    error_msg = f"Training failed after {max_retries} retries: {str(e)}"
+                    self._add_log(task_id, error_msg)
+                    self.training_status[task_id]["status"] = "failed"
+                    self.training_status[task_id]["error"] = str(e)
+                    self.training_status[task_id]["traceback"] = tb
+                    messenger.publish(f"task_status_{task_id}", {
+                        "task_id": task_id,
+                        "type": "failed",
+                        "error": str(e)
+                    })
+                    self._persist_state_if_due(force=True)
+                    return
+                
+                self.training_status[task_id]["status"] = "retrying"
+                self._add_log(task_id, f"Training attempt {retry_count} failed: {str(e)}")
+                self._persist_state_if_due(force=True)
+                time.sleep(5)
+
+    def _do_train(self, task_id: str, dataset_dir: str, config: dict, resume: bool = False):
+        """
+        单次训练执行逻辑
+        """
+        # 设置线程局部的 task_id，供 patched_popen 使用
+        self._thread_local.task_id = task_id
+        
         try:
             # 在训练线程中再次确保仓库初始化，防止多线程环境下的模型注册失效
             try:
@@ -313,14 +557,62 @@ class AnomalyTrainer:
                 pass
 
             label_name = config.get("label_name", "unknown")
-            self._add_log(task_id, f"Training thread started for label: {label_name}")
+            parallel_train = config.get("parallel_train", False)
+            
+            self._add_log(task_id, f"Training thread started for label: {label_name} (Parallel: {parallel_train})")
             self.training_status[task_id]["status"] = "training"
             self.training_status[task_id]["progress"] = 5
             self._add_log(task_id, "Stage 1/4: Preparing training environment...")
 
             # 1. 构造 PaddleX 训练配置
             model_name = config.get("model_name", "STFPM")
-            save_dir = os.path.join(self.output_dir, config.get("project_id", "default"), label_name, task_id)
+            save_dir = self.training_status.get(task_id, {}).get("save_dir") or os.path.join(
+                self.output_dir, config.get("project_id", "default"), label_name, task_id
+            )
+            os.makedirs(save_dir, exist_ok=True)
+            if task_id in self.training_status:
+                self.training_status[task_id]["dataset_dir"] = dataset_dir
+                self.training_status[task_id]["save_dir"] = save_dir
+                self.training_status[task_id]["config"] = config
+                self._persist_state_if_due(force=True)
+
+            if not os.path.isdir(dataset_dir):
+                raise FileNotFoundError(f"dataset_dir not found: {dataset_dir}")
+            
+            train_list = os.path.join(dataset_dir, "train.txt")
+            if not os.path.exists(train_list):
+                raise FileNotFoundError(f"train.txt not found in dataset_dir: {dataset_dir}")
+            
+            # 计算训练参数：优先使用 train_iters，否则使用 train_epochs 换算
+            train_iters_input = config.get("train_iters")
+            train_epochs_input = config.get("train_epochs") or config.get("epochs", 50)
+            iters_per_epoch = 1
+            
+            try:
+                with open(train_list, "r") as f:
+                    num_samples = sum(1 for line in f if line.strip())
+                batch_size = config.get("batch_size", 8)
+                iters_per_epoch = max(1, num_samples // batch_size)
+                
+                if train_iters_input:
+                    total_iters = train_iters_input
+                    # 如果提供了 iters，我们也换算一个名义上的 epochs 用于日志显示
+                    total_epochs = max(1, total_iters // iters_per_epoch)
+                    self._add_log(task_id, f"Using explicit train_iters: {total_iters} (approx {total_epochs} epochs)")
+                else:
+                    total_epochs = train_epochs_input
+                    total_iters = total_epochs * iters_per_epoch
+                    self._add_log(task_id, f"Converting epochs to iters: {total_epochs} epochs -> {total_iters} total iters (Dataset size: {num_samples})")
+            except Exception as e:
+                logger.warning(f"Failed to calculate iters: {e}")
+                total_iters = train_iters_input or train_epochs_input or 50
+                total_epochs = train_epochs_input or 1
+            
+            # 更新状态中的总轮数/总迭代数，供监控器使用
+            if task_id in self.training_status:
+                self.training_status[task_id]["total_epochs"] = total_epochs
+                self.training_status[task_id]["total_iters"] = total_iters
+                self.training_status[task_id]["use_iters_mode"] = bool(train_iters_input)
             
             pdx_cfg = AttrDict({
                 "Global": AttrDict({
@@ -330,8 +622,8 @@ class AnomalyTrainer:
                     "device": "gpu:0"
                 }),
                 "Train": AttrDict({
-                    "epochs": config.get("epochs", 50),
-                    "epochs_iters": config.get("epochs", 50),
+                    "epochs": total_epochs,
+                    "epochs_iters": total_iters, # PaddleSeg 实际上使用的是这个总 iteration 数
                     "batch_size": config.get("batch_size", 8),
                     "learning_rate": config.get("learning_rate", 0.01),
                     "num_classes": 1,
@@ -345,38 +637,193 @@ class AnomalyTrainer:
                     "weight_path": None
                 })
             })
+
+            if resume:
+                resume_path = self._find_latest_resume_path(save_dir)
+                if resume_path:
+                    m = re.search(r"iter_(\d+)", resume_path)
+                    if m:
+                        resume_iter = int(m.group(1))
+                        if total_iters <= resume_iter:
+                            total_iters = resume_iter + 1
+                            total_epochs = max(total_epochs, (total_iters + iters_per_epoch - 1) // iters_per_epoch)
+                            pdx_cfg["Train"]["epochs_iters"] = total_iters
+                            pdx_cfg["Train"]["epochs"] = total_epochs
+                            if task_id in self.training_status:
+                                self.training_status[task_id]["total_epochs"] = total_epochs
+                                self.training_status[task_id]["total_iters"] = total_iters
+                                self._persist_state_if_due(force=True)
+                            self._add_log(task_id, f"Adjusted total_iters to {total_iters} to continue from checkpoint iter_{resume_iter}")
+                    pdx_cfg["Train"]["resume_path"] = resume_path
+                    if task_id in self.training_status:
+                        self.training_status[task_id]["resume_path"] = resume_path
+                        self._persist_state_if_due(force=True)
+                    self._add_log(task_id, f"Stage 2/4: Resuming from checkpoint: {resume_path}")
+                else:
+                    self._add_log(task_id, "Stage 2/4: No valid checkpoint found; training from scratch.")
             
             self._add_log(task_id, f"Stage 2/4: Initializing {model_name} trainer...")
             from paddlex.modules.anomaly_detection import UadTrainer
-            trainer_obj = UadTrainer(pdx_cfg)
             
-            self.training_status[task_id]["progress"] = 10
-            self._add_log(task_id, "Stage 3/4: Starting core training process...")
-            
-            # 2. 启动日志监控
-            log_file = os.path.join(save_dir, "train.log")
-            monitor = TrainingMonitor(task_id, log_file, self)
-            monitor.start()
-            
-            # 3. 执行训练
+            # 尝试静默掉 PaddleSeg 的控制台输出，只保留文件日志
             try:
-                trainer_obj.train()
-                self._add_log(task_id, "Stage 4/4: Finalizing and saving model...")
-                time.sleep(1) # 给日志监控一点时间同步最后几行
-                
-                # 显式输出 100% 进度日志
-                self.training_status[task_id]["progress"] = 100
-                self._add_log(task_id, "Training Progress: 100% | Status: Completed")
-                self._add_log(task_id, "PaddleX training completed successfully.")
-                self.training_status[task_id]["status"] = "completed"
-            finally:
-                monitor.stop()
+                import logging
+                for name in ["paddleseg", "paddle", "paddlex"]:
+                    l = logging.getLogger(name)
+                    for h in l.handlers[:]:
+                        if isinstance(h, logging.StreamHandler):
+                            l.removeHandler(h)
+                    l.propagate = False
+            except:
+                pass
+
+            # 注入 monkey-patch 以获取底层的 Popen 对象 (Thread-safe)
+            import subprocess
+            original_popen = subprocess.Popen
             
+            def patched_popen(*args, **kwargs):
+                proc = original_popen(*args, **kwargs)
+                # 从线程局部变量中获取当前任务 ID
+                tid = getattr(self._thread_local, 'task_id', None)
+                if tid:
+                    self.processes[tid] = proc
+                return proc
+            
+            from paddlex.repo_apis.base.utils import subprocess as pdx_subprocess
+            pdx_subprocess.subprocess.Popen = patched_popen
+
+            monitor = None
+            
+            # 标记为等待队列状态
+            if not parallel_train:
+                self.training_status[task_id]["status"] = "pending"
+                self._add_log(task_id, "Waiting for GPU resources (Queued)...")
+                # 立即持久化状态，确保前端能看到 "pending"
+                self._persist_state_if_due(force=True)
+            
+            # 定义实际执行训练的逻辑闭包
+            def run_core_train():
+                try:
+                    # 获取到 GPU，更新状态为 starting
+                    self.training_status[task_id]["status"] = "starting"
+                    self._add_log(task_id, "GPU resource acquired. Initializing trainer...")
+                    
+                    trainer_obj = UadTrainer(pdx_cfg)
+                    
+                    self.training_status[task_id]["progress"] = 10
+                    self._add_log(task_id, "Stage 3/4: Starting core training process...")
+                    
+                    # 2. 启动日志监控
+                    log_file = os.path.join(save_dir, "train.log")
+                    monitor = TrainingMonitor(task_id, log_file, self)
+                    monitor.start()
+                    
+                    # 3. 执行训练
+                    trainer_obj.train()
+                    
+                    # 4. 训练成功后的处理
+                    self._add_log(task_id, "Stage 4/4: Finalizing and saving model...")
+                    time.sleep(1) # 给日志监控一点时间同步最后几行
+                    
+                    # 显式输出 100% 进度日志
+                    self.training_status[task_id]["progress"] = 100
+                    self._add_log(task_id, "Training Progress: 100% | Status: Completed")
+                    self._add_log(task_id, "PaddleX training completed successfully.")
+                    self.training_status[task_id]["status"] = "completed"
+                    
+                    # 发布完成状态
+                    messenger.publish(f"task_status_{task_id}", {
+                        "task_id": task_id,
+                        "type": "completed",
+                        "progress": 100
+                    })
+                    
+                    # 训练成功后清理中间检查点
+                    self._cleanup_checkpoints(task_id, save_dir)
+                    
+                finally:
+                    # 恢复原始的 Popen
+                    pdx_subprocess.subprocess.Popen = original_popen
+                    if task_id in self.processes:
+                        del self.processes[task_id]
+                    
+                    if monitor:
+                        monitor.stop()
+                    
+                    self._persist_state_if_due(force=True)
+
+            # 根据 parallel_train 决定是否使用信号量排队
+            if parallel_train:
+                run_core_train()
+            else:
+                with self._gpu_semaphore:
+                    run_core_train()
+
+        except Exception:
+            raise
+
+    def resume_task(self, task_id: str, resume_path: str = None):
+        """
+        恢复一个已停止或中断的任务
+        """
+        if task_id not in self.training_status:
+            return {"status": "error", "message": "Task not found"}
+        
+        task_info = self.training_status[task_id]
+        status = task_info.get("status")
+        
+        # 只有不在运行中的任务可以恢复
+        thread = self.threads.get(task_id)
+        if status in {"starting", "training"} and thread and thread.is_alive():
+            return {"status": "error", "message": "Task is already running"}
+        
+        # 确定恢复路径
+        save_dir = task_info.get("save_dir")
+        actual_resume_path = resume_path or self._find_latest_resume_path(save_dir)
+        
+        if not actual_resume_path or not os.path.exists(actual_resume_path):
+             return {"status": "error", "message": "No valid checkpoint found to resume from"}
+
+        # 更新状态并启动
+        task_info["status"] = "starting"
+        task_info["progress"] = min(task_info.get("progress", 0), 90)
+        task_info["resume_path"] = actual_resume_path
+        self._add_log(task_id, f"Manual resume requested. Using checkpoint: {actual_resume_path}")
+        
+        thread = threading.Thread(
+            target=self._train_process,
+            args=(task_id, task_info.get("dataset_dir"), task_info.get("config"), True),
+        )
+        self.threads[task_id] = thread
+        thread.start()
+        
+        self._persist_state_if_due(force=True)
+        return {"status": "success", "task_id": task_id, "resume_path": actual_resume_path}
+
+    def _cleanup_checkpoints(self, task_id: str, save_dir: str):
+        """
+        训练完成后清理中间检查点，只保留 best_model
+        """
+        if not save_dir or not os.path.exists(save_dir):
+            return
+            
+        self._add_log(task_id, "Cleaning up intermediate checkpoints, keeping best_model...")
+        try:
+            cleaned_count = 0
+            # 遍历 save_dir 下的一级子目录
+            for item in os.listdir(save_dir):
+                item_path = os.path.join(save_dir, item)
+                if not os.path.isdir(item_path):
+                    continue
+                
+                # 策略：删除所有以 epoch_ 开头的目录，保留 best_model 和其他可能的重要目录
+                if item.startswith("epoch_"):
+                    shutil.rmtree(item_path)
+                    cleaned_count += 1
+            
+            self._add_log(task_id, f"Cleanup finished. Removed {cleaned_count} intermediate checkpoint directories.")
         except Exception as e:
-            error_msg = f"Training failed: {str(e)}"
-            self._add_log(task_id, error_msg)
-            self.training_status[task_id]["status"] = "failed"
-            self.training_status[task_id]["error"] = str(e)
+            self._add_log(task_id, f"Warning: Failed to cleanup checkpoints: {e}")
 
     def get_status(self, task_id: str):
         """
