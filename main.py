@@ -1,6 +1,7 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 import asyncio
@@ -44,6 +45,10 @@ app.add_middleware(
     allow_methods=["*"],  # 允许所有方法 (GET, POST, OPTIONS 等)
     allow_headers=["*"],  # 允许所有请求头
 )
+
+# 挂载静态文件目录，允许通过 HTTP 访问训练数据图片
+# 假设所有训练数据都保存在当前目录下的项目文件夹中
+app.mount("/static", StaticFiles(directory=os.getcwd()), name="static")
 
 # 定义 COCO 数据模型
 class COCOAnnotation(BaseModel):
@@ -105,6 +110,7 @@ class TrainRequest(BaseModel):
     learning_rate: float = 0.01
     label_names: Optional[List[str]] = None
     resume_path: Optional[str] = None # 可选的恢复训练路径
+    resume_mode: Optional[str] = "interrupted" # 续训模式: "interrupted" (中断续训) 或 "extended" (完结续训)
     parallel_train: bool = False # 是否开启多线程并行训练（默认为串行排队）
 
 @app.post("/train/anomaly")
@@ -268,6 +274,7 @@ async def train_anomaly(request: TrainRequest):
                 "data_version": request.data_version,
                 "run_count": request.run_count,
                 "resume_path": request.resume_path,
+                "resume_mode": request.resume_mode,
                 "parallel_train": request.parallel_train
             }
             
@@ -296,7 +303,50 @@ async def get_train_status(task_id: str):
     查询单个训练任务状态 (单个 label)
     """
     status = trainer.get_status(task_id)
+    if status.get("status") == "not_found":
+        raise HTTPException(status_code=404, detail="Task not found")
     return status
+
+@app.get("/train/data/{task_id}")
+async def get_train_data(task_id: str):
+    """
+    获取某个训练任务所使用的图片列表及访问 URL
+    """
+    status = trainer.get_status(task_id)
+    if status.get("status") == "not_found":
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    dataset_dir = status.get("dataset_dir")
+    if not dataset_dir or not os.path.exists(dataset_dir):
+        raise HTTPException(status_code=404, detail="Dataset directory not found")
+    
+    images_dir = os.path.join(dataset_dir, "images")
+    if not os.path.exists(images_dir):
+        return {"task_id": task_id, "images": []}
+    
+    image_files = [f for f in os.listdir(images_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+    
+    # 构建相对于静态目录的路径
+    cwd = os.getcwd()
+    try:
+        rel_dataset_path = os.path.relpath(images_dir, cwd)
+    except ValueError:
+        # 如果不在同一个驱动器或无法计算相对路径
+        raise HTTPException(status_code=500, detail="Cannot calculate relative path for images")
+
+    result = []
+    for f in image_files:
+        result.append({
+            "name": f,
+            "url": f"/static/{rel_dataset_path}/{f}".replace("\\", "/")
+        })
+    
+    return {
+        "task_id": task_id,
+        "label": status.get("label"),
+        "total": len(result),
+        "images": result
+    }
 
 @app.get("/train/status/group/{group_id}")
 async def get_group_train_status(group_id: str):
@@ -395,13 +445,14 @@ async def get_task_checkpoints(task_id: str):
     return {"task_id": task_id, "checkpoints": checkpoints}
 
 @app.post("/train/resume/{task_id}")
-async def resume_train_task(task_id: str, resume_path: Optional[str] = None):
+async def resume_train_task(task_id: str, resume_path: Optional[str] = None, resume_mode: Optional[str] = None):
     """
     显式恢复某个训练任务
     :param task_id: 任务 ID
     :param resume_path: 可选，指定具体的检查点路径。如果不传，则自动寻找最新的。
+    :param resume_mode: 可选，指定续训模式 ("interrupted" 或 "extended")。
     """
-    result = trainer.resume_task(task_id, resume_path=resume_path)
+    result = trainer.resume_task(task_id, resume_path=resume_path, resume_mode=resume_mode)
     if result.get("status") == "error":
         raise HTTPException(status_code=400, detail=result.get("message"))
     return result

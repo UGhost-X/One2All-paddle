@@ -642,22 +642,35 @@ class AnomalyTrainer:
                 resume_path = self._find_latest_resume_path(save_dir)
                 if resume_path:
                     m = re.search(r"iter_(\d+)", resume_path)
+                    resume_iter = 0
                     if m:
                         resume_iter = int(m.group(1))
-                        if total_iters <= resume_iter:
-                            total_iters = resume_iter + 1
-                            total_epochs = max(total_epochs, (total_iters + iters_per_epoch - 1) // iters_per_epoch)
-                            pdx_cfg["Train"]["epochs_iters"] = total_iters
-                            pdx_cfg["Train"]["epochs"] = total_epochs
-                            if task_id in self.training_status:
-                                self.training_status[task_id]["total_epochs"] = total_epochs
-                                self.training_status[task_id]["total_iters"] = total_iters
-                                self._persist_state_if_due(force=True)
-                            self._add_log(task_id, f"Adjusted total_iters to {total_iters} to continue from checkpoint iter_{resume_iter}")
-                    pdx_cfg["Train"]["resume_path"] = resume_path
+                    
+                    resume_mode = config.get("resume_mode", "interrupted")
+                    
+                    if total_iters <= resume_iter:
+                        # 无论哪种模式，如果目标轮数不大于当前进度，都至少增加 1 个 iter 以允许程序运行
+                        total_iters = resume_iter + 1
+                        total_epochs = (total_iters + iters_per_epoch - 1) // iters_per_epoch
+                        self._add_log(task_id, f"Stage 2/4: Current progress ({resume_iter}) >= target. Adjusting target to {total_iters} iters to allow continuation.")
+                    
+                    if resume_mode == "extended":
+                        # 完结续训：前端已经传回了累加后的总目标轮次
+                        self._add_log(task_id, f"Stage 2/4: Extended resume mode. New total target: {total_iters} iters ({total_epochs} epochs)")
+                    else:
+                        # 中断续训：恢复到原本设定的总轮数
+                        self._add_log(task_id, f"Stage 2/4: Interrupted resume mode. Resuming to target: {total_iters} iters ({total_epochs} epochs)")
+
+                    pdx_cfg["Train"]["epochs_iters"] = total_iters
+                    pdx_cfg["Train"]["epochs"] = total_epochs
+                    
                     if task_id in self.training_status:
+                        self.training_status[task_id]["total_epochs"] = total_epochs
+                        self.training_status[task_id]["total_iters"] = total_iters
                         self.training_status[task_id]["resume_path"] = resume_path
                         self._persist_state_if_due(force=True)
+
+                    pdx_cfg["Train"]["resume_path"] = resume_path
                     self._add_log(task_id, f"Stage 2/4: Resuming from checkpoint: {resume_path}")
                 else:
                     self._add_log(task_id, "Stage 2/4: No valid checkpoint found; training from scratch.")
@@ -762,7 +775,7 @@ class AnomalyTrainer:
         except Exception:
             raise
 
-    def resume_task(self, task_id: str, resume_path: str = None):
+    def resume_task(self, task_id: str, resume_path: str = None, resume_mode: str = None):
         """
         恢复一个已停止或中断的任务
         """
@@ -777,6 +790,12 @@ class AnomalyTrainer:
         if status in {"starting", "training"} and thread and thread.is_alive():
             return {"status": "error", "message": "Task is already running"}
         
+        # 如果传入了新的 resume_mode，则更新配置
+        if resume_mode:
+            if "config" not in task_info:
+                task_info["config"] = {}
+            task_info["config"]["resume_mode"] = resume_mode
+
         # 确定恢复路径
         save_dir = task_info.get("save_dir")
         actual_resume_path = resume_path or self._find_latest_resume_path(save_dir)
