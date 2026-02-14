@@ -19,6 +19,7 @@ import random
 import platform
 import warnings
 import logging
+import uuid as uuid_lib
 from pathlib import Path
 
 # 屏蔽框架无关紧要的日志和警告
@@ -100,9 +101,6 @@ class TrainRequest(BaseModel):
     coco_data: COCOData # 对应的 COCO 标注数据
     base_path: str # 基础路径，例如 "/data/projects"
     project_id: str # 项目 ID
-    version: str # 版本号
-    data_version: str # 数据版本
-    run_count: int = 1 # 运行次数
     model_name: str = "STFPM"
     train_epochs: Optional[int] = None # 建议使用 train_iters，若提供则自动换算
     train_iters: Optional[int] = None  # 推荐：显式指定训练迭代次数
@@ -117,10 +115,11 @@ class TrainRequest(BaseModel):
 async def train_anomaly(request: TrainRequest):
     """
     接收 COCO 数据，按照特定层级结构保存裁剪信息并启动训练
-    层级结构: {base_path}/{project_id}/train/{data_version}/{run_count}/{label}/
+    层级结构: {base_path}/{project_id}/train/{uuid}/{label}/
+    输出路径: output/{project_id}/{uuid}/{label_name}/
     """
-    # 1. 构建目录层级
-    # 映射 category_id 到 label 名称
+    task_uuid = uuid_lib.uuid4().hex[:8]
+    
     cat_map = {cat.id: cat.name for cat in request.coco_data.categories} if request.coco_data.categories else {}
     
     if platform.system().lower() == "linux":
@@ -128,7 +127,7 @@ async def train_anomaly(request: TrainRequest):
     else:
         normalized_base = request.base_path.replace("\\", "/")
     
-    storage_base = Path(normalized_base) / request.project_id / "train" / request.data_version / str(request.run_count)
+    storage_base = Path(normalized_base) / request.project_id / "train" / task_uuid
     
     try:
         # 2. 解码所有图片
@@ -270,9 +269,7 @@ async def train_anomaly(request: TrainRequest):
                 "batch_size": request.batch_size,
                 "learning_rate": request.learning_rate,
                 "project_id": request.project_id,
-                "version": request.version,
-                "data_version": request.data_version,
-                "run_count": request.run_count,
+                "task_uuid": task_uuid,
                 "resume_path": request.resume_path,
                 "resume_mode": request.resume_mode,
                 "parallel_train": request.parallel_train
@@ -287,8 +284,8 @@ async def train_anomaly(request: TrainRequest):
         return {
             "status": "success",
             "project_id": request.project_id,
+            "task_uuid": task_uuid,
             "group_id": group_id,
-            "data_version": request.data_version,
             "storage_path": str(storage_base),
             "total_crops": crop_count,
             "tasks": task_results
@@ -306,6 +303,158 @@ async def get_train_status(task_id: str):
     if status.get("status") == "not_found":
         raise HTTPException(status_code=404, detail="Task not found")
     return status
+
+@app.get("/project/{project_id}/datasets")
+async def get_project_datasets(project_id: str):
+    """
+    获取项目级历史训练数据列表。
+    返回该项目下所有已存在的训练数据快照（基于目录结构）。
+    路径结构: {project_id}/train/{uuid}/{label}
+    """
+    base_dir = os.path.join(os.getcwd(), project_id, "train")
+    
+    if not os.path.exists(base_dir):
+        return {"project_id": project_id, "datasets": []}
+    
+    datasets = []
+    
+    for task_uuid in os.listdir(base_dir):
+        uuid_path = os.path.join(base_dir, task_uuid)
+        if not os.path.isdir(uuid_path):
+            continue
+            
+        for label in os.listdir(uuid_path):
+            label_path = os.path.join(uuid_path, label)
+            if not os.path.isdir(label_path):
+                continue
+            
+            images_dir = os.path.join(label_path, "images")
+            if not os.path.exists(images_dir):
+                continue
+                
+            image_files = [f for f in os.listdir(images_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+            image_count = len(image_files)
+            
+            images_preview = []
+            try:
+                rel_images_path = os.path.relpath(images_dir, os.getcwd())
+                for f in sorted(image_files):
+                    images_preview.append({
+                        "filename": f,
+                        "url": f"/static/{rel_images_path}/{f}"
+                    })
+            except ValueError:
+                pass
+
+            datasets.append({
+                "task_uuid": task_uuid,
+                "label": label,
+                "image_count": image_count,
+                "dataset_path": label_path,
+                "relative_path": os.path.relpath(label_path, os.getcwd()),
+                "images": images_preview
+            })
+    
+    return {"project_id": project_id, "datasets": datasets}
+
+@app.get("/project/{project_id}/models")
+async def get_project_models(project_id: str):
+    """
+    获取项目级历史模型列表。
+    遍历 output/project_id 下的所有任务，收集已完成的模型。
+    路径结构: output/{project_id}/{uuid}/{label_name}
+    """
+    output_base = os.path.join(os.getcwd(), "output", project_id)
+    
+    if not os.path.exists(output_base):
+        return {"project_id": project_id, "models": []}
+        
+    models = []
+    
+    for task_uuid in os.listdir(output_base):
+        uuid_path = os.path.join(output_base, task_uuid)
+        if not os.path.isdir(uuid_path):
+            continue
+            
+        for label in os.listdir(uuid_path):
+            label_path = os.path.join(uuid_path, label)
+            if not os.path.isdir(label_path):
+                continue
+                
+            best_model_path = os.path.join(label_path, "best_model")
+            has_best_model = os.path.exists(best_model_path) and os.path.exists(os.path.join(best_model_path, "model.pdparams"))
+            
+            latest_checkpoint = None
+            max_iter = -1
+            for item in os.listdir(label_path):
+                if item.startswith("iter_") and os.path.isdir(os.path.join(label_path, item)):
+                    try:
+                        it = int(item.split("_")[1])
+                        if it > max_iter:
+                            max_iter = it
+                            latest_checkpoint = item
+                    except ValueError:
+                        continue
+            
+            if has_best_model or latest_checkpoint:
+                model_files = []
+                try:
+                    rel_label_path = os.path.relpath(label_path, os.getcwd())
+                    
+                    if has_best_model:
+                        rel_best_path = os.path.join(rel_label_path, "best_model")
+                        for f in os.listdir(best_model_path):
+                             if os.path.isfile(os.path.join(best_model_path, f)):
+                                model_files.append({
+                                    "name": f"best_model/{f}",
+                                    "url": f"/static/{rel_best_path}/{f}",
+                                    "type": "best_model"
+                                })
+                    
+                    if latest_checkpoint:
+                         checkpoint_dir = os.path.join(label_path, latest_checkpoint)
+                         rel_ckpt_path = os.path.join(rel_label_path, latest_checkpoint)
+                         for f in os.listdir(checkpoint_dir):
+                             if os.path.isfile(os.path.join(checkpoint_dir, f)):
+                                 model_files.append({
+                                     "name": f"{latest_checkpoint}/{f}",
+                                     "url": f"/static/{rel_ckpt_path}/{f}",
+                                     "type": "checkpoint"
+                                 })
+                    
+                    train_log = os.path.join(label_path, "train.log")
+                    if os.path.exists(train_log):
+                        model_files.append({
+                            "name": "train.log",
+                            "url": f"/static/{rel_label_path}/train.log",
+                            "type": "log"
+                        })
+                        
+                    vdl_dir = os.path.join(label_path, "vdl_log")
+                    if os.path.exists(vdl_dir):
+                         rel_vdl_path = os.path.join(rel_label_path, "vdl_log")
+                         for f in os.listdir(vdl_dir):
+                             model_files.append({
+                                 "name": f"vdl_log/{f}",
+                                 "url": f"/static/{rel_vdl_path}/{f}",
+                                 "type": "vdl_log"
+                             })
+
+                except ValueError:
+                    pass
+
+                models.append({
+                    "task_uuid": task_uuid,
+                    "label": label,
+                    "has_best_model": has_best_model,
+                    "latest_checkpoint": latest_checkpoint,
+                    "latest_iter": max_iter,
+                    "model_path": label_path,
+                    "relative_path": os.path.relpath(label_path, os.getcwd()),
+                    "files": model_files
+                })
+
+    return {"project_id": project_id, "models": models}
 
 @app.get("/train/data/{task_id}")
 async def get_train_data(task_id: str):

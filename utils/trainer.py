@@ -9,10 +9,14 @@ import ctypes
 import logging
 import traceback
 import warnings
+import subprocess
+import signal
 from utils.messaging import messenger
 from pathlib import Path
 
-# 屏蔽无用警告
+os.environ["PYTHONUNBUFFERED"] = "1"
+os.environ[" paddle_infer_flag_info " ] = "1"
+
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -25,11 +29,14 @@ class TrainingMonitor:
     """
     负责监控日志文件并更新训练状态
     """
-    def __init__(self, task_id: str, log_file: str, trainer_instance):
+    def __init__(self, task_id: str, log_file: str, trainer_instance, timeout_seconds: int = 600):
         self.task_id = task_id
         self.log_file = log_file
         self.trainer = trainer_instance
         self.stop_event = threading.Event()
+        self.timeout_seconds = timeout_seconds
+        self.last_log_time = time.time()
+        self.last_iter = 0
 
     def start(self):
         self.trainer._add_log(self.task_id, f"Log monitor started for {os.path.basename(self.log_file)}")
@@ -39,6 +46,28 @@ class TrainingMonitor:
 
     def stop(self):
         self.stop_event.set()
+
+    def _check_stalled(self):
+        """检测训练是否停滞（长时间没有新日志）"""
+        current_time = time.time()
+        status = self.trainer.training_status.get(self.task_id)
+        if not status:
+            return False
+        
+        progress = status.get("progress", 0)
+        iter_progress = status.get("metrics", [])
+        current_iter = len(iter_progress) if iter_progress else 0
+        
+        time_since_last_log = current_time - self.last_log_time
+        
+        if progress > 0 and progress < 100:
+            if time_since_last_log > self.timeout_seconds:
+                if current_iter == self.last_iter:
+                    self.trainer._add_log(self.task_id, f"ERROR: Training stalled for {self.timeout_seconds}s without progress. Current iter: {current_iter}")
+                    return True
+        
+        self.last_iter = current_iter
+        return False
 
     def _monitor_loop(self):
         """
@@ -57,16 +86,24 @@ class TrainingMonitor:
 
         with open(self.log_file, "r") as f:
             while True:
+                if self.stop_event.is_set():
+                    remaining_line = f.readline()
+                    if remaining_line:
+                        self._parse_line(remaining_line)
+                    break
+                
                 line = f.readline()
                 if not line:
-                    if self.stop_event.is_set():
-                        # 在退出前再尝试读一次，确保不漏掉最后几行
-                        remaining_line = f.readline()
-                        if remaining_line:
-                            self._parse_line(remaining_line)
+                    if self._check_stalled():
+                        self.trainer._add_log(self.task_id, "Training timeout detected. Forcing termination.")
+                        self.trainer.training_status[self.task_id]["status"] = "failed"
+                        self.trainer.training_status[self.task_id]["error"] = "Training stalled - timeout"
+                        self.stop_event.set()
                         break
-                    time.sleep(0.5)
+                    time.sleep(1)
                     continue
+                
+                self.last_log_time = time.time()
                 self._parse_line(line)
 
         self.trainer._add_log(self.task_id, "Log monitor thread finished.")
@@ -103,6 +140,8 @@ class TrainingMonitor:
             total_iters = int(train_match.group(3))
             loss = float(train_match.group(4))
             lr = float(train_match.group(5))
+            
+            self.last_log_time = time.time()
             
             metrics = {
                 "epoch": epoch,
@@ -247,6 +286,41 @@ class AnomalyTrainer:
             json.dump(data, f, ensure_ascii=False)
         os.replace(tmp_path, self.state_file)
 
+    def _check_gpu_available(self) -> bool:
+        """检查 GPU 是否可用"""
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode != 0:
+                return False
+            
+            lines = result.stdout.strip().split('\n')
+            if not lines:
+                return False
+            
+            total_free = 0
+            for line in lines:
+                parts = line.split(',')
+                if len(parts) >= 2:
+                    used = float(parts[0].strip())
+                    total = float(parts[1].strip())
+                    free = total - used
+                    if free > 2000:
+                        total_free += free
+            
+            if total_free < 2000:
+                logger.warning(f"Low GPU memory: {total_free}MB available")
+                return False
+            
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to check GPU status: {e}")
+            return False
+
     def _persist_state_if_due(self, force: bool = False):
         now = time.time()
         if not force and now - self._last_persist_ts < 1.0:
@@ -265,9 +339,7 @@ class AnomalyTrainer:
         return "|".join(
             [
                 str(config.get("project_id", "")),
-                str(config.get("version", "")),
-                str(config.get("data_version", "")),
-                str(config.get("run_count", "")),
+                str(config.get("task_uuid", "")),
                 str(config.get("model_name", "")),
                 str(config.get("label_name", "")),
                 str(dataset_dir),
@@ -275,27 +347,42 @@ class AnomalyTrainer:
         )
 
     def _find_latest_resume_path(self, save_dir: str):
-        latest = None
+        latest_file = None
         latest_mtime = -1.0
+        logger.info(f"Searching for checkpoints in: {save_dir}")
         for root, _, files in os.walk(save_dir):
             if "model.pdparams" not in files:
                 continue
+            # 恢复训练通常需要优化器状态 .pdopt
             if "model.pdopt" not in files:
+                logger.debug(f"Skipping {root}: model.pdopt not found")
                 continue
+            
             pdparams = os.path.join(root, "model.pdparams")
             try:
                 mtime = os.path.getmtime(pdparams)
             except Exception:
                 continue
+                
             if mtime > latest_mtime:
                 latest_mtime = mtime
-                latest = pdparams
-        return latest
+                latest_file = pdparams # 返回文件路径，PaddleSeg 要求指向 model.pdparams
+        
+        if latest_file:
+            logger.info(f"Found latest checkpoint: {latest_file} (mtime: {latest_mtime})")
+        else:
+            logger.info(f"No valid checkpoint (with .pdopt) found in {save_dir}")
+        return latest_file
 
     def run_training_async(self, dataset_dir: str, config: dict, group_id: str = None):
         """
         启动后台线程执行训练
         """
+        project_id = config.get("project_id", "unknown")
+        
+        if not self._check_gpu_available():
+            logger.warning(f"[{project_id}] Low GPU memory or GPU unavailable. Training may fail.")
+        
         task_key = self._make_task_key(dataset_dir, config)
         existing_task_id = self.task_key_index.get(task_key)
         if existing_task_id and existing_task_id in self.training_status:
@@ -333,24 +420,46 @@ class AnomalyTrainer:
                 self._persist_state_if_due(force=True)
                 return existing_task_id
 
-        task_id = f"task_{int(time.time())}_{config.get('label_name', 'unknown')}_{random.randint(1000, 9999)}"
-        label_name = config.get("label_name", "unknown")
-        save_dir = os.path.join(self.output_dir, config.get("project_id", "default"), label_name, task_id)
-        self.training_status[task_id] = {
-            "status": "starting", 
-            "progress": 0,
-            "label": label_name,
-            "group_id": group_id,
-            "logs": [f"Task {task_id} initialized."],
-            "metrics": [], # 存储 Epoch 级别的指标
-            "total_epochs": config.get("epochs", 50),
-            "start_time": time.time(),
-            "dataset_dir": dataset_dir,
-            "save_dir": save_dir,
-            "config": config,
-            "task_key": task_key,
-        }
-        self.task_key_index[task_key] = task_id
+        if existing_task_id:
+            task_id = existing_task_id
+            self._add_log(task_id, f"Reusing task_id: {task_id}")
+            
+            # 只有在非续训模式下才重置状态
+            # 如果是续训 (resume=True)，则保留 logs 和 metrics 以便查看历史
+            resume = config.get("resume", False)
+            if not resume:
+                logger.info(f"Resetting task status for restart: {task_id}")
+                self.training_status[task_id].update({
+                    "status": "starting",
+                    "progress": 0,
+                    "logs": [],
+                    "metrics": [],
+                    "start_time": time.time(),
+                    "resume_path": None,
+                    "error": None
+                })
+                self._add_log(task_id, "Task restarted from scratch. Previous logs cleared.")
+        else:
+            task_id = f"task_{int(time.time())}_{config.get('label_name', 'unknown')}_{random.randint(1000, 9999)}"
+            label_name = config.get("label_name", "unknown")
+            task_uuid = config.get("task_uuid", "unknown")
+            save_dir = os.path.join(self.output_dir, config.get("project_id", "default"), task_uuid, label_name)
+            self.training_status[task_id] = {
+                "status": "starting", 
+                "progress": 0,
+                "label": label_name,
+                "task_uuid": task_uuid,
+                "group_id": group_id,
+                "logs": [f"Task {task_id} initialized."],
+                "metrics": [], # 存储 Epoch 级别的指标
+                "total_epochs": config.get("epochs", 50),
+                "start_time": time.time(),
+                "dataset_dir": dataset_dir,
+                "save_dir": save_dir,
+                "config": config,
+                "task_key": task_key,
+            }
+            self.task_key_index[task_key] = task_id
         
         # 记录到组
         if group_id:
@@ -507,6 +616,11 @@ class AnomalyTrainer:
         
         while retry_count <= max_retries:
             try:
+                # 检查任务是否已被手动取消
+                if self.training_status.get(task_id, {}).get("status") == "cancelled":
+                    logger.info(f"[{task_id}] Task cancelled before starting/retrying.")
+                    return
+
                 if retry_count > 0:
                     self._add_log(task_id, f"Auto-retrying training ({retry_count}/{max_retries})...")
                     # 重试时强制开启续训模式
@@ -516,7 +630,23 @@ class AnomalyTrainer:
                 # 如果执行到这里没有抛出异常，说明训练成功，退出循环
                 break
                 
+            except (SystemExit, KeyboardInterrupt):
+                # 显式捕获手动停止引发的异常 (ctypes 注入的 SystemExit 或终端 Ctrl+C)
+                logger.info(f"[{task_id}] Training thread received stop signal (SystemExit/KeyboardInterrupt).")
+                # 再次确认状态，确保状态一致性
+                if task_id in self.training_status:
+                    self.training_status[task_id]["status"] = "cancelled"
+                self._persist_state_if_due(force=True)
+                return
+
             except Exception as e:
+                # 关键：检查任务是否是通过 API 手动中止的
+                # 在 stop_task API 调用时，状态会被设置为 'cancelled'
+                current_status = self.training_status.get(task_id, {}).get("status")
+                if current_status == "cancelled":
+                    logger.info(f"[{task_id}] Task was cancelled via API, skipping retry.")
+                    return
+
                 retry_count += 1
                 if retry_count > max_retries:
                     tb = traceback.format_exc()
@@ -566,8 +696,9 @@ class AnomalyTrainer:
 
             # 1. 构造 PaddleX 训练配置
             model_name = config.get("model_name", "STFPM")
+            task_uuid = config.get("task_uuid", "unknown")
             save_dir = self.training_status.get(task_id, {}).get("save_dir") or os.path.join(
-                self.output_dir, config.get("project_id", "default"), label_name, task_id
+                self.output_dir, config.get("project_id", "default"), task_uuid, label_name
             )
             os.makedirs(save_dir, exist_ok=True)
             if task_id in self.training_status:
@@ -623,24 +754,26 @@ class AnomalyTrainer:
                 }),
                 "Train": AttrDict({
                     "epochs": total_epochs,
-                    "epochs_iters": total_iters, # PaddleSeg 实际上使用的是这个总 iteration 数
+                    "epochs_iters": total_iters,
                     "batch_size": config.get("batch_size", 8),
                     "learning_rate": config.get("learning_rate", 0.01),
                     "num_classes": 1,
                     "pretrain_weight_path": None,
                     "resume_path": None,
                     "log_interval": 1,
-                    "eval_interval": 1,
-                    "save_interval": 1
+                    "eval_interval": 5,
+                    "save_interval": 10
                 }),
                 "Evaluate": AttrDict({
                     "weight_path": None
                 })
             })
 
+            self._add_log(task_id, f"Stage 2/4: Initializing {model_name} trainer (Resume: {resume})...")
             if resume:
                 resume_path = self._find_latest_resume_path(save_dir)
                 if resume_path:
+                    self._add_log(task_id, f"Stage 2/4: Found checkpoint for resume: {resume_path}")
                     m = re.search(r"iter_(\d+)", resume_path)
                     resume_iter = 0
                     if m:
@@ -675,7 +808,6 @@ class AnomalyTrainer:
                 else:
                     self._add_log(task_id, "Stage 2/4: No valid checkpoint found; training from scratch.")
             
-            self._add_log(task_id, f"Stage 2/4: Initializing {model_name} trainer...")
             from paddlex.modules.anomaly_detection import UadTrainer
             
             # 尝试静默掉 PaddleSeg 的控制台输出，只保留文件日志
