@@ -33,6 +33,8 @@ logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 from utils.augmentation import DataAugmentor
 from utils.trainer import trainer
+from utils.deployer import deployer
+from dataclasses import asdict
 
 logger = logging.getLogger(__name__)
 
@@ -522,27 +524,24 @@ async def stop_group_train(group_id: str):
     return result
 
 @app.get("/train/events/{task_id}")
-async def train_events(task_id: str, auto_delete: bool = True):
+async def train_events(task_id: str):
     """
     SSE 实时推送训练进度和日志
-    :param auto_delete: 是否在读取历史消息后自动删除数据库中的记录
+    状态从 trainer 内存中直接获取，无需 ZeroMQ
     """
     async def event_generator():
         last_log_idx = 0
         while True:
-            # 1. 从 trainer 获取当前状态
+            # 从 trainer 获取当前状态（内存）
             status = trainer.get_status(task_id)
-            
-            # 2. 从消息队列获取历史消息（如果需要自动删除，可以通过 messenger.get_history）
-            # 注意：这里的 status.logs 已经包含了内存中的日志
-            # 如果前端是通过 SSE 持续订阅，我们通常不需要在这里删除
             
             data = {
                 "status": status.get("status"),
                 "progress": status.get("progress", 0),
                 "label": status.get("label"),
                 "new_logs": [],
-                "metrics": status.get("metrics", [])
+                "metrics": status.get("metrics", []),
+                "eval_metrics": status.get("eval_metrics", [])
             }
             
             logs = status.get("logs", [])
@@ -552,11 +551,7 @@ async def train_events(task_id: str, auto_delete: bool = True):
             
             yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
             
-            if status.get("status") in ["completed", "failed", "not_found"]:
-                # 如果开启了自动删除，可以在任务结束时清理该 topic 的所有消息
-                if auto_delete:
-                    from utils.messaging import messenger
-                    messenger.get_history(f"task_status_{task_id}", limit=9999, delete_after=True)
+            if status.get("status") in ["completed", "failed", "not_found", "cancelled", "interrupted"]:
                 break
                 
             await asyncio.sleep(1)
@@ -607,16 +602,20 @@ async def resume_train_task(task_id: str, resume_path: Optional[str] = None, res
     return result
 
 @app.get("/train/history/{task_id}")
-async def get_task_history(task_id: str, type: str = "log", since_ts: float = 0):
+async def get_task_history(task_id: str):
     """
-    获取任务的历史消息（从持久化数据库中）
-    :param type: 'log' 或 'status'
-    :param since_ts: 获取该时间戳之后的消息
+    获取任务的历史日志（从 trainer 内存中）
     """
-    from utils.messaging import messenger
-    topic = f"task_{type}_{task_id}"
-    history = messenger.get_history(topic, since_ts=since_ts)
-    return {"task_id": task_id, "type": type, "history": history}
+    status = trainer.get_status(task_id)
+    if status.get("status") == "not_found":
+        return {"task_id": task_id, "logs": [], "error": "Task not found"}
+    
+    return {
+        "task_id": task_id,
+        "logs": status.get("logs", []),
+        "metrics": status.get("metrics", []),
+        "eval_metrics": status.get("eval_metrics", [])
+    }
 
 @app.get("/")
 async def root():
@@ -699,7 +698,91 @@ async def augment_data(request: AugmentRequest):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
+# ==================== 模型部署 API ====================
+
+class DeployRequest(BaseModel):
+    project_id: str
+    task_uuid: str
+    port: Optional[int] = None
+
+@app.get("/deploy/models/{project_id}")
+async def list_available_models(project_id: str):
+    """
+    列出项目下所有可部署的模型（按 task_uuid 分组）
+    """
+    models = deployer.get_available_models(project_id)
+    return {
+        "project_id": project_id,
+        "models": models,
+        "total": len(models)
+    }
+
+@app.post("/deploy/start")
+async def start_deploy_service(request: DeployRequest):
+    """
+    启动推理服务（一个服务包含 task_uuid 下的所有模型）
+    """
+    result = deployer.deploy_service(
+        project_id=request.project_id,
+        task_uuid=request.task_uuid,
+        port=request.port
+    )
+    if result.get("status") == "error":
+        raise HTTPException(status_code=400, detail=result.get("message"))
+    return result
+
+@app.post("/deploy/stop/{service_id}")
+async def stop_deploy_service(service_id: str):
+    """
+    停止推理服务
+    """
+    result = deployer.stop_service(service_id)
+    if result.get("status") == "error":
+        raise HTTPException(status_code=404, detail=result.get("message"))
+    return result
+
+@app.delete("/deploy/{service_id}")
+async def delete_deploy_service(service_id: str):
+    """
+    删除推理服务
+    """
+    result = deployer.delete_service(service_id)
+    if result.get("status") == "error":
+        raise HTTPException(status_code=404, detail=result.get("message"))
+    return result
+
+@app.get("/deploy/status/{service_id}")
+async def get_deploy_status(service_id: str):
+    """
+    查询推理服务状态
+    """
+    status = deployer.get_service(service_id)
+    if status.get("status") == "not_found":
+        raise HTTPException(status_code=404, detail="Service not found")
+    return status
+
+@app.get("/deploy/uuid/{task_uuid}")
+async def get_deploy_by_uuid(task_uuid: str):
+    """
+    通过 task_uuid 查询推理服务
+    """
+    service = deployer.get_service_by_uuid(task_uuid)
+    if not service:
+        raise HTTPException(status_code=404, detail="Service not found for this task_uuid")
+    return asdict(service) if hasattr(service, '__dataclass_fields__') else service
+
+@app.get("/deploy/list")
+async def list_deploy_services(project_id: Optional[str] = None):
+    """
+    列出所有推理服务
+    """
+    services = deployer.list_services(project_id)
+    return {
+        "total": len(services),
+        "services": services
+    }
+
 if __name__ == "__main__":
     import uvicorn
     # 使用字符串导入方式 ("main:app") 才能开启 reload=True
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)

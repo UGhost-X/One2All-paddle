@@ -11,7 +11,7 @@ import traceback
 import warnings
 import subprocess
 import signal
-from utils.messaging import messenger
+# from utils.messaging import messenger  # 已移除 ZeroMQ 依赖
 from pathlib import Path
 
 os.environ["PYTHONUNBUFFERED"] = "1"
@@ -29,14 +29,17 @@ class TrainingMonitor:
     """
     负责监控日志文件并更新训练状态
     """
-    def __init__(self, task_id: str, log_file: str, trainer_instance, timeout_seconds: int = 600):
+    def __init__(self, task_id: str, log_file: str, trainer_instance, timeout_seconds: int = 600, init_timeout_seconds: int = 120):
         self.task_id = task_id
         self.log_file = log_file
         self.trainer = trainer_instance
         self.stop_event = threading.Event()
         self.timeout_seconds = timeout_seconds
+        self.init_timeout_seconds = init_timeout_seconds
         self.last_log_time = time.time()
         self.last_iter = 0
+        self.start_time = time.time()
+        self.init_log_received = False
 
     def start(self):
         self.trainer._add_log(self.task_id, f"Log monitor started for {os.path.basename(self.log_file)}")
@@ -59,6 +62,14 @@ class TrainingMonitor:
         current_iter = len(iter_progress) if iter_progress else 0
         
         time_since_last_log = current_time - self.last_log_time
+        
+        # 检测初始化阶段超时：如果超过 init_timeout_seconds 没有收到任何训练日志
+        if not self.init_log_received:
+            time_since_start = current_time - self.start_time
+            if time_since_start > self.init_timeout_seconds:
+                self.trainer._add_log(self.task_id, f"ERROR: Training initialization timeout after {self.init_timeout_seconds}s. No training log received.")
+                return True
+            return False
         
         if progress > 0 and progress < 100:
             if time_since_last_log > self.timeout_seconds:
@@ -104,6 +115,7 @@ class TrainingMonitor:
                     continue
                 
                 self.last_log_time = time.time()
+                self.init_log_received = True
                 self._parse_line(line)
 
         self.trainer._add_log(self.task_id, "Log monitor thread finished.")
@@ -142,6 +154,12 @@ class TrainingMonitor:
             lr = float(train_match.group(5))
             
             self.last_log_time = time.time()
+            
+            # 首次检测到训练日志时，更新状态为 training
+            current_status = self.trainer.training_status[self.task_id].get("status")
+            if current_status != "training":
+                self.trainer.training_status[self.task_id]["status"] = "training"
+                self.trainer._add_log(self.task_id, "Training started - first iteration detected.")
             
             metrics = {
                 "epoch": epoch,
@@ -189,13 +207,13 @@ class TrainingMonitor:
                 self.trainer.training_status[self.task_id]["metrics"] = []
             self.trainer.training_status[self.task_id]["metrics"].append(metrics)
             
-            # 通过消息队列发布指标和进度
-            messenger.publish(f"task_status_{self.task_id}", {
-                "task_id": self.task_id,
-                "type": "status_update",
-                "progress": new_progress,
-                "metrics": metrics
-            })
+            # 状态更新已存储在 training_status 内存中，通过 SSE 直接推送
+            # messenger.publish(f"task_status_{self.task_id}", {
+            #     "task_id": self.task_id,
+            #     "type": "status_update",
+            #     "progress": new_progress,
+            #     "metrics": metrics
+            # })
             
             # 限制 metrics 数量
             if len(self.trainer.training_status[self.task_id]["metrics"]) > 1000:
@@ -262,7 +280,7 @@ class AnomalyTrainer:
 
             now = time.time()
             for task_id, s in self.training_status.items():
-                if s.get("status") in {"starting", "training"}:
+                if s.get("status") in {"starting", "training", "pending", "preparing"}:
                     s["status"] = "interrupted"
                     s["interrupted_at"] = now
                     logs = s.setdefault("logs", [])
@@ -516,12 +534,12 @@ class AnomalyTrainer:
             self._add_log(task_id, "Task cancellation requested by user.")
             self.training_status[task_id]["status"] = "cancelled"
             
-            # 发布停止消息
-            messenger.publish(f"task_status_{task_id}", {
-                "task_id": task_id,
-                "type": "cancelled",
-                "message": "Task stopped by user"
-            })
+            # 发布停止消息 - 状态已存储在内存中，通过 SSE 推送
+            # messenger.publish(f"task_status_{task_id}", {
+            #     "task_id": task_id,
+            #     "type": "cancelled",
+            #     "message": "Task stopped by user"
+            # })
             
             self._persist_state_if_due(force=True)
             return {"status": "success", "message": "Cancellation requested"}
@@ -596,13 +614,13 @@ class AnomalyTrainer:
             if len(logs) > 500:
                 self.training_status[task_id]["logs"] = logs[-500:]
             
-            # 通过消息队列发布日志
-            messenger.publish(f"task_log_{task_id}", {
-                "task_id": task_id,
-                "type": "log",
-                "message": log_entry,
-                "raw_message": message
-            })
+            # 通过消息队列发布日志 - 日志已存储在内存中，通过 SSE 推送
+            # messenger.publish(f"task_log_{task_id}", {
+            #     "task_id": task_id,
+            #     "type": "log",
+            #     "message": log_entry,
+            #     "raw_message": message
+            # })
             
             logger.info(f"[{task_id}] {message}")
             self._persist_state_if_due()
@@ -655,11 +673,12 @@ class AnomalyTrainer:
                     self.training_status[task_id]["status"] = "failed"
                     self.training_status[task_id]["error"] = str(e)
                     self.training_status[task_id]["traceback"] = tb
-                    messenger.publish(f"task_status_{task_id}", {
-                        "task_id": task_id,
-                        "type": "failed",
-                        "error": str(e)
-                    })
+                    # 发布失败消息 - 状态已存储在内存中，通过 SSE 推送
+                    # messenger.publish(f"task_status_{task_id}", {
+                    #     "task_id": task_id,
+                    #     "type": "failed",
+                    #     "error": str(e)
+                    # })
                     self._persist_state_if_due(force=True)
                     return
                 
@@ -690,7 +709,7 @@ class AnomalyTrainer:
             parallel_train = config.get("parallel_train", False)
             
             self._add_log(task_id, f"Training thread started for label: {label_name} (Parallel: {parallel_train})")
-            self.training_status[task_id]["status"] = "training"
+            self.training_status[task_id]["status"] = "preparing"
             self.training_status[task_id]["progress"] = 5
             self._add_log(task_id, "Stage 1/4: Preparing training environment...")
 
@@ -876,16 +895,16 @@ class AnomalyTrainer:
                     self._add_log(task_id, "PaddleX training completed successfully.")
                     self.training_status[task_id]["status"] = "completed"
                     
-                    # 发布完成状态
-                    messenger.publish(f"task_status_{task_id}", {
-                        "task_id": task_id,
-                        "type": "completed",
-                        "progress": 100
-                    })
-                    
                     # 训练成功后清理中间检查点
                     self._cleanup_checkpoints(task_id, save_dir)
                     
+                except Exception as e:
+                    import traceback
+                    error_msg = str(e)
+                    self._add_log(task_id, f"Training failed: {error_msg}")
+                    self._add_log(task_id, traceback.format_exc())
+                    self.training_status[task_id]["status"] = "failed"
+                    self.training_status[task_id]["error"] = error_msg
                 finally:
                     # 恢复原始的 Popen
                     pdx_subprocess.subprocess.Popen = original_popen

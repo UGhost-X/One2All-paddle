@@ -165,6 +165,7 @@ tmp/
 test_*/
 __pycache__/
 8/*
+1/*
 # OS files
 .DS_Store
 Thumbs.db
