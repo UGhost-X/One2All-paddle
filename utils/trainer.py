@@ -109,6 +109,7 @@ class TrainingMonitor:
                         self.trainer._add_log(self.task_id, "Training timeout detected. Forcing termination.")
                         self.trainer.training_status[self.task_id]["status"] = "failed"
                         self.trainer.training_status[self.task_id]["error"] = "Training stalled - timeout"
+                        self.trainer.training_status[self.task_id]["_training_timeout"] = True
                         self.stop_event.set()
                         break
                     time.sleep(1)
@@ -262,7 +263,12 @@ class AnomalyTrainer:
         self.task_key_index = {}
         self.state_file = str(Path(self.output_dir) / "_one2all_trainer_state.json")
         self._state_lock = threading.Lock()
-        self._gpu_semaphore = threading.Semaphore(1) # 限制同时只能有一个训练任务占用 GPU
+        
+        gpu_count = self._get_gpu_count()
+        self._gpu_semaphore = threading.Semaphore(gpu_count) if gpu_count > 0 else threading.Semaphore(1)
+        self._gpu_count = gpu_count
+        self._gpu_assignment = {}  # task_id -> gpu_id
+        self._gpu_assignment_lock = threading.Lock()
         self._last_persist_ts = 0.0
         self._thread_local = threading.local()
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
@@ -304,8 +310,105 @@ class AnomalyTrainer:
             json.dump(data, f, ensure_ascii=False)
         os.replace(tmp_path, self.state_file)
 
+    def _get_available_gpus(self) -> list:
+        """获取可用 GPU 列表"""
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=index,memory.used,memory.total", "--format=csv,noheader,nounits"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode != 0:
+                return []
+            
+            lines = result.stdout.strip().split('\n')
+            if not lines:
+                return []
+            
+            available = []
+            for line in lines:
+                parts = line.split(',')
+                if len(parts) >= 3:
+                    gpu_id = int(parts[0].strip())
+                    used = float(parts[1].strip())
+                    total = float(parts[2].strip())
+                    free = total - used
+                    if free > 2000:
+                        available.append({
+                            "id": gpu_id,
+                            "free": free,
+                            "total": total
+                        })
+            
+            return available
+        except Exception as e:
+            logger.warning(f"Failed to get GPU info: {e}")
+            return []
+
+    def _get_gpu_count(self) -> int:
+        """获取 GPU 数量"""
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=count", "--format=csv,noheader"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                lines = result.stdout.strip().split('\n')
+                return int(lines[0].strip())
+            return 1
+        except Exception:
+            return 1
+
+    def _check_gpu_for_batch_size(self, batch_size: int) -> tuple:
+        """
+        检查是否有足够的显存支持指定 batch_size
+        返回: (bool, gpu_ids, message)
+        """
+        gpus = self._get_available_gpus()
+        
+        if not gpus:
+            return False, [], "No GPU available"
+        
+        estimated_memory_per_sample = 500
+        required_memory = batch_size * estimated_memory_per_sample
+        
+        single_gpu = [g for g in gpus if g["free"] >= required_memory]
+        
+        if single_gpu:
+            return True, [single_gpu[0]["id"]], f"Using GPU {single_gpu[0]['id']} (free: {single_gpu[0]['free']}MB)"
+        
+        if len(gpus) >= 2:
+            total_free = sum(g["free"] for g in gpus)
+            if total_free >= required_memory:
+                gpu_ids = [g["id"] for g in gpus]
+                return True, gpu_ids, f"Using {len(gpus)} GPUs (total free: {total_free}MB)"
+        
+        return False, [], f"Insufficient GPU memory for batch_size={batch_size} (need ~{required_memory}MB)"
+
+    def _assign_gpu(self, task_id: str) -> int:
+        """
+        为任务分配一个 GPU（用于并行训练）
+        返回: gpu_id
+        """
+        with self._gpu_assignment_lock:
+            used_gpus = set(self._gpu_assignment.values())
+            for gpu_id in range(self._gpu_count):
+                if gpu_id not in used_gpus:
+                    self._gpu_assignment[task_id] = gpu_id
+                    return gpu_id
+            return 0
+
+    def _release_gpu(self, task_id: str):
+        """
+        释放任务占用的 GPU
+        """
+        with self._gpu_assignment_lock:
+            self._gpu_assignment.pop(task_id, None)
+
     def _check_gpu_available(self) -> bool:
-        """检查 GPU 是否可用"""
         try:
             result = subprocess.run(
                 ["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"],
@@ -505,13 +608,23 @@ class AnomalyTrainer:
         if status in ["completed", "failed", "cancelled"]:
             return {"status": "success", "message": f"Task already in {status} state"}
 
+        # 如果任务在 pending 状态等待 GPU 信号量，需要特殊处理
+        if status == "pending":
+            self.training_status[task_id]["status"] = "cancelled"
+            self._add_log(task_id, "Task cancelled while waiting for GPU.")
+            if task_id in self.threads:
+                del self.threads[task_id]
+            if task_id in self.processes:
+                del self.processes[task_id]
+            self._persist_state_if_due(force=True)
+            return {"status": "success", "message": "Task cancelled"}
+
         # 1. 尝试终止子进程 (PaddleSeg 训练进程)
         proc = self.processes.get(task_id)
         if proc:
             try:
                 self._add_log(task_id, f"Terminating training subprocess (PID: {proc.pid})...")
                 proc.terminate()
-                # 给一点时间优雅退出，不行就 kill
                 try:
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
@@ -742,6 +855,14 @@ class AnomalyTrainer:
                 with open(train_list, "r") as f:
                     num_samples = sum(1 for line in f if line.strip())
                 batch_size = config.get("batch_size", 8)
+                
+                # 自适应 batch_size：确保 batch_size 不超过数据集大小
+                # 否则会导致训练无法启动（尤其是一个 label 数据少的情况）
+                max_batch_size = max(1, num_samples-1)
+                if batch_size > max_batch_size:
+                    self._add_log(task_id, f"Adjusting batch_size from {batch_size} to {max_batch_size} (dataset has only {num_samples} samples)")
+                    batch_size = max_batch_size
+                
                 iters_per_epoch = max(1, num_samples // batch_size)
                 
                 if train_iters_input:
@@ -764,17 +885,35 @@ class AnomalyTrainer:
                 self.training_status[task_id]["total_iters"] = total_iters
                 self.training_status[task_id]["use_iters_mode"] = bool(train_iters_input)
             
+            if parallel_train:
+                assigned_gpu = self._assign_gpu(task_id)
+                device = f"gpu:{assigned_gpu}"
+                self._add_log(task_id, f"Parallel training: assigned GPU {assigned_gpu}")
+            else:
+                can_use_gpu, gpu_ids, gpu_msg = self._check_gpu_for_batch_size(batch_size)
+                
+                if can_use_gpu:
+                    if len(gpu_ids) > 1:
+                        device = f"gpu:{','.join(map(str, gpu_ids))}"
+                        self._add_log(task_id, f"Multi-GPU training: {gpu_msg}")
+                    else:
+                        device = f"gpu:{gpu_ids[0]}"
+                        self._add_log(task_id, f"Single GPU training: {gpu_msg}")
+                else:
+                    device = "gpu:0"
+                    self._add_log(task_id, f"Warning: {gpu_msg}, falling back to gpu:0")
+            
             pdx_cfg = AttrDict({
                 "Global": AttrDict({
                     "model": model_name,
                     "dataset_dir": dataset_dir,
                     "output": save_dir,
-                    "device": "gpu:0"
+                    "device": device
                 }),
                 "Train": AttrDict({
                     "epochs": total_epochs,
                     "epochs_iters": total_iters,
-                    "batch_size": config.get("batch_size", 8),
+                    "batch_size": batch_size,
                     "learning_rate": config.get("learning_rate", 0.01),
                     "num_classes": 1,
                     "pretrain_weight_path": None,
@@ -868,6 +1007,12 @@ class AnomalyTrainer:
             # 定义实际执行训练的逻辑闭包
             def run_core_train():
                 try:
+                    # 并行训练时，设置 CUDA_VISIBLE_DEVICES 只使用分配的单个 GPU
+                    # 防止 PaddleX 错误地使用多个 GPU 进行分布式训练
+                    if parallel_train and assigned_gpu is not None:
+                        os.environ["CUDA_VISIBLE_DEVICES"] = str(assigned_gpu)
+                        self._add_log(task_id, f"Setting CUDA_VISIBLE_DEVICES={assigned_gpu} for this process")
+                    
                     # 获取到 GPU，更新状态为 starting
                     self.training_status[task_id]["status"] = "starting"
                     self._add_log(task_id, "GPU resource acquired. Initializing trainer...")
@@ -914,14 +1059,94 @@ class AnomalyTrainer:
                     if monitor:
                         monitor.stop()
                     
+                    # 释放分配的 GPU
+                    self._release_gpu(task_id)
+                    
+                    # 检查是否发生了超时错误，需要让外层重试逻辑捕获
+                    status_info = self.training_status.get(task_id, {})
+                    is_timeout = status_info.get("_training_timeout", False)
+                    if is_timeout:
+                        status_info.pop("_training_timeout", None)
+                        # 清除 failed 状态，让外层知道要重试
+                        status_info["status"] = "retrying"
+                        status_info.pop("error", None)
+                        self._persist_state_if_due(force=True)
+                        raise TimeoutError("Training timeout, will retry")
+                    
                     self._persist_state_if_due(force=True)
 
-            # 根据 parallel_train 决定是否使用信号量排队
+            # 根据 parallel_train 决定是否使用 GPU 资源
+            # 重要：先获取信号量，再执行训练，确保资源管理正确
             if parallel_train:
-                run_core_train()
+                # 并行训练：先获取信号量，再执行训练（GPU 已在上面分配）
+                acquired = self._gpu_semaphore.acquire(blocking=False)
+                if acquired:
+                    try:
+                        run_core_train()
+                    finally:
+                        self._gpu_semaphore.release()
+                else:
+                    # 如果获取不到，就用非阻塞轮询方式
+                    max_wait_seconds = 300  # 最多等待 5 分钟
+                    check_interval = 2
+                    waited = 0
+                    while waited < max_wait_seconds:
+                        current_status = self.training_status.get(task_id, {}).get("status")
+                        if current_status == "cancelled":
+                            self._add_log(task_id, "Task cancelled while waiting for GPU.")
+                            return
+                        
+                        acquired = self._gpu_semaphore.acquire(blocking=False)
+                        if acquired:
+                            try:
+                                run_core_train()
+                            finally:
+                                self._gpu_semaphore.release()
+                            return
+                        else:
+                            self._add_log(task_id, f"Waiting for GPU resource... ({waited}s elapsed)")
+                            self._persist_state_if_due(force=True)
+                            time.sleep(check_interval)
+                            waited += check_interval
+                    
+                    # 超时
+                    self._add_log(task_id, "Timeout waiting for GPU resource.")
+                    self.training_status[task_id]["status"] = "failed"
+                    self.training_status[task_id]["error"] = "GPU resource timeout"
+                    self._persist_state_if_due(force=True)
             else:
-                with self._gpu_semaphore:
-                    run_core_train()
+                # 使用非阻塞轮询方式获取 GPU 信号量，避免线程永久阻塞
+                max_wait_seconds = 1800  # 最多等待 30 分钟
+                check_interval = 2  # 每 2 秒检查一次
+                waited = 0
+                while waited < max_wait_seconds:
+                    # 检查任务是否已被取消
+                    current_status = self.training_status.get(task_id, {}).get("status")
+                    if current_status == "cancelled":
+                        self._add_log(task_id, "Task cancelled while waiting for GPU.")
+                        return
+                    
+                    # 尝试获取信号量（非阻塞）
+                    acquired = self._gpu_semaphore.acquire(blocking=False)
+                    if acquired:
+                        try:
+                            run_core_train()
+                        finally:
+                            # 确保信号量一定会被释放
+                            self._gpu_semaphore.release()
+                        return
+                    else:
+                        # 信号量被占用，等待一会儿再试
+                        self._add_log(task_id, f"Waiting for GPU resource... ({waited}s elapsed)")
+                        self._persist_state_if_due(force=True)
+                        time.sleep(check_interval)
+                        waited += check_interval
+                
+                # 超时
+                self._add_log(task_id, "Timeout waiting for GPU resource.")
+                self.training_status[task_id]["status"] = "failed"
+                self.training_status[task_id]["error"] = "GPU resource timeout"
+                self._persist_state_if_due(force=True)
 
         except Exception:
             raise
