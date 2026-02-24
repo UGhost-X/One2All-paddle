@@ -20,6 +20,9 @@ os.environ[" paddle_infer_flag_info " ] = "1"
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
+# 导入 PaddleSeg 注册模块以确保 STFPM 被注册
+import paddlex.repo_apis.PaddleSeg_api.seg.register as _seg_register
+
 import paddlex as pdx
 from paddlex.utils.config import AttrDict
 
@@ -1223,8 +1226,16 @@ class AnomalyTrainer:
     def get_status(self, task_id: str):
         """
         查询训练状态
+        支持通过 task_id 或 task_uuid 查找
         """
-        return self.training_status.get(task_id, {"status": "not_found"})
+        if task_id in self.training_status:
+            return self.training_status[task_id]
+        
+        for tid, status in self.training_status.items():
+            if status.get("task_uuid") == task_id:
+                return status
+        
+        return {"status": "not_found"}
 
 # 全局单例
 trainer = AnomalyTrainer()

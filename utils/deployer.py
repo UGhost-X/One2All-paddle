@@ -103,21 +103,47 @@ class ModelDeployer:
         raise RuntimeError("No available port for deployment")
     
     def _find_models(self, project_id: str, task_uuid: str) -> Dict[str, str]:
+        """
+        查找模型路径
+        支持新的统一结构: {output_dir}/{project_id}/{task_uuid}/best_model/
+        兼容旧结构: {output_dir}/{project_id}/{task_uuid}/{label}/best_model/
+        """
         models = {}
         base_path = Path(self.output_dir) / str(project_id) / task_uuid
-        
+
         if not base_path.exists():
             return models
-        
-        for label_dir in base_path.iterdir():
-            if not label_dir.is_dir():
-                continue
-            
-            best_model_path = label_dir / "best_model"
+
+        # 检查是否是新的统一结构
+        labels_file = base_path / "labels.txt"
+        is_unified = labels_file.exists()
+
+        if is_unified:
+            # 新的统一结构: 只有一个模型
+            best_model_path = base_path / "best_model"
             pdparams = best_model_path / "model.pdparams"
             if pdparams.exists():
-                models[label_dir.name] = str(best_model_path)
-        
+                # 读取类别列表
+                labels = []
+                try:
+                    with open(labels_file, "r") as f:
+                        labels = [line.strip() for line in f if line.strip()]
+                except:
+                    pass
+                # 使用统一的模型名称
+                models["multi_position"] = str(best_model_path)
+                models["_labels"] = labels  # 存储类别信息
+        else:
+            # 旧结构: 每个label一个模型
+            for label_dir in base_path.iterdir():
+                if not label_dir.is_dir():
+                    continue
+
+                best_model_path = label_dir / "best_model"
+                pdparams = best_model_path / "model.pdparams"
+                if pdparams.exists():
+                    models[label_dir.name] = str(best_model_path)
+
         return models
     
     def _create_inference_service(self, service: DeployService) -> str:
@@ -492,18 +518,25 @@ if __name__ == "__main__":
             return {"status": "success", "message": f"Service {service_id} deleted"}
     
     def get_service(self, service_id: str) -> Dict:
-        if service_id not in self.services:
-            return {"status": "not_found"}
+        service = self.services.get(service_id)
+        if not service:
+            return {"status": "not_found", "message": "Service not found"}
         
-        service = self.services[service_id]
+        is_running = service.pid and self._is_process_alive(service.pid)
         
-        if service.pid and not self._is_process_alive(service.pid):
-            if service.status == ServiceStatus.RUNNING.value:
-                service.status = ServiceStatus.STOPPED.value
-                service.pid = None
-                self._save_state()
-        
-        return asdict(service)
+        return {
+            "status": service.status if is_running else ServiceStatus.STOPPED.value,
+            "service_id": service.service_id,
+            "project_id": service.project_id,
+            "task_uuid": service.task_uuid,
+            "port": service.port,
+            "inference_url": service.inference_url,
+            "labels": service.labels,
+            "model_paths": service.model_paths,
+            "pid": service.pid,
+            "created_at": service.created_at,
+            "error": service.error
+        }
     
     def get_service_by_uuid(self, task_uuid: str) -> Optional[DeployService]:
         service_id = self.uuid_index.get(task_uuid)
@@ -512,53 +545,47 @@ if __name__ == "__main__":
         return None
     
     def list_services(self, project_id: Optional[str] = None) -> List[Dict]:
-        result = []
-        for sid, service in self.services.items():
+        services = []
+        for service in self.services.values():
             if project_id and service.project_id != project_id:
                 continue
             
-            if service.pid and not self._is_process_alive(service.pid):
-                if service.status == ServiceStatus.RUNNING.value:
-                    service.status = ServiceStatus.STOPPED.value
-                    service.pid = None
-                    self._save_state()
-            
-            result.append(asdict(service))
-        return result
+            is_running = service.pid and self._is_process_alive(service.pid)
+            services.append({
+                "service_id": service.service_id,
+                "project_id": service.project_id,
+                "task_uuid": service.task_uuid,
+                "port": service.port,
+                "status": service.status if is_running else ServiceStatus.STOPPED.value,
+                "labels": service.labels,
+                "created_at": service.created_at,
+                "inference_url": service.inference_url
+            })
+        
+        return services
     
-    def get_available_models(self, project_id: str) -> List[Dict]:
-        models = []
+    def get_available_models(self, project_id: str) -> Dict:
         project_path = Path(self.output_dir) / str(project_id)
         
         if not project_path.exists():
-            return models
+            return {}
         
-        for uuid_dir in project_path.iterdir():
-            if not uuid_dir.is_dir():
-                continue
-            if uuid_dir.name.startswith("_"):
-                continue
-            
-            task_models = {
-                "task_uuid": uuid_dir.name,
-                "labels": [],
-                "model_paths": {}
-            }
-            
-            for label_dir in uuid_dir.iterdir():
-                if not label_dir.is_dir():
-                    continue
-                
-                best_model_path = label_dir / "best_model"
-                if best_model_path.exists():
-                    pdparams = best_model_path / "model.pdparams"
-                    if pdparams.exists():
-                        task_models["labels"].append(label_dir.name)
-                        task_models["model_paths"][label_dir.name] = str(best_model_path)
-            
-            if task_models["labels"]:
-                models.append(task_models)
+        models_by_uuid = {}
         
-        return models
+        for task_dir in project_path.iterdir():
+            if not task_dir.is_dir():
+                continue
+            
+            task_uuid = task_dir.name
+            models = self._find_models(project_id, task_uuid)
+            
+            if models:
+                models_by_uuid[task_uuid] = {
+                    "labels": list(models.keys()),
+                    "model_paths": models
+                }
+        
+        return models_by_uuid
+
 
 deployer = ModelDeployer()
