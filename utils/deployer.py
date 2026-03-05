@@ -17,6 +17,8 @@ from typing import Dict, Optional, List
 from dataclasses import dataclass, asdict, field
 from enum import Enum
 
+from jinja2 import Environment, FileSystemLoader
+
 logger = logging.getLogger(__name__)
 
 class ServiceStatus(str, Enum):
@@ -107,6 +109,8 @@ class ModelDeployer:
         查找模型路径
         支持新的统一结构: {output_dir}/{project_id}/{task_uuid}/best_model/
         兼容旧结构: {output_dir}/{project_id}/{task_uuid}/{label}/best_model/
+        支持扁平结构: {output_dir}/{project_id}/{task_uuid}/{label}/model.pdparams
+        支持 Paddle 模型 (.pdparams) 和 ONNX 模型 (.onnx)
         """
         models = {}
         base_path = Path(self.output_dir) / str(project_id) / task_uuid
@@ -114,256 +118,80 @@ class ModelDeployer:
         if not base_path.exists():
             return models
 
-        # 检查是否是新的统一结构
         labels_file = base_path / "labels.txt"
         is_unified = labels_file.exists()
 
         if is_unified:
-            # 新的统一结构: 只有一个模型
             best_model_path = base_path / "best_model"
-            pdparams = best_model_path / "model.pdparams"
-            if pdparams.exists():
-                # 读取类别列表
+            has_onnx = (best_model_path / "model.onnx").exists()
+            has_pdparams = (best_model_path / "model.pdparams").exists()
+            
+            if has_onnx or has_pdparams:
                 labels = []
                 try:
                     with open(labels_file, "r") as f:
                         labels = [line.strip() for line in f if line.strip()]
                 except:
                     pass
-                # 使用统一的模型名称
+                
+                model_type = "onnx" if has_onnx else "paddle"
                 models["multi_position"] = str(best_model_path)
-                models["_labels"] = labels  # 存储类别信息
+                models["_labels"] = labels
+                models["_model_type"] = model_type
         else:
-            # 旧结构: 每个label一个模型
             for label_dir in base_path.iterdir():
                 if not label_dir.is_dir():
                     continue
 
+                # 尝试扁平结构: {label}/model.pdparams
+                has_pdparams_flat = (label_dir / "model.pdparams").exists()
+                has_config_flat = (label_dir / "config.json").exists()
+                
+                # 尝试旧结构: {label}/best_model/model.pdparams
                 best_model_path = label_dir / "best_model"
-                pdparams = best_model_path / "model.pdparams"
-                if pdparams.exists():
+                has_onnx = (best_model_path / "model.onnx").exists()
+                has_pdparams = (best_model_path / "model.pdparams").exists()
+                
+                if has_pdparams_flat or (has_pdparams and has_config_flat):
+                    # 扁平结构
+                    model_type = "paddle"
+                    models[label_dir.name] = str(label_dir)
+                    models[f"{label_dir.name}_type"] = model_type
+                elif has_onnx or has_pdparams:
+                    # 旧结构
+                    model_type = "onnx" if has_onnx else "paddle"
                     models[label_dir.name] = str(best_model_path)
+                    models[f"{label_dir.name}_type"] = model_type
 
         return models
     
     def _create_inference_service(self, service: DeployService) -> str:
-        models_config = json.dumps(service.model_paths, ensure_ascii=False, indent=4)
+        """使用 Jinja2 模板生成推理服务脚本"""
+        # 设置 Jinja2 环境
+        template_dir = Path(__file__).parent.parent / "templates"
+        env = Environment(loader=FileSystemLoader(template_dir))
+        template = env.get_template("inference_service.py.j2")
         
-        script_content = f'''#!/usr/bin/env python3
-"""
-推理服务 - 自动生成
-Service ID: {service.service_id}
-Project: {service.project_id}
-Task UUID: {service.task_uuid}
-Labels: {service.labels}
-"""
-import os
-import sys
-import signal
-import logging
-import json
-import base64
-import time
-from typing import Dict, Any, List
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
-os.environ["FLAGS_allocator_strategy"] = "auto_growth"
-
-from fastapi import FastAPI, File, UploadFile, HTTPException, Body
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-import uvicorn
-import numpy as np
-import cv2
-
-app = FastAPI(
-    title="Inference Service",
-    description=f"Project: {service.project_id}, UUID: {service.task_uuid}",
-    version="1.0.0"
-)
-
-MODELS: Dict[str, Any] = {{}}
-MODEL_PATHS = {models_config}
-
-class PredictRequest(BaseModel):
-    image: str
-    labels: List[str] = None
-
-class PredictResponse(BaseModel):
-    results: Dict[str, Dict[str, Any]]
-    processing_time: float
-
-def load_models():
-    global MODELS
-    import paddlex as pdx
-    
-    for label_name, model_path in MODEL_PATHS.items():
-        try:
-            logger.info(f"Loading model for [{{label_name}}] from: {{model_path}}")
-            predictor = pdx.deploy.Predictor(model_path, device="GPU:0")
-            MODELS[label_name] = predictor
-            logger.info(f"Model [{{label_name}}] loaded successfully")
-        except Exception as e:
-            logger.error(f"Failed to load model [{{label_name}}]: {{e}}")
-            MODELS[label_name] = None
-    
-    loaded_count = sum(1 for v in MODELS.values() if v is not None)
-    logger.info(f"Loaded {{loaded_count}}/{{len(MODEL_PATHS)}} models")
-
-@app.on_event("startup")
-async def startup_event():
-    load_models()
-
-@app.get("/health")
-async def health_check():
-    loaded = [k for k, v in MODELS.items() if v is not None]
-    return {{
-        "status": "healthy",
-        "service_id": "{service.service_id}",
-        "project_id": "{service.project_id}",
-        "task_uuid": "{service.task_uuid}",
-        "loaded_models": loaded,
-        "total_models": len(MODEL_PATHS)
-    }}
-
-@app.get("/models")
-async def list_models():
-    return {{
-        "models": list(MODEL_PATHS.keys()),
-        "loaded": [k for k, v in MODELS.items() if v is not None]
-    }}
-
-@app.post("/predict", response_model=PredictResponse)
-async def predict(file: UploadFile = File(...)):
-    start_time = time.time()
-    results = {{}}
-    
-    try:
-        contents = await file.read()
-        nparr = np.frombuffer(contents, np.uint8)
-        image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        # 构建 annotations.json 路径
+        # 路径格式: {project_id}/train/{task_uuid}/annotations.json
+        annotations_path = Path(str(service.project_id)) / "train" / service.task_uuid / "annotations.json"
+        annotations_path_str = str(annotations_path.absolute()) if annotations_path.exists() else ""
         
-        if image is None:
-            raise HTTPException(status_code=400, detail="Invalid image")
+        if annotations_path.exists():
+            logger.info(f"Found annotations file: {annotations_path_str}")
+        else:
+            logger.warning(f"Annotations file not found: {annotations_path}")
         
-        for label_name, predictor in MODELS.items():
-            if predictor is None:
-                results[label_name] = {{
-                    "status": "error",
-                    "message": "Model not loaded"
-                }}
-                continue
-            
-            try:
-                result = predictor.predict(image)
-                
-                if isinstance(result, dict):
-                    results[label_name] = result
-                elif isinstance(result, np.ndarray):
-                    results[label_name] = {{
-                        "mask_shape": result.shape,
-                        "mask_mean": float(np.mean(result)),
-                        "mask_std": float(np.std(result))
-                    }}
-                else:
-                    results[label_name] = {{"result": str(result)}}
-                    
-            except Exception as e:
-                results[label_name] = {{
-                    "status": "error",
-                    "message": str(e)
-                }}
-        
-        processing_time = time.time() - start_time
-        return PredictResponse(results=results, processing_time=processing_time)
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Prediction error: {{e}}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/predict_base64", response_model=PredictResponse)
-async def predict_base64(request: PredictRequest):
-    start_time = time.time()
-    results = {{}}
-    
-    try:
-        image_b64 = request.image
-        if "," in image_b64:
-            image_b64 = image_b64.split(",")[1]
-        
-        img_data = base64.b64decode(image_b64)
-        nparr = np.frombuffer(img_data, np.uint8)
-        image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
-        if image is None:
-            raise HTTPException(status_code=400, detail="Invalid image")
-        
-        target_labels = request.labels if request.labels else list(MODELS.keys())
-        
-        for label_name in target_labels:
-            if label_name not in MODELS:
-                results[label_name] = {{
-                    "status": "error",
-                    "message": f"Unknown label: {{label_name}}"
-                }}
-                continue
-            
-            predictor = MODELS[label_name]
-            if predictor is None:
-                results[label_name] = {{
-                    "status": "error",
-                    "message": "Model not loaded"
-                }}
-                continue
-            
-            try:
-                result = predictor.predict(image)
-                
-                if isinstance(result, dict):
-                    results[label_name] = result
-                elif isinstance(result, np.ndarray):
-                    results[label_name] = {{
-                        "mask_shape": result.shape,
-                        "mask_mean": float(np.mean(result)),
-                        "mask_std": float(np.std(result))
-                    }}
-                else:
-                    results[label_name] = {{"result": str(result)}}
-                    
-            except Exception as e:
-                results[label_name] = {{
-                    "status": "error",
-                    "message": str(e)
-                }}
-        
-        processing_time = time.time() - start_time
-        return PredictResponse(results=results, processing_time=processing_time)
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Prediction error: {{e}}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-def signal_handler(sig, frame):
-    logger.info("Shutting down inference service...")
-    sys.exit(0)
-
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
-
-if __name__ == "__main__":
-    logger.info(f"Starting inference service on port {service.port}")
-    uvicorn.run(app, host="0.0.0.0", port={service.port})
-'''
+        # 渲染模板
+        script_content = template.render(
+            service_id=service.service_id,
+            project_id=service.project_id,
+            task_uuid=service.task_uuid,
+            labels=service.labels,
+            port=service.port,
+            models_config=service.model_paths,
+            annotations_path=annotations_path_str
+        )
         
         script_path = Path(self.scripts_dir) / f"service_{service.service_id}.py"
         script_path.parent.mkdir(parents=True, exist_ok=True)
@@ -410,16 +238,20 @@ if __name__ == "__main__":
             else:
                 port = self._allocate_port()
             
-            service = DeployService(
+            # 过滤掉特殊键，只保留实际的 label
+            special_keys = {'_labels', '_model_type'}
+            label_keys = [k for k in model_paths.keys() if not k.endswith('_type') and k not in special_keys]
+            
+            service=DeployService(
                 service_id=service_id,
                 project_id=project_id,
                 task_uuid=task_uuid,
                 port=port,
                 status=ServiceStatus.STARTING.value,
-                labels=list(model_paths.keys()),
+                labels=label_keys,
                 model_paths=model_paths,
                 created_at=time.time(),
-                inference_url=f"http://localhost:{port}"
+                inference_url=f"http://0.0.0.0:{port}"
             )
             
             script_path = self._create_inference_service(service)
@@ -543,15 +375,91 @@ if __name__ == "__main__":
         if service_id:
             return self.services.get(service_id)
         return None
-    
-    def list_services(self, project_id: Optional[str] = None) -> List[Dict]:
+
+    def check_service_health(self, service_id: str) -> Dict:
+        """检查服务的健康状态，包括进程状态和服务响应状态"""
+        service = self.services.get(service_id)
+        if not service:
+            return {
+                "status": "not_found",
+                "service_id": service_id,
+                "healthy": False,
+                "message": "服务不存在"
+            }
+        
+        # 检查进程是否存活
+        process_alive = service.pid and self._is_process_alive(service.pid)
+        
+        # 检查端口是否在监听
+        port_listening = False
+        if process_alive and service.port:
+            try:
+                import socket
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(2)
+                result = sock.connect_ex(('localhost', service.port))
+                port_listening = (result == 0)
+                sock.close()
+            except Exception:
+                port_listening = False
+        
+        # 尝试调用健康检查接口
+        service_healthy = False
+        health_response = None
+        if port_listening:
+            try:
+                import urllib.request
+                import urllib.error
+                url = f"http://localhost:{service.port}/health"
+                req = urllib.request.Request(url, method='GET')
+                req.add_header('Accept', 'application/json')
+                with urllib.request.urlopen(req, timeout=5) as response:
+                    if response.status == 200:
+                        service_healthy = True
+                        health_response = json.loads(response.read().decode('utf-8'))
+            except Exception as e:
+                service_healthy = False
+                health_response = {"error": str(e)}
+        
+        # 确定最终状态
+        if not process_alive:
+            final_status = "stopped"
+            healthy = False
+        elif not port_listening:
+            final_status = "starting"
+            healthy = False
+        elif not service_healthy:
+            final_status = "unhealthy"
+            healthy = False
+        else:
+            final_status = "healthy"
+            healthy = True
+        
+        return {
+            "status": final_status,
+            "service_id": service_id,
+            "healthy": healthy,
+            "process_alive": process_alive,
+            "port_listening": port_listening,
+            "service_responsive": service_healthy,
+            "project_id": service.project_id,
+            "task_uuid": service.task_uuid,
+            "port": service.port,
+            "inference_url": service.inference_url,
+            "pid": service.pid,
+            "created_at": service.created_at,
+            "health_response": health_response,
+            "message": "服务运行正常" if healthy else f"服务状态异常: {final_status}"
+        }
+
+    def list_services(self, project_id: Optional[str] = None, include_health: bool = False) -> List[Dict]:
         services = []
         for service in self.services.values():
             if project_id and service.project_id != project_id:
                 continue
             
             is_running = service.pid and self._is_process_alive(service.pid)
-            services.append({
+            service_info = {
                 "service_id": service.service_id,
                 "project_id": service.project_id,
                 "task_uuid": service.task_uuid,
@@ -560,7 +468,20 @@ if __name__ == "__main__":
                 "labels": service.labels,
                 "created_at": service.created_at,
                 "inference_url": service.inference_url
-            })
+            }
+            
+            # 如果需要包含健康检查信息
+            if include_health:
+                health_info = self.check_service_health(service.service_id)
+                service_info["health"] = {
+                    "healthy": health_info.get("healthy"),
+                    "process_alive": health_info.get("process_alive"),
+                    "port_listening": health_info.get("port_listening"),
+                    "service_responsive": health_info.get("service_responsive"),
+                    "message": health_info.get("message")
+                }
+            
+            services.append(service_info)
         
         return services
     
@@ -580,8 +501,12 @@ if __name__ == "__main__":
             models = self._find_models(project_id, task_uuid)
             
             if models:
+                # 过滤掉特殊键，只保留实际的 label
+                special_keys = {'_labels', '_model_type'}
+                label_keys = {k for k in models.keys() if not k.endswith('_type') and k not in special_keys}
+                
                 models_by_uuid[task_uuid] = {
-                    "labels": list(models.keys()),
+                    "labels": list(label_keys),
                     "model_paths": models
                 }
         

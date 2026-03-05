@@ -158,8 +158,10 @@ logs/
 
 # Data
 data/
+test/
 output/
 results/
+inference_services/
 temp/
 tmp/
 test_*/

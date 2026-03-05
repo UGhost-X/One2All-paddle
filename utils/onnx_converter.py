@@ -14,7 +14,116 @@ logger = logging.getLogger(__name__)
 
 ONNX_MODEL_FILENAME = "model.onnx"
 CONFIG_FILENAME = "deploy.yaml"
+INFERENCE_CONFIG_FILENAME = "inference_config.yaml"
 MODEL_FILE_PREFIX = "model"
+
+
+def generate_inference_config(paddle_model_dir: str, output_dir: str):
+    """
+    生成推理配置文件，包含模型输入格式和预处理参数
+    
+    Args:
+        paddle_model_dir: Paddle 模型目录
+        output_dir: 输出目录
+    """
+    paddle_model_dir = Path(paddle_model_dir)
+    output_dir = Path(output_dir)
+    
+    config_data = {
+        "model_type": "anomaly_detection",
+        "input": {
+            "name": "image",
+            "shape": [1, 3, 256, 256],
+            "dtype": "float32"
+        },
+        "output": {
+            "name": "feature",
+            "description": "异常检测特征向量"
+        },
+        "preprocess": {
+            "resize": {"height": 256, "width": 256},
+            "normalize": {
+                "mean": [0.485, 0.456, 0.406],
+                "std": [0.229, 0.224, 0.225]
+            },
+            "to_rgb": True,
+            "bgr_to_rgb": False,
+            "scale": 1.0 / 255.0
+        },
+        "postprocess": {
+            "type": "anomaly_score",
+            "threshold": 0.5
+        }
+    }
+    
+    # 尝试从训练配置文件中读取实际的参数
+    config_file = paddle_model_dir / "config.yaml"
+    if not config_file.exists():
+        config_file = paddle_model_dir / "multi_position" / "config.yaml"
+    
+    if config_file.exists():
+        try:
+            import yaml
+            with open(config_file, "r") as f:
+                train_config = yaml.safe_load(f)
+            
+            # 从训练配置中提取预处理参数
+            if "train_dataset" in train_config and "transforms" in train_config["train_dataset"]:
+                transforms = train_config["train_dataset"]["transforms"]
+                for transform in transforms:
+                    if transform.get("type") == "Resize" and "target_size" in transform:
+                        config_data["preprocess"]["resize"] = {
+                            "height": transform["target_size"][0],
+                            "width": transform["target_size"][1]
+                        }
+                    elif transform.get("type") == "Normalize":
+                        if "mean" in transform:
+                            config_data["preprocess"]["normalize"]["mean"] = transform["mean"]
+                        if "std" in transform:
+                            config_data["preprocess"]["normalize"]["std"] = transform["std"]
+            
+            # 提取模型信息
+            if "model" in train_config:
+                model_cfg = train_config["model"]
+                config_data["model_info"] = {
+                    "type": model_cfg.get("type", "STFPM"),
+                    "num_classes": model_cfg.get("num_classes", 1)
+                }
+                
+                if "backbone" in model_cfg:
+                    config_data["model_info"]["backbone"] = model_cfg["backbone"].get("type", "Unknown")
+            
+            # 提取输入尺寸
+            if "batch_size" in train_config:
+                config_data["input"]["shape"][0] = train_config["batch_size"]
+                
+        except Exception as e:
+            logger.warning(f"从训练配置文件读取参数失败: {e}")
+    
+    # 尝试从 ONNX 模型中获取输入形状
+    onnx_path = output_dir / ONNX_MODEL_FILENAME
+    if onnx_path.exists():
+        try:
+            import onnx
+            onnx_model = onnx.load(str(onnx_path))
+            for input_tensor in onnx_model.graph.input:
+                shape = [dim.dim_value if dim.dim_value > 0 else 1 for dim in input_tensor.type.tensor_type.shape.dim]
+                if len(shape) == 4:
+                    config_data["input"]["shape"] = shape
+                    config_data["input"]["name"] = input_tensor.name
+                    break
+        except Exception as e:
+            logger.warning(f"从 ONNX 模型读取输入形状失败: {e}")
+    
+    # 写入配置文件
+    config_path = output_dir / INFERENCE_CONFIG_FILENAME
+    try:
+        import yaml
+        with open(config_path, "w") as f:
+            yaml.dump(config_data, f, default_flow_style=False, allow_unicode=True)
+        logger.info(f"推理配置文件已生成: {config_path}")
+    except Exception as e:
+        logger.error(f"生成推理配置文件失败: {e}")
 
 
 def check_paddle2onnx_available() -> bool:
@@ -161,6 +270,9 @@ def convert_paddle_to_onnx(
             config_src = paddle_model_dir / CONFIG_FILENAME
         if config_src.exists():
             shutil.copy(config_src, output_dir / CONFIG_FILENAME)
+        
+        # 生成推理配置文件
+        generate_inference_config(paddle_model_dir, output_dir)
         
         return {
             "success": True,

@@ -1,0 +1,798 @@
+#!/usr/bin/env python3
+"""
+推理服务 - 自动生成 (STFPM版本)
+Service ID: {{ service_id }}
+Project: {{ project_id }}
+Task UUID: {{ task_uuid }}
+Labels: {{ labels }}
+"""
+import os
+import sys
+import signal
+import logging
+import logging.handlers
+import json
+import base64
+import time
+from typing import Dict, Any, List
+from pathlib import Path
+from datetime import datetime
+
+# 创建日志目录
+LOG_DIR = Path("logs")
+LOG_DIR.mkdir(exist_ok=True)
+
+# 生成日志文件名（包含日期和服务ID）
+LOG_FILE = LOG_DIR / f"service_{{ service_id }}_{datetime.now().strftime('%Y%m%d')}.log"
+
+# 配置日志处理器
+file_handler = logging.handlers.RotatingFileHandler(
+    LOG_FILE,
+    maxBytes=10*1024*1024,  # 10MB
+    backupCount=5,
+    encoding='utf-8'
+)
+console_handler = logging.StreamHandler(sys.stdout)
+
+# 设置日志格式
+formatter = logging.Formatter(
+    '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+file_handler.setFormatter(formatter)
+console_handler.setFormatter(formatter)
+
+# 配置根日志记录器
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
+
+# 同时配置 uvicorn 的日志
+uvicorn_logger = logging.getLogger("uvicorn")
+uvicorn_logger.setLevel(logging.INFO)
+uvicorn_logger.addHandler(file_handler)
+uvicorn_logger.addHandler(console_handler)
+
+os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
+os.environ["FLAGS_allocator_strategy"] = "auto_growth"
+
+from fastapi import FastAPI, File, UploadFile, HTTPException, Body, Form
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+import uvicorn
+import numpy as np
+import cv2
+import paddle
+import paddle.nn as nn
+
+app = FastAPI(
+    title="Inference Service",
+    description=f"Project: {{ project_id }}, UUID: {{ task_uuid }}",
+    version="1.0.0"
+)
+
+# ═════════════════════════════════════════════════════════════════════════════
+# STFPM 异常检测模型
+# ═════════════════════════════════════════════════════════════════════════════
+
+class STFPMModel(nn.Layer):
+    def __init__(self):
+        super(STFPMModel, self).__init__()
+        self.teacher = nn.Sequential(
+            nn.Conv2D(3, 64, 3, padding=1), nn.ReLU(), nn.MaxPool2D(2),
+            nn.Conv2D(64, 128, 3, padding=1), nn.ReLU(), nn.MaxPool2D(2),
+            nn.Conv2D(128, 256, 3, padding=1), nn.ReLU(),
+        )
+        self.student = nn.Sequential(
+            nn.Conv2D(3, 64, 3, padding=1), nn.ReLU(), nn.MaxPool2D(2),
+            nn.Conv2D(64, 128, 3, padding=1), nn.ReLU(), nn.MaxPool2D(2),
+            nn.Conv2D(128, 256, 3, padding=1), nn.ReLU(),
+        )
+        for param in self.teacher.parameters():
+            param.stop_gradient = True
+
+    def forward(self, x):
+        return self.teacher(x), self.student(x)
+
+    def compute_loss(self, t, s):
+        return paddle.mean(paddle.square(t - s))
+
+
+class MultiSTFPMDetector:
+    def __init__(self, models_dir):
+        self.models_dir = Path(models_dir)
+        self.models = {}
+        self.configs = {}
+        self._load_models()
+
+    def _load_models(self):
+        """加载所有类别模型
+        支持目录结构: 
+          - 扁平结构: {category}/model.pdparams
+          - 旧结构: {category}/best_model/model.pdparams
+        """
+        if not self.models_dir.exists():
+            logger.warning(f"Models directory not found: {self.models_dir}")
+            return
+            
+        for category in self.models_dir.iterdir():
+            if not category.is_dir():
+                continue
+            
+            # 尝试扁平结构: {category}/model.pdparams
+            model_path = category / 'model.pdparams'
+            config_path = category / 'config.json'
+            
+            # 尝试旧结构: {category}/best_model/model.pdparams
+            if not model_path.exists():
+                best_model_dir = category / 'best_model'
+                if best_model_dir.exists():
+                    model_path = best_model_dir / 'model.pdparams'
+                    config_path = best_model_dir / 'config.json'
+            
+            if model_path.exists():
+                try:
+                    model = STFPMModel()
+                    model.set_state_dict(paddle.load(str(model_path)))
+                    model.eval()
+                    
+                    config = {}
+                    if config_path.exists():
+                        with open(config_path, 'r') as f:
+                            config = json.load(f)
+                    
+                    self.models[category.name] = model
+                    self.configs[category.name] = config
+                    logger.info(f"Loaded model: {category.name}")
+                except Exception as e:
+                    logger.error(f"Failed to load model {category.name}: {e}")
+
+    def detect(self, image, category):
+        """对单个ROI进行异常检测"""
+        if category not in self.models:
+            return None
+            
+        model = self.models[category]
+        config = self.configs[category]
+
+        # 图像预处理
+        if len(image.shape) == 2:
+            image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+        elif image.shape[2] == 4:
+            image = cv2.cvtColor(image, cv2.COLOR_BGRA2RGB)
+        elif image.shape[2] == 3:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+        img_resized = cv2.resize(image, (224, 224)).astype(np.float32) / 255.0
+        img_tensor = paddle.to_tensor(np.transpose(img_resized, (2, 0, 1))).unsqueeze(0)
+
+        with paddle.no_grad():
+            t_feat, s_feat = model(img_tensor)
+            error = model.compute_loss(t_feat, s_feat).item()
+
+        threshold = config.get('threshold', 0.1)
+        return {
+            'is_anomaly': error > threshold,
+            'anomaly_score': min(error / threshold, 1.0) if threshold > 0 else error,
+            'error': error,
+            'threshold': threshold
+        }
+
+    def detect_all(self, image):
+        """对整张图片进行所有类别的异常检测"""
+        results = {}
+        for category in self.models.keys():
+            result = self.detect(image, category)
+            if result:
+                results[category] = result
+        return results
+
+    def get_loaded_categories(self):
+        """获取已加载的类别列表"""
+        return list(self.models.keys())
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 从 annotations.json 选择最佳模板图片
+# ═════════════════════════════════════════════════════════════════════════════
+
+def select_best_template_from_annotations(annotations_path: str) -> tuple:
+    """
+    从 annotations.json 中选择 angle 最接近 0 且没有反转的图片作为模板
+    返回: (template_image_path, template_annotations_list)
+    """
+    try:
+        with open(annotations_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        images = {img['id']: img for img in data.get('images', [])}
+        annotations = data.get('annotations', [])
+        
+        # 筛选没有反转的标注 (horizontal_flip=false 且 vertical_flip=false)
+        no_flip_annotations = [
+            ann for ann in annotations 
+            if not ann.get('horizontal_flip', False) and not ann.get('vertical_flip', False)
+        ]
+        
+        if not no_flip_annotations:
+            logger.warning("No annotations without flip found")
+            return None, []
+        
+        # 按 angle 绝对值排序，选择最接近 0 的
+        no_flip_annotations.sort(key=lambda x: abs(x.get('angle', 0)))
+        
+        # 获取最佳标注对应的图片
+        best_annotation = no_flip_annotations[0]
+        best_image_id = best_annotation.get('image_id')
+        best_image_info = images.get(best_image_id)
+        
+        if not best_image_info:
+            logger.warning(f"Image {best_image_id} not found")
+            return None, []
+        
+        # 构建图片路径
+        annotations_dir = Path(annotations_path).parent
+        file_name = best_image_info.get('file_name', '')
+        
+        # 尝试不同的路径组合
+        possible_paths = [
+            annotations_dir / "raw_images" / file_name,
+            annotations_dir / file_name,
+            annotations_dir / "images" / file_name,
+        ]
+        
+        template_image_path = None
+        for path in possible_paths:
+            if path.exists():
+                template_image_path = str(path)
+                break
+        
+        if template_image_path is None:
+            logger.warning(f"Template image not found for {file_name}")
+            return None, []
+        
+        # 获取该图片对应的所有标注（用于ROI检测）
+        template_annotations = [
+            {
+                'category': ann.get('label', ''),
+                'bbox': ann.get('bbox', [0, 0, 0, 0])
+            }
+            for ann in no_flip_annotations 
+            if ann.get('image_id') == best_image_id and ann.get('label')
+        ]
+        
+        logger.info(f"Selected template: {file_name}, angle={best_annotation.get('angle', 0)}, "
+                   f"annotations={len(template_annotations)}")
+        
+        return template_image_path, template_annotations
+        
+    except Exception as e:
+        logger.error(f"Failed to select template from annotations: {e}")
+        return None, []
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Homography 对齐和 ROI 检测
+# ═════════════════════════════════════════════════════════════════════════════
+
+def enhance_for_matching(image):
+    """图像增强：CLAHE + 去噪，提升特征点质量"""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+    denoised = cv2.GaussianBlur(enhanced, (3, 3), 0)
+    return denoised
+
+
+def align_orb_homography(template_gray, pred_gray, min_matches=10):
+    """ORB特征匹配 + RANSAC 求 Homography"""
+    orb = cv2.ORB_create(nfeatures=3000, scaleFactor=1.2, nlevels=8, edgeThreshold=15, patchSize=31)
+    kp1, des1 = orb.detectAndCompute(template_gray, None)
+    kp2, des2 = orb.detectAndCompute(pred_gray, None)
+    
+    if des1 is None or des2 is None or len(kp1) < min_matches or len(kp2) < min_matches:
+        return None
+    
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = bf.match(des1, des2)
+    matches = sorted(matches, key=lambda x: x.distance)
+    
+    if len(matches) > 0:
+        max_dist = max(m.distance for m in matches)
+        good = [m for m in matches if m.distance < 0.7 * max_dist]
+    else:
+        good = []
+    
+    if len(good) < min_matches:
+        return None
+    
+    pts1 = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+    pts2 = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+    
+    H, mask = cv2.findHomography(pts1, pts2, cv2.RANSAC, 4.0)
+    return H
+
+
+def align_ecc(template_gray, pred_gray):
+    """
+    策略2：ECC图像配准
+    适合特征点稀少、纹理均匀的工件
+    求仿射变换（6自由度），比Homography更稳定
+    """
+    scale = 0.5
+    t_small = cv2.resize(template_gray, None, fx=scale, fy=scale)
+    p_small = cv2.resize(pred_gray, None, fx=scale, fy=scale)
+    warp_matrix = np.eye(2, 3, dtype=np.float32)
+    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 200, 1e-6)
+    try:
+        cc, warp_matrix = cv2.findTransformECC(t_small, p_small, warp_matrix, cv2.MOTION_AFFINE, criteria)
+        warp_matrix[0, 2] /= scale
+        warp_matrix[1, 2] /= scale
+        H = np.vstack([warp_matrix, [0, 0, 1]])
+        return H
+    except Exception:
+        return None
+
+
+def align_contour_affine(template_img, pred_img):
+    """
+    策略3：轮廓中心对齐 + 尺度估计（兜底方案）
+    基于工件的外接矩形做刚体变换
+    """
+    def get_workpiece_rect(img):
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=3)
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+        largest = max(contours, key=cv2.contourArea)
+        rect = cv2.minAreaRect(largest)
+        return rect
+
+    rect_t = get_workpiece_rect(template_img)
+    rect_p = get_workpiece_rect(pred_img)
+
+    if rect_t is None or rect_p is None:
+        return None
+
+    (cx_t, cy_t), (tw, th), angle_t = rect_t
+    (cx_p, cy_p), (pw, ph), angle_p = rect_p
+
+    scale_x = pw / tw if tw > 0 else 1.0
+    scale_y = ph / th if th > 0 else 1.0
+
+    delta_angle = angle_p - angle_t
+    cos_a = np.cos(np.radians(delta_angle))
+    sin_a = np.sin(np.radians(delta_angle))
+
+    H = np.array([
+        [scale_x * cos_a, -scale_x * sin_a, cx_p - scale_x * (cos_a * cx_t - sin_a * cy_t)],
+        [scale_y * sin_a,  scale_y * cos_a, cy_p - scale_y * (sin_a * cx_t + cos_a * cy_t)],
+        [0, 0, 1]
+    ], dtype=np.float64)
+
+    return H
+
+
+def preprocess_for_matching(image, target_size=(512, 512)):
+    """
+    统一缩放到固定尺寸用于特征匹配，消除尺寸差异影响
+    返回: (resized_image, scale_x, scale_y)
+    """
+    h, w = image.shape[:2]
+    resized = cv2.resize(image, target_size)
+    scale_x = w / target_size[0]
+    scale_y = h / target_size[1]
+    return resized, scale_x, scale_y
+
+
+def find_alignment_homography(template_img, pred_img):
+    """三层降级策略求Homography
+    
+    参考 predict_rotate_image.py 的实现，正确处理坐标缩放
+    """
+    MATCH_SIZE = (512, 512)
+    
+    # 预处理并获取缩放因子
+    t_resized, t_sx, t_sy = preprocess_for_matching(template_img, MATCH_SIZE)
+    p_resized, p_sx, p_sy = preprocess_for_matching(pred_img, MATCH_SIZE)
+    
+    t_gray = enhance_for_matching(t_resized)
+    p_gray = enhance_for_matching(p_resized)
+    
+    H_normalized = None
+    strategy_used = None
+    
+    # 策略1: ORB
+    H_normalized = align_orb_homography(t_gray, p_gray)
+    if H_normalized is not None:
+        strategy_used = "ORB"
+    
+    # 策略2: ECC
+    if H_normalized is None:
+        H_normalized = align_ecc(t_gray, p_gray)
+        if H_normalized is not None:
+            strategy_used = "ECC"
+    
+    # 策略3: 轮廓仿射对齐
+    if H_normalized is None:
+        H_normalized = align_contour_affine(t_resized, p_resized)
+        if H_normalized is not None:
+            strategy_used = "轮廓仿射对齐"
+    
+    if H_normalized is None:
+        return None, None
+    
+    # 将H从归一化坐标(512x512)映射回原图坐标
+    # H_orig = S_pred_inv @ H_normalized @ S_template
+    # 其中 S = diag(1/sx, 1/sy, 1) 表示从原图到归一化的缩放
+    S_t = np.diag([1.0 / t_sx, 1.0 / t_sy, 1.0])   # template原图 -> 512
+    S_p_inv = np.diag([p_sx, p_sy, 1.0])            # 512 -> pred原图
+    
+    H_orig = S_p_inv @ H_normalized @ S_t
+    
+    # 调试日志：输出关键信息
+    logger.info(f"[Homography] Template size: ({template_img.shape[1]}, {template_img.shape[0]}), scales: ({t_sx:.3f}, {t_sy:.3f})")
+    logger.info(f"[Homography] Pred size: ({pred_img.shape[1]}, {pred_img.shape[0]}), scales: ({p_sx:.3f}, {p_sy:.3f})")
+    logger.info(f"[Homography] H_normalized:\n{H_normalized}")
+    logger.info(f"[Homography] H_orig:\n{H_orig}")
+    
+    return H_orig, strategy_used
+
+
+def transform_bbox_with_H(bbox, H, img_size=None):
+    """用Homography变换bbox"""
+    x, y, w, h = bbox
+    corners = np.array([
+        [x, y], [x + w, y], [x + w, y + h], [x, y + h]
+    ], dtype=np.float32).reshape(-1, 1, 2)
+    transformed = cv2.perspectiveTransform(corners, H).reshape(-1, 2)
+    x_min, y_min = np.min(transformed[:, 0]), np.min(transformed[:, 1])
+    x_max, y_max = np.max(transformed[:, 0]), np.max(transformed[:, 1])
+    if img_size:
+        iw, ih = img_size
+        x_min, y_min = max(0, min(x_min, iw)), max(0, min(y_min, ih))
+        x_max, y_max = max(0, min(x_max, iw)), max(0, min(y_max, ih))
+    return [float(x_min), float(y_min), float(x_max - x_min), float(y_max - y_min)]
+
+
+def detect_with_annotations(detector, image, template_image, annotations, request_id=""):
+    """
+    使用Homography对齐 + 标注框进行ROI检测
+    annotations: list of dict with 'category' and 'bbox' keys
+    
+    返回每个标注框的详细检测结果，格式与predict_rotate_image.py一致
+    """
+    if template_image is None or not annotations:
+        return []
+    
+    pred_h, pred_w = image.shape[:2]
+    results = []
+    skipped_count = 0
+    
+    H, strategy = find_alignment_homography(template_image, image)
+    if H is None:
+        logger.warning(f"[{request_id}] Homography对齐失败，使用原图坐标")
+        H = np.eye(3, dtype=np.float64)
+        strategy = "none"
+    else:
+        logger.info(f"[{request_id}] Homography对齐成功，策略: {strategy}")
+    
+    for i, ann in enumerate(annotations):
+        category = ann.get('category')
+        template_bbox = ann.get('bbox')
+        
+        if not category or not template_bbox or category not in detector.models:
+            logger.warning(f"[{request_id}] Annotation {i+1}: 跳过 - category={category}, bbox={template_bbox}, in_models={category in detector.models if category else False}")
+            skipped_count += 1
+            continue
+        
+        pred_bbox = transform_bbox_with_H(template_bbox, H, img_size=(pred_w, pred_h))
+        x, y, w, h = [int(v) for v in pred_bbox]
+        
+        # 计算相对位置和大小（用于调试）
+        t_x, t_y, t_w, t_h = template_bbox
+        t_img_w, t_img_h = template_image.shape[1], template_image.shape[0]
+        t_rel_x, t_rel_y = t_x / t_img_w, t_y / t_img_h
+        t_rel_w, t_rel_h = t_w / t_img_w, t_h / t_img_h
+        
+        p_rel_x, p_rel_y = x / pred_w, y / pred_h
+        p_rel_w, p_rel_h = w / pred_w, h / pred_h
+        
+        logger.info(f"[{request_id}] Annotation {i+1} ({category}): 相对位置对比")
+        logger.info(f"[{request_id}]   Template: rel_pos=({t_rel_x:.3f},{t_rel_y:.3f}), rel_size=({t_rel_w:.3f},{t_rel_h:.3f})")
+        logger.info(f"[{request_id}]   Pred:     rel_pos=({p_rel_x:.3f},{p_rel_y:.3f}), rel_size=({p_rel_w:.3f},{p_rel_h:.3f})")
+        
+        x_clip = max(0, min(x, pred_w - 1))
+        y_clip = max(0, min(y, pred_h - 1))
+        w_clip = max(0, min(w, pred_w - x_clip))
+        h_clip = max(0, min(h, pred_h - y_clip))
+        
+        is_outside = (x < 0 or y < 0 or x + w > pred_w or y + h > pred_h)
+        
+        if w_clip < 5 or h_clip < 5:
+            logger.warning(f"[{request_id}] Annotation {i+1} ({category}): 跳过 - ROI太小, bbox=({x},{y},{w},{h}), clipped=({w_clip},{h_clip})")
+            skipped_count += 1
+            continue
+        
+        roi = image[y_clip:y_clip+h_clip, x_clip:x_clip+w_clip]
+        if roi.size == 0:
+            logger.warning(f"[{request_id}] Annotation {i+1} ({category}): 跳过 - ROI为空")
+            skipped_count += 1
+            continue
+        
+        logger.info(f"[{request_id}] Annotation {i+1} ({category}): 处理中, template_bbox={template_bbox}, pred_bbox=({x},{y},{w},{h}), clipped=({x_clip},{y_clip},{w_clip},{h_clip}), outside={is_outside}")
+        
+        detection = detector.detect(roi, category)
+        
+        # 构建与predict_rotate_image.py一致的返回格式
+        result_item = {
+            'category': category,
+            'template_bbox': template_bbox,  # 模板原始坐标
+            'bbox': [float(x), float(y), float(w), float(h)],  # 变换后的坐标
+            'bbox_clipped': [float(x_clip), float(y_clip), float(w_clip), float(h_clip)],  # 裁剪后的坐标
+            'is_outside': is_outside,
+            'alignment_strategy': strategy
+        }
+        
+        if detection:
+            result_item.update({
+                'is_anomaly': detection.get('is_anomaly', False),
+                'anomaly_score': detection.get('anomaly_score', 0.0),
+                'error': detection.get('error', 0.0),
+                'threshold': detection.get('threshold', 0.0)
+            })
+        else:
+            result_item.update({
+                'is_anomaly': False,
+                'anomaly_score': 0.0,
+                'error': 0.0,
+                'threshold': 0.0
+            })
+        
+        results.append(result_item)
+    
+    logger.info(f"[{request_id}] ROI detection completed: {len(results)} processed, {skipped_count} skipped, total {len(annotations)} annotations")
+    
+    return results
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# FastAPI 路由
+# ═════════════════════════════════════════════════════════════════════════════
+
+MODELS: Dict[str, Any] = {}
+MODEL_PATHS = {{ models_config | tojson(indent=4) }}
+STFPM_DETECTOR: MultiSTFPMDetector = None
+TEMPLATE_IMAGE: np.ndarray = None  # 预加载的模板图
+TEMPLATE_ANNOTATIONS: List[Dict[str, Any]] = []  # 模板图片的标注框信息
+
+
+class PredictROIResponse(BaseModel):
+    """ROI检测响应，返回每个标注框的详细检测结果"""
+    results: List[Dict[str, Any]]
+    processing_time: float
+    total_detections: int
+    anomaly_count: int
+
+def load_models():
+    """加载所有模型和模板图"""
+    global STFPM_DETECTOR, MODELS, TEMPLATE_IMAGE, TEMPLATE_ANNOTATIONS
+    
+    # 初始化STFPM检测器
+    # 模型路径格式: {label: path, label_type: type}
+    # 我们需要提取所有模型目录
+    model_dirs = set()
+    for key, path in MODEL_PATHS.items():
+        if not key.endswith('_type') and key != '_labels' and key != '_model_type':
+            model_dirs.add(path)
+    
+    if model_dirs:
+        # 使用第一个模型目录的父目录作为基础目录
+        base_dir = Path(list(model_dirs)[0]).parent
+        STFPM_DETECTOR = MultiSTFPMDetector(base_dir)
+        MODELS = {cat: {'loaded': True} for cat in STFPM_DETECTOR.get_loaded_categories()}
+        logger.info(f"Loaded {len(MODELS)} models: {list(MODELS.keys())}")
+        
+        # 优先从 annotations.json 加载模板图片（选择 angle 最接近 0 且没有反转的图片）
+        annotations_path = Path("{{ annotations_path }}") if "{{ annotations_path }}" else None
+        
+        if annotations_path and annotations_path.exists():
+            template_path, template_anns = select_best_template_from_annotations(str(annotations_path))
+            if template_path:
+                TEMPLATE_IMAGE = cv2.imread(template_path)
+                TEMPLATE_ANNOTATIONS = template_anns
+                if TEMPLATE_IMAGE is not None:
+                    logger.info(f"Loaded template image from annotations: {template_path}, "
+                               f"with {len(TEMPLATE_ANNOTATIONS)} annotations")
+        
+        # 如果无法从 annotations 加载，则回退到从模型目录查找 template.jpg
+        if TEMPLATE_IMAGE is None:
+            for model_dir in model_dirs:
+                template_path = Path(model_dir) / "template.jpg"
+                if template_path.exists():
+                    TEMPLATE_IMAGE = cv2.imread(str(template_path))
+                    if TEMPLATE_IMAGE is not None:
+                        logger.info(f"Loaded template image from: {template_path}")
+                        break
+        
+        if TEMPLATE_IMAGE is None:
+            logger.warning("No template image found")
+    else:
+        logger.warning("No model directories found")
+
+@app.on_event("startup")
+async def startup_event():
+    load_models()
+
+@app.get("/health")
+async def health_check():
+    loaded = list(MODELS.keys()) if MODELS else []
+    return {
+        "status": "healthy",
+        "service_id": "{{ service_id }}",
+        "project_id": "{{ project_id }}",
+        "task_uuid": "{{ task_uuid }}",
+        "loaded_models": loaded,
+        "total_models": len(MODELS)
+    }
+
+@app.get("/models")
+async def list_models():
+    return {
+        "models": list(MODELS.keys()),
+        "loaded": list(MODELS.keys())
+    }
+
+
+@app.post("/predict", response_model=PredictROIResponse)
+async def predict(
+    file: UploadFile = File(None),
+    image: str = Form(None)
+):
+    """
+    统一的预测接口，支持文件上传和base64两种方式
+    
+    方式1（文件上传）:
+        POST /predict
+        Content-Type: multipart/form-data
+        Body: file=<图片文件>
+    
+    方式2（Base64）:
+        POST /predict
+        Content-Type: application/json
+        Body: {"image": "<base64字符串>"}
+    
+    自动使用模板图片的标注信息进行ROI检测
+    返回每个标注框的详细检测结果
+    """
+    start_time = time.time()
+    request_id = f"{int(start_time * 1000)}"
+    
+    logger.info(f"[{request_id}] ========== PREDICTION REQUEST ==========")
+    
+    try:
+        # 获取图片数据
+        image_data = None
+        input_type = None
+        
+        if file is not None:
+            input_type = "file"
+            logger.info(f"[{request_id}] Input type: file upload")
+            logger.info(f"[{request_id}] Filename: {file.filename}")
+            contents = await file.read()
+            logger.info(f"[{request_id}] File size: {len(contents)} bytes")
+            nparr = np.frombuffer(contents, np.uint8)
+            image_data = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        elif image is not None:
+            input_type = "base64"
+            logger.info(f"[{request_id}] Input type: base64")
+            image_b64 = image
+            if "," in image_b64:
+                image_b64 = image_b64.split(",")[1]
+            img_data = base64.b64decode(image_b64)
+            logger.info(f"[{request_id}] Base64 decoded size: {len(img_data)} bytes")
+            nparr = np.frombuffer(img_data, np.uint8)
+            image_data = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        else:
+            logger.error(f"[{request_id}] No image provided")
+            raise HTTPException(status_code=400, detail="No image provided")
+        
+        if image_data is None:
+            logger.error(f"[{request_id}] Failed to decode image")
+            raise HTTPException(status_code=400, detail="Invalid image")
+        
+        logger.info(f"[{request_id}] Image decoded successfully: shape={image_data.shape}")
+        
+        if STFPM_DETECTOR is None:
+            logger.error(f"[{request_id}] Models not loaded")
+            raise HTTPException(status_code=500, detail="Models not loaded")
+        
+        if TEMPLATE_IMAGE is None:
+            logger.error(f"[{request_id}] Template image not loaded")
+            raise HTTPException(status_code=500, detail="Template image not loaded")
+        
+        logger.info(f"[{request_id}] Template image: shape={TEMPLATE_IMAGE.shape}")
+        
+        annotations_list = TEMPLATE_ANNOTATIONS
+        logger.info(f"[{request_id}] Template annotations count: {len(annotations_list)}")
+        
+        if not annotations_list:
+            logger.error(f"[{request_id}] No template annotations available")
+            raise HTTPException(status_code=400, detail="No template annotations available")
+        
+        logger.info(f"[{request_id}] Starting ROI detection...")
+        roi_results = detect_with_annotations(
+            STFPM_DETECTOR, 
+            image_data, 
+            TEMPLATE_IMAGE, 
+            annotations_list,
+            request_id
+        )
+        
+        processing_time = time.time() - start_time
+        anomaly_count = sum(1 for r in roi_results if r.get('is_anomaly', False))
+        
+        # 打印详细预测结果
+        logger.info(f"[{request_id}] ========== PREDICTION RESULTS ==========")
+        logger.info(f"[{request_id}] Total ROIs: {len(roi_results)}")
+        logger.info(f"[{request_id}] Anomalies detected: {anomaly_count}")
+        logger.info(f"[{request_id}] Processing time: {processing_time:.3f}s")
+        logger.info(f"[{request_id}] ----------------------------------------")
+        
+        for i, r in enumerate(roi_results):
+            status = "ANOMALY" if r.get('is_anomaly') else "NORMAL"
+            category = r.get('category', 'unknown')
+            score = r.get('anomaly_score', 0)
+            threshold = r.get('threshold', 0)
+            error = r.get('error', 0)
+            bbox = r.get('bbox', [0,0,0,0])
+            strategy = r.get('alignment_strategy', 'unknown')
+            
+            logger.info(f"[{request_id}] ROI {i+1:2d}: {category:8s} | {status:7s} | "
+                       f"score={score:.3f} | threshold={threshold:.3f} | error={error:.3f} | "
+                       f"bbox={bbox} | strategy={strategy}")
+        
+        logger.info(f"[{request_id}] ========== REQUEST COMPLETED ==========")
+        
+        return PredictROIResponse(
+            results=roi_results, 
+            processing_time=processing_time,
+            total_detections=len(roi_results),
+            anomaly_count=anomaly_count
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[{request_id}] Prediction error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def signal_handler(sig, frame):
+    logger.info("Shutting down inference service...")
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+if __name__ == "__main__":
+    logger.info("=" * 60)
+    logger.info(f"Starting inference service")
+    logger.info(f"Port: {{ port }}")
+    logger.info(f"Project: {{ project_id }}")
+    logger.info(f"Task UUID: {{ task_uuid }}")
+    logger.info(f"Log file: {LOG_FILE}")
+    logger.info("=" * 60)
+    
+    # 禁用 uvicorn 默认日志配置，使用我们自定义的
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port={{ port }},
+        log_config=None,  # 禁用默认日志配置
+        access_log=True
+    )
