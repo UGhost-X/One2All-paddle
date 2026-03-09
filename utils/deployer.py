@@ -329,15 +329,93 @@ class ModelDeployer:
             
             service = self.services[service_id]
             
+            # 直接停止进程，避免死锁（stop_service也在同一个锁内）
             if service.pid and self._is_process_alive(service.pid):
-                self.stop_service(service_id)
+                try:
+                    os.killpg(os.getpgid(service.pid), signal.SIGTERM)
+                    time.sleep(2)
+                    if self._is_process_alive(service.pid):
+                        os.killpg(os.getpgid(service.pid), signal.SIGKILL)
+                except Exception as e:
+                    logger.warning(f"Error killing process during delete: {e}")
+            
+            # 更新服务状态
+            service.status = ServiceStatus.STOPPED.value
+            service.pid = None
             
             script_path = Path(self.scripts_dir) / f"service_{service_id}.py"
-            if script_path.exists():
-                try:
-                    script_path.unlink()
-                except Exception as e:
-                    logger.warning(f"Failed to delete script: {e}")
+            logger.info(f"Attempting to delete script: {script_path}")
+            logger.info(f"Script path exists: {script_path.exists()}")
+            
+            # 尝试多种可能的脚本路径
+            possible_paths = [
+                script_path,
+                Path(self.scripts_dir) / f"service_{service_id}.py",
+                Path(f"inference_services/service_{service_id}.py"),
+                Path(f"service_{service_id}.py"),
+            ]
+            
+            deleted = False
+            for path in possible_paths:
+                logger.info(f"Checking path: {path}, exists: {path.exists()}")
+                if path.exists():
+                    try:
+                        path.unlink()
+                        logger.info(f"Deleted script: {path}")
+                        deleted = True
+                    except Exception as e:
+                        logger.warning(f"Failed to delete script {path}: {e}")
+            
+            if not deleted:
+                # 使用模糊匹配查找相关脚本文件
+                scripts_dir = Path(self.scripts_dir)
+                if scripts_dir.exists():
+                    # 提取 service_id 中的数字部分用于匹配
+                    search_parts = service_id.split("_")
+                    
+                    # 查找包含 service_id 的文件
+                    for f in scripts_dir.glob("*.py"):
+                        # 检查多种可能的匹配方式
+                        if (service_id in f.name or 
+                            f"service_{service_id}" in f.name or
+                            any(part in f.name for part in search_parts if len(part) > 5)):
+                            try:
+                                f.unlink()
+                                logger.info(f"Deleted script (fuzzy match): {f}")
+                                deleted = True
+                                break
+                            except Exception as e:
+                                logger.warning(f"Failed to delete script {f}: {e}")
+                    
+                    if not deleted:
+                        # 列出所有文件供参考
+                        files = list(scripts_dir.glob("*.py"))
+                        logger.info(f"Files in {scripts_dir}: {files}")
+                        logger.info(f"Looking for service_id: {service_id}")
+            
+            # 删除日志文件
+            logs_dir = Path("logs")
+            if logs_dir.exists():
+                # 精确匹配: service_svc_xxx_*.log 格式
+                exact_pattern = f"service_{service_id}_*.log"
+                exact_files = list(logs_dir.glob(exact_pattern))
+                
+                if exact_files:
+                    for log_file in exact_files:
+                        try:
+                            log_file.unlink()
+                            logger.info(f"Deleted log file: {log_file}")
+                        except Exception as e:
+                            logger.warning(f"Failed to delete log file {log_file}: {e}")
+                else:
+                    # 精确匹配没找到，尝试模糊匹配：文件名包含完整 service_id
+                    for log_file in logs_dir.glob("service_*.log"):
+                        if f"service_{service_id}" in log_file.name:
+                            try:
+                                log_file.unlink()
+                                logger.info(f"Deleted log file (fuzzy): {log_file}")
+                            except Exception as e:
+                                logger.warning(f"Failed to delete log file {log_file}: {e}")
             
             if service.port in self.port_index:
                 del self.port_index[service.port]
@@ -375,6 +453,88 @@ class ModelDeployer:
         if service_id:
             return self.services.get(service_id)
         return None
+
+    def get_service_logs(self, service_id: str, lines: int = 100, from_line: int = -1) -> Dict:
+        """获取推理服务的日志
+        
+        增量获取模式（推荐）：
+        - from_line=-1 (默认): 获取最新的日志（最后 lines 行）
+        - from_line>=0: 从指定行号开始获取增量日志
+        
+        返回包含 next_line，前端保存用于下次增量获取
+        """
+        service = self.services.get(service_id)
+        if not service:
+            return {
+                "status": "not_found",
+                "service_id": service_id,
+                "message": "服务不存在"
+            }
+        
+        logs_dir = Path("logs")
+        if not logs_dir.exists():
+            return {
+                "status": "success",
+                "service_id": service_id,
+                "logs": "",
+                "message": "日志目录不存在",
+                "next_line": 0,
+                "has_more": False
+            }
+        
+        log_pattern = f"service_{service_id}_*.log"
+        log_files = sorted(logs_dir.glob(log_pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+        
+        if not log_files:
+            return {
+                "status": "success",
+                "service_id": service_id,
+                "logs": "",
+                "message": "日志文件不存在",
+                "next_line": 0,
+                "has_more": False
+            }
+        
+        latest_log = log_files[0]
+        try:
+            with open(latest_log, 'r', encoding='utf-8') as f:
+                all_lines = f.readlines()
+                total_lines = len(all_lines)
+                
+                if from_line < 0:
+                    start_line = max(0, total_lines - lines)
+                else:
+                    start_line = from_line
+                
+                if start_line >= total_lines:
+                    return {
+                        "status": "success",
+                        "service_id": service_id,
+                        "log_file": str(latest_log.name),
+                        "logs": "",
+                        "total_lines": total_lines,
+                        "next_line": total_lines,
+                        "has_more": False
+                    }
+                
+                end_line = min(start_line + lines, total_lines)
+                log_content = ''.join(all_lines[start_line:end_line])
+                
+                return {
+                    "status": "success",
+                    "service_id": service_id,
+                    "log_file": str(latest_log.name),
+                    "logs": log_content,
+                    "total_lines": total_lines,
+                    "next_line": end_line,
+                    "has_more": end_line < total_lines
+                }
+        except Exception as e:
+            return {
+                "status": "error",
+                "service_id": service_id,
+                "message": f"读取日志失败: {str(e)}"
+            }
 
     def check_service_health(self, service_id: str) -> Dict:
         """检查服务的健康状态，包括进程状态和服务响应状态"""

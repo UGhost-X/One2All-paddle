@@ -1224,6 +1224,36 @@ async def list_available_models(project_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/deploy/http/service/{service_id}/logs")
+async def get_service_logs(
+    service_id: str,
+    lines: int = Query(100, ge=1, le=5000, description="每次返回的日志行数"),
+    from_line: int = Query(-1, ge=-1, description="从第几行开始获取，-1表示获取最新日志")
+):
+    """获取推理服务的日志
+    
+    增量获取模式：
+    - from_line=-1 (默认): 获取最新的日志（最后 lines 行）
+    - from_line>=0: 从指定行号开始获取增量日志
+    
+    返回包含 next_line，前端保存用于下次增量获取
+    """
+    try:
+        result = http_deployer.get_service_logs(
+            service_id, 
+            lines=lines,
+            from_line=from_line
+        )
+        if result.get("status") == "not_found":
+            raise HTTPException(status_code=404, detail=result.get("message"))
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"获取服务日志异常: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
