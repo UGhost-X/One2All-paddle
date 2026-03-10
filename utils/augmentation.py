@@ -90,29 +90,35 @@ class DataAugmentor:
         # 1. Continuous parameters
         if "brightness" in self.config:
             b_range = self.config["brightness"].get("range", [0.8, 1.2])
+            b_range = [float(b_range[0]), float(b_range[1])]
             param_gradients["brightness"] = np.linspace(b_range[0], b_range[1], num_results).tolist()
             
         if "contrast" in self.config:
             c_range = self.config["contrast"].get("range", [0.8, 1.2])
+            c_range = [float(c_range[0]), float(c_range[1])]
             param_gradients["contrast"] = np.linspace(c_range[0], c_range[1], num_results).tolist()
             
         if "rotate" in self.config:
             r_cfg = self.config["rotate"]
             r_range = r_cfg.get("range") or [-r_cfg.get("max_angle", 15), r_cfg.get("max_angle", 15)]
+            r_range = [float(r_range[0]), float(r_range[1])]
             param_gradients["rotate"] = np.linspace(r_range[0], r_range[1], num_results).tolist()
 
         if "pitch" in self.config:
             p_cfg = self.config["pitch"]
             p_range = p_cfg.get("range", [-30, 30])
+            p_range = [float(p_range[0]), float(p_range[1])]
             param_gradients["pitch"] = np.linspace(p_range[0], p_range[1], num_results).tolist()
 
         if "yaw" in self.config:
             y_cfg = self.config["yaw"]
             y_range = y_cfg.get("range", [-30, 30])
+            y_range = [float(y_range[0]), float(y_range[1])]
             param_gradients["yaw"] = np.linspace(y_range[0], y_range[1], num_results).tolist()
             
         if "blur" in self.config:
             k_range = self.config["blur"].get("ksize_range", [3, 11])
+            k_range = [float(k_range[0]), float(k_range[1])]
             # 模糊核必须是奇数
             param_gradients["blur"] = [int(x) | 1 for x in np.linspace(k_range[0], k_range[1], num_results)]
 
