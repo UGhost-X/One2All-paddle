@@ -16,34 +16,61 @@ import json
 import base64
 import time
 import asyncio
+import psutil
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any, List, Optional
 from pathlib import Path
 from datetime import datetime
+from contextlib import contextmanager
 
-# 推理超时时间（秒），超过此时间认为线程已挂起，强制重建线程池
 INFERENCE_TIMEOUT_SEC = 60
 
-# 创建线程池用于执行同步的 Paddle 推理
-executor = ThreadPoolExecutor(max_workers=1)
+class ExecutorManager:
+    """
+    线程池管理器。
+    - 用 asyncio.Lock 保证同一时刻只有一个协程在重建线程池
+    - shutdown(wait=True) 在独立线程里执行，确保旧线程真正结束后
+      旧线程里的 Paddle 张量才会被释放，避免 CUDA context 损坏
+    """
+    def __init__(self, max_workers: int = 1):
+        self._executor  = ThreadPoolExecutor(max_workers=max_workers)
+        self._max_workers = max_workers
+        self._lock: Optional[asyncio.Lock] = None
 
-# 创建日志目录
-LOG_DIR = Path("logs")
+    def init_lock(self):
+        self._lock = asyncio.Lock()
+
+    @property
+    def executor(self) -> ThreadPoolExecutor:
+        return self._executor
+
+    async def rebuild(self, reason: str = ""):
+        async with self._lock:
+            old_executor = self._executor
+            self._executor = ThreadPoolExecutor(max_workers=self._max_workers)
+            if reason:
+                logger.warning(f"[ExecutorManager] Rebuilding thread pool: {reason}")
+            loop = asyncio.get_running_loop()
+            loop.run_in_executor(None, old_executor.shutdown, True)
+
+
+_executor_manager = ExecutorManager(max_workers=4)
+
+# 全局并发限流：同一时刻只有一个请求进入推理链路
+_infer_semaphore: Optional[asyncio.Semaphore] = None
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 日志配置
+# ─────────────────────────────────────────────────────────────────────────────
+
+LOG_DIR  = Path("logs")
 LOG_DIR.mkdir(exist_ok=True)
-
-# 生成日志文件名（包含日期和服务ID）
 LOG_FILE = LOG_DIR / f"service_{{ service_id }}_{datetime.now().strftime('%Y%m%d')}.log"
 
-# 配置日志处理器
-file_handler = logging.handlers.RotatingFileHandler(
-    LOG_FILE,
-    maxBytes=10 * 1024 * 1024,  # 10MB
-    backupCount=5,
-    encoding='utf-8'
+file_handler    = logging.handlers.RotatingFileHandler(
+    LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=5, encoding='utf-8'
 )
 console_handler = logging.StreamHandler(sys.stdout)
-
-# 设置日志格式
 formatter = logging.Formatter(
     '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
@@ -51,22 +78,23 @@ formatter = logging.Formatter(
 file_handler.setFormatter(formatter)
 console_handler.setFormatter(formatter)
 
-# 配置根日志记录器
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
 
-# 同时配置 uvicorn 的日志
 uvicorn_logger = logging.getLogger("uvicorn")
 uvicorn_logger.setLevel(logging.INFO)
 uvicorn_logger.addHandler(file_handler)
 uvicorn_logger.addHandler(console_handler)
 
-os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
-os.environ["FLAGS_allocator_strategy"] = "auto_growth"
+# ─────────────────────────────────────────────────────────────────────────────
+# 环境变量 & 路径
+# ─────────────────────────────────────────────────────────────────────────────
 
-# 添加 PaddleSeg 路径
+os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
+os.environ["FLAGS_allocator_strategy"]              = "auto_growth"
+
 PADDLESEG_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "PaddleX", "paddlex", "repo_manager", "repos", "PaddleSeg"
@@ -91,6 +119,134 @@ app = FastAPI(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 性能监控工具
+# ─────────────────────────────────────────────────────────────────────────────
+
+class PerformanceMonitor:
+    """性能监控器：记录CPU、内存、GPU使用情况和步骤耗时"""
+
+    def __init__(self, request_id: str):
+        self.request_id = request_id
+        self.step_times: Dict[str, float] = {}
+        self.resource_snapshots: Dict[str, Dict[str, Any]] = {}
+        self._step_start_time: Optional[float] = None
+        self._current_step: Optional[str] = None
+
+    @staticmethod
+    def get_cpu_info() -> Dict[str, Any]:
+        """获取CPU信息"""
+        cpu_percent = psutil.cpu_percent(interval=0.1)
+        cpu_count = psutil.cpu_count()
+        cpu_freq = psutil.cpu_freq()
+        return {
+            "usage_percent": round(cpu_percent, 1),
+            "core_count": cpu_count,
+            "freq_mhz": round(cpu_freq.current, 0) if cpu_freq else 0,
+            "load_avg": [round(x, 2) for x in os.getloadavg()] if hasattr(os, 'getloadavg') else [],
+        }
+
+    @staticmethod
+    def get_memory_info() -> Dict[str, Any]:
+        """获取内存信息"""
+        mem = psutil.virtual_memory()
+        return {
+            "total_gb": round(mem.total / (1024**3), 2),
+            "available_gb": round(mem.available / (1024**3), 2),
+            "used_gb": round(mem.used / (1024**3), 2),
+            "usage_percent": mem.percent,
+        }
+
+    @staticmethod
+    def get_gpu_info() -> Dict[str, Any]:
+        """获取GPU显存信息"""
+        try:
+            allocated = paddle.device.cuda.memory_allocated(0)
+            reserved = paddle.device.cuda.memory_reserved(0)
+            max_memory = paddle.device.cuda.max_memory_allocated(0)
+            return {
+                "allocated_mb": round(allocated / 1024**2, 1),
+                "reserved_mb": round(reserved / 1024**2, 1),
+                "max_allocated_mb": round(max_memory / 1024**2, 1),
+                "free_mb": round((reserved - allocated) / 1024**2, 1),
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    def get_full_resource_snapshot(self) -> Dict[str, Any]:
+        """获取完整的资源快照"""
+        return {
+            "cpu": self.get_cpu_info(),
+            "memory": self.get_memory_info(),
+            "gpu": self.get_gpu_info(),
+            "timestamp": time.time(),
+        }
+
+    def start_step(self, step_name: str):
+        """开始记录一个步骤"""
+        self._current_step = step_name
+        self._step_start_time = time.time()
+        self.resource_snapshots[f"{step_name}_start"] = self.get_full_resource_snapshot()
+        logger.info(f"[{self.request_id}] ▶️ STEP START: {step_name}")
+
+    def end_step(self, step_name: str = None):
+        """结束记录当前步骤"""
+        step = step_name or self._current_step
+        if step and self._step_start_time:
+            elapsed = time.time() - self._step_start_time
+            self.step_times[step] = elapsed
+            self.resource_snapshots[f"{step}_end"] = self.get_full_resource_snapshot()
+
+            # 计算资源变化
+            start = self.resource_snapshots.get(f"{step}_start", {})
+            end = self.resource_snapshots.get(f"{step}_end", {})
+
+            # 构建详细日志
+            log_parts = [f"[{self.request_id}] ✅ STEP END: {step} | Time: {elapsed:.3f}s"]
+
+            # CPU变化
+            cpu_start = start.get("cpu", {})
+            cpu_end = end.get("cpu", {})
+            if cpu_start and cpu_end:
+                log_parts.append(f"CPU: {cpu_start.get('usage_percent', 0):.1f}% → {cpu_end.get('usage_percent', 0):.1f}%")
+
+            # 内存变化
+            mem_start = start.get("memory", {})
+            mem_end = end.get("memory", {})
+            if mem_start and mem_end:
+                mem_delta = mem_end.get("used_gb", 0) - mem_start.get("used_gb", 0)
+                log_parts.append(f"Memory: {mem_start.get('used_gb', 0):.2f}GB → {mem_end.get('used_gb', 0):.2f}GB (Δ{mem_delta:+.3f}GB)")
+
+            # GPU变化
+            gpu_start = start.get("gpu", {})
+            gpu_end = end.get("gpu", {})
+            if gpu_start and gpu_end and "error" not in gpu_start and "error" not in gpu_end:
+                gpu_delta = gpu_end.get("allocated_mb", 0) - gpu_start.get("allocated_mb", 0)
+                log_parts.append(f"GPU: {gpu_start.get('allocated_mb', 0):.1f}MB → {gpu_end.get('allocated_mb', 0):.1f}MB (Δ{gpu_delta:+.1f}MB)")
+
+            logger.info(" | ".join(log_parts))
+
+        self._current_step = None
+        self._step_start_time = None
+
+    @contextmanager
+    def step(self, step_name: str):
+        """上下文管理器方式记录步骤"""
+        self.start_step(step_name)
+        try:
+            yield self
+        finally:
+            self.end_step(step_name)
+
+    def log_summary(self):
+        """输出完整摘要"""
+        total_time = sum(self.step_times.values())
+        logger.info(f"[{self.request_id}] 📊 PERFORMANCE SUMMARY (Total: {total_time:.3f}s)")
+        for step, elapsed in sorted(self.step_times.items(), key=lambda x: x[1], reverse=True):
+            pct = (elapsed / total_time * 100) if total_time > 0 else 0
+            logger.info(f"[{self.request_id}]   - {step}: {elapsed:.3f}s ({pct:.1f}%)")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 工具函数
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -108,17 +264,30 @@ def _safe_empty_cache():
 def _cleanup(label: str = ""):
     """
     显存 + Python GC 统一清理入口。
-    调用 paddle.device.cuda.synchronize() 让 GPU 先把队列里的任务跑完，
-    确保 OOM 等错误在 empty_cache 前就已经抛出（而不是默默挂起）。
+
+    修复：移除 paddle.device.cuda.synchronize()。
+    原因：synchronize() 在 CUDA context 已损坏时会永久挂起，
+          导致 executor 线程卡死 → asyncio timeout → shutdown(wait=False)
+          → 旧线程仍在跑 → CUDA context 再次损坏，形成死循环最终崩溃。
+    paddle 的 .numpy() 调用已隐式完成 GPU→CPU 同步，此处无需额外 synchronize。
     """
-    try:
-        paddle.device.cuda.synchronize()   # 强制 GPU 同步，让挂起的错误立即浮现
-    except Exception:
-        pass
     gc.collect()
     _safe_empty_cache()
     if label:
         logger.debug(f"[cleanup] {label}")
+
+
+def _get_gpu_memory_info() -> Dict[str, Any]:
+    """获取 GPU 显存信息，用于健康检查和监控"""
+    try:
+        allocated = paddle.device.cuda.memory_allocated(0)
+        reserved  = paddle.device.cuda.memory_reserved(0)
+        return {
+            "allocated_mb": round(allocated / 1024 ** 2, 1),
+            "reserved_mb":  round(reserved  / 1024 ** 2, 1),
+        }
+    except Exception:
+        return {}
 
 
 def _preprocess_roi(roi: np.ndarray) -> np.ndarray:
@@ -134,7 +303,7 @@ def _preprocess_roi(roi: np.ndarray) -> np.ndarray:
     else:
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-    img = cv2.resize(img, (224, 224)).astype(np.float32) / 255.0
+    img  = cv2.resize(img, (224, 224)).astype(np.float32) / 255.0
     mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
     std  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
     img  = (img - mean) / std
@@ -152,7 +321,7 @@ def create_stfpm_model(backbone_name="resnet18"):
         def __init__(self, backbone_name):
             super(STFPMModel, self).__init__()
             self.student = ResNet_MS3(pretrained=False, arch=backbone_name)
-            self.teacher = ResNet_MS3(pretrained=True, arch=backbone_name)
+            self.teacher = ResNet_MS3(pretrained=True,  arch=backbone_name)
             for param in self.teacher.parameters():
                 param.stop_gradient = True
 
@@ -165,76 +334,90 @@ def create_stfpm_model(backbone_name="resnet18"):
             if self.student.training:
                 return [[stu, tea]]
             else:
-                # 逐步累乘，及时释放中间张量防止显存累积
-                score_map = None
+                H, W = x.shape[2], x.shape[3]
+                maps = []
                 for j in range(len(tea)):
-                    t = F.normalize(tea[j], axis=1)
-                    s = F.normalize(stu[j], axis=1)
-                    sm = paddle.sum((t - s) ** 2, 1, keepdim=True)
+                    t  = F.normalize(tea[j], axis=1)
+                    s  = F.normalize(stu[j], axis=1)
+                    sm = paddle.sum((t - s) ** 2, axis=1, keepdim=True)
                     sm = F.interpolate(
-                        sm, size=(x.shape[2], x.shape[3]),
+                        sm, size=(H, W),
                         mode='bilinear', align_corners=False
                     )
-                    if score_map is None:
-                        score_map = sm
-                    else:
-                        new_map = score_map * sm
-                        del score_map, sm
-                        score_map = new_map
+                    maps.append(sm)
+                score_map = paddle.prod(paddle.stack(maps, axis=0), axis=0)
                 return score_map   # [B, 1, H, W]
 
-        def infer_single(self, roi_np: np.ndarray) -> float:
+        def infer_single(self, roi_np: np.ndarray) -> Dict[str, Any]:
             """
-            单张推理。在 finally 中做 synchronize + gc + empty_cache，
-            确保每次推理后显存彻底释放，同时让 GPU 错误立即抛出。
+            单张推理。
+
+            修复：
+            - finally 块中加入对 roi_np 引用的 del，确保中间张量及时释放
+            - 移除多余的 synchronize（.numpy() 已隐式同步）
+            - 返回字典含 infer_failed 字段，方便上层精确标记
             """
-            tensor = None
+            tensor    = None
             score_map = None
             try:
                 tensor = paddle.to_tensor(roi_np[np.newaxis])   # [1, 3, 224, 224]
                 with paddle.no_grad():
-                    score_map = self.forward(tensor)
+                    with paddle.amp.auto_cast(enable=True, level='O1'):
+                        score_map = self.forward(tensor)
                     if isinstance(score_map, (list, tuple)):
                         score_map = score_map[0]
                     score = float(paddle.max(score_map).numpy())
-                return score
+                return {"error": score, "infer_failed": False}
+            except Exception as e:
+                logger.error(f"[infer_single] failed: {e}")
+                return {"error": 0.0, "infer_failed": True}
             finally:
+                # 修复：主动 del 所有中间张量，不依赖 GC 时机
                 if score_map is not None:
                     del score_map
                 if tensor is not None:
                     del tensor
-                _cleanup()
+                del roi_np
+                gc.collect()
+                _safe_empty_cache()
 
-        def infer_batch(self, rois_np: np.ndarray) -> np.ndarray:
+        def infer_batch(self, rois_np: np.ndarray) -> Dict[str, Any]:
             """
-            批量推理。[B, 3, 224, 224] -> [B] float32 numpy。
-            只在 finally 中做 synchronize，gc/empty_cache 由调用方在
-            category 间隙统一执行，避免频繁同步。
+            批量推理 [B, 3, 224, 224]。
+
+            修复：
+            - finally 块中 del rois_np（调用方传入的 batch numpy）
+            - 移除多余的 synchronize
+            - 返回字典含 infer_failed 字段
             """
             batch_tensor = None
-            score_map = None
+            score_map    = None
             try:
-                batch_tensor = paddle.to_tensor(rois_np)   # [B, 3, 224, 224]
+                batch_tensor = paddle.to_tensor(rois_np)
                 with paddle.no_grad():
-                    score_map = self.forward(batch_tensor)
+                    with paddle.amp.auto_cast(enable=True, level='O1'):
+                        score_map = self.forward(batch_tensor)
                     if isinstance(score_map, (list, tuple)):
                         score_map = score_map[0]
-                    B = score_map.shape[0]
+                    B      = score_map.shape[0]
                     scores = paddle.max(
                         score_map.reshape([B, -1]), axis=1
-                    ).numpy()   # GPU->CPU 同步，整批只做一次
-                return scores.astype(np.float32)
+                    ).numpy()
+                return {"scores": scores.astype(np.float32), "infer_failed": False}
+            except Exception as e:
+                logger.error(f"[infer_batch] failed: {e}")
+                return {
+                    "scores":       np.zeros(rois_np.shape[0], dtype=np.float32),
+                    "infer_failed": True,
+                }
             finally:
                 if score_map is not None:
                     del score_map
                 if batch_tensor is not None:
                     del batch_tensor
-                # 只做 synchronize，让 OOM 等错误立即抛出；
-                # gc/empty_cache 留给 category 间隙统一处理
-                try:
-                    paddle.device.cuda.synchronize()
-                except Exception:
-                    pass
+                del rois_np
+                gc.collect()
+                _safe_empty_cache()
 
     return STFPMModel(backbone_name)
 
@@ -242,7 +425,7 @@ def create_stfpm_model(backbone_name="resnet18"):
 class MultiSTFPMDetector:
     def __init__(self, models_dir):
         self.models_dir = Path(models_dir)
-        self.models: Dict[str, Any] = {}
+        self.models:  Dict[str, Any] = {}
         self.configs: Dict[str, Any] = {}
         self._load_models()
 
@@ -278,7 +461,9 @@ class MultiSTFPMDetector:
 
                     self.models[category.name]  = model
                     self.configs[category.name] = config
-                    logger.info(f"Loaded model: {category.name} (backbone: {backbone_name})")
+                    logger.info(
+                        f"Loaded model: {category.name} (backbone: {backbone_name})"
+                    )
                 except Exception as e:
                     logger.error(f"Failed to load model {category.name}: {e}")
 
@@ -287,71 +472,94 @@ class MultiSTFPMDetector:
         rois: List[np.ndarray],
         category: str,
         request_id: str = ""
-    ) -> List[Optional[Dict[str, Any]]]:
+    ) -> List[Dict[str, Any]]:
         """
         对同一 category 的多个 ROI 进行推理。
-        优先尝试批量推理；若批量失败（OOM 等）自动降级为逐个推理。
-        category 处理完后立即做一次 gc + empty_cache，避免 category
-        间显存累积。
+        优先批量推理；批量失败（OOM 等）自动降级为逐个推理。
+
+        修复：
+        - 批量 numpy 数组在传入 infer_batch 前用 try/finally 确保释放
+        - 逐个推理时每个 ROI 独立标记 infer_failed，不再污染整批结果
+        - category 处理完统一 cleanup 一次
         """
         if category not in self.models:
-            return [None] * len(rois)
+            return [
+                {
+                    "error": 0.0, "is_anomaly": False,
+                    "anomaly_score": 0.0, "threshold": 0.0,
+                    "infer_failed": True,
+                }
+            ] * len(rois)
 
         model     = self.models[category]
         config    = self.configs[category]
         threshold = config.get('threshold', 0.5)
 
-        def _make_result(error: float) -> Dict[str, Any]:
+        def _make_result(error: float, infer_failed: bool = False) -> Dict[str, Any]:
             return {
-                'is_anomaly':    error > threshold,
+                'is_anomaly':    (not infer_failed) and (error > threshold),
                 'anomaly_score': min(error / threshold, 1.0) if threshold > 0 else error,
                 'error':         error,
                 'threshold':     threshold,
+                'infer_failed':  infer_failed,
             }
 
-        errors: Optional[np.ndarray] = None
+        # 收集各 ROI 的 (error, infer_failed)，最终统一构建结果
+        result_pairs: List[tuple] = []   # [(error, infer_failed), ...]
 
-        # ── 尝试批量推理 ──────────────────────────────────────────────────
-        if len(rois) > 1:
-            try:
+        try:
+            # ── 尝试批量推理 ──────────────────────────────────────────────
+            if len(rois) > 1:
+                # 修复：batch_np 在 try/finally 中显式释放
                 batch_np = np.stack([_preprocess_roi(r) for r in rois], axis=0)
-                errors   = model.infer_batch(batch_np)
-                logger.info(
-                    f"[{request_id}] [{category}] batch inference OK, count={len(rois)}"
-                )
-            except Exception as e:
-                logger.warning(
-                    f"[{request_id}] [{category}] batch inference failed "
-                    f"({e}), falling back to single inference"
-                )
-                errors = None
-                # 批量失败后立即清理，给逐个推理腾出显存
-                _cleanup(f"{category} batch failed")
-
-        # ── 降级：逐个推理 ────────────────────────────────────────────────
-        if errors is None:
-            single_errors = []
-            for idx, roi in enumerate(rois):
                 try:
-                    roi_np = _preprocess_roi(roi)
-                    err    = model.infer_single(roi_np)   # infer_single 内部自己清理
-                    single_errors.append(err)
+                    batch_result = model.infer_batch(batch_np)
+                    # infer_batch 内部已 del rois_np，此处 batch_np 已无效，
+                    # 但变量仍持有引用，需手动 del
+                finally:
+                    del batch_np
+
+                if not batch_result["infer_failed"]:
+                    scores = batch_result["scores"]
+                    result_pairs = [(float(s), False) for s in scores]
                     logger.info(
-                        f"[{request_id}] [{category}] single inference {idx+1}/{len(rois)} "
-                        f"OK, error={err:.4f}"
+                        f"[{request_id}] [{category}] batch inference OK, "
+                        f"count={len(rois)}"
                     )
-                except Exception as e:
-                    logger.error(
-                        f"[{request_id}] [{category}] single inference {idx+1}/{len(rois)} "
-                        f"failed: {e}"
+                else:
+                    logger.warning(
+                        f"[{request_id}] [{category}] batch inference failed, "
+                        "falling back to single inference"
                     )
-                    single_errors.append(0.0)   # 失败时给 0，不阻断后续
-            errors = np.array(single_errors, dtype=np.float32)
+                    _cleanup(f"{category} batch failed")
 
-        # ── category 处理完，统一清理一次 ─────────────────────────────────
-        _cleanup(f"{category} done")
+            # ── 降级：逐个推理（批量失败 或 只有 1 个 ROI）─────────────
+            if not result_pairs:
+                for idx, roi in enumerate(rois):
+                    roi_np = _preprocess_roi(roi)
+                    # infer_single 内部会 del roi_np
+                    result = model.infer_single(roi_np)
 
-        return [_make_result(float(e)) for e in errors]
+                    # 修复：每个 ROI 独立记录 infer_failed，不相互污染
+                    result_pairs.append((result["error"], result["infer_failed"]))
+
+                    if result["infer_failed"]:
+                        logger.error(
+                            f"[{request_id}] [{category}] single inference "
+                            f"{idx+1}/{len(rois)} failed, using 0.0"
+                        )
+                    else:
+                        logger.info(
+                            f"[{request_id}] [{category}] single inference "
+                            f"{idx+1}/{len(rois)} OK, "
+                            f"error={result['error']:.4f}"
+                        )
+
+        finally:
+            # category 处理完，统一清理一次
+            _cleanup(f"{category} done")
+
+        return [_make_result(error, failed) for error, failed in result_pairs]
 
     def get_loaded_categories(self) -> List[str]:
         return list(self.models.keys())
@@ -371,15 +579,16 @@ def select_best_template_from_annotations(annotations_path: str) -> tuple:
 
         no_flip = [
             ann for ann in annotations
-            if not ann.get('horizontal_flip', False) and not ann.get('vertical_flip', False)
+            if not ann.get('horizontal_flip', False)
+            and not ann.get('vertical_flip', False)
         ]
         if not no_flip:
             logger.warning("No annotations without flip found")
             return None, []
 
         no_flip.sort(key=lambda x: abs(x.get('angle', 0)))
-        best      = no_flip[0]
-        img_info  = images.get(best.get('image_id'))
+        best     = no_flip[0]
+        img_info = images.get(best.get('image_id'))
         if not img_info:
             logger.warning(f"Image {best.get('image_id')} not found")
             return None, []
@@ -400,7 +609,10 @@ def select_best_template_from_annotations(annotations_path: str) -> tuple:
             return None, []
 
         template_annotations = [
-            {'category': ann.get('label', ''), 'bbox': ann.get('bbox', [0, 0, 0, 0])}
+            {
+                'category': ann.get('label', ''),
+                'bbox':     ann.get('bbox', [0, 0, 0, 0]),
+            }
             for ann in no_flip
             if ann.get('image_id') == best.get('image_id') and ann.get('label')
         ]
@@ -428,11 +640,14 @@ def enhance_for_matching(image):
 
 
 def align_orb_homography(tg, pg, min_matches=10):
-    orb = cv2.ORB_create(nfeatures=3000, scaleFactor=1.2, nlevels=8,
-                         edgeThreshold=15, patchSize=31)
+    orb = cv2.ORB_create(
+        nfeatures=3000, scaleFactor=1.2, nlevels=8,
+        edgeThreshold=15, patchSize=31
+    )
     kp1, des1 = orb.detectAndCompute(tg, None)
     kp2, des2 = orb.detectAndCompute(pg, None)
-    if des1 is None or des2 is None or len(kp1) < min_matches or len(kp2) < min_matches:
+    if (des1 is None or des2 is None
+            or len(kp1) < min_matches or len(kp2) < min_matches):
         return None
     bf      = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
     matches = sorted(bf.match(des1, des2), key=lambda x: x.distance)
@@ -444,7 +659,7 @@ def align_orb_homography(tg, pg, min_matches=10):
         return None
     pts1 = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
     pts2 = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
-    H, _  = cv2.findHomography(pts1, pts2, cv2.RANSAC, 4.0)
+    H, _ = cv2.findHomography(pts1, pts2, cv2.RANSAC, 4.0)
     return H
 
 
@@ -467,11 +682,11 @@ def align_ecc(tg, pg):
 
 def align_contour_affine(ti, pi):
     def get_rect(img):
-        gray     = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
-        _, bin_  = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        kernel   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-        bin_     = cv2.morphologyEx(bin_, cv2.MORPH_CLOSE, kernel, iterations=3)
-        cnts, _  = cv2.findContours(bin_, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        gray    = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
+        _, bin_ = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        kernel  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        bin_    = cv2.morphologyEx(bin_, cv2.MORPH_CLOSE, kernel, iterations=3)
+        cnts, _ = cv2.findContours(bin_, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         return cv2.minAreaRect(max(cnts, key=cv2.contourArea)) if cnts else None
 
     rt, rp = get_rect(ti), get_rect(pi)
@@ -490,17 +705,28 @@ def align_contour_affine(ti, pi):
     ], dtype=np.float64)
 
 
-def find_alignment_homography(template_img, pred_img):
+def find_alignment_homography(
+    template_img: np.ndarray,
+    pred_img: np.ndarray,
+    cached_template_gray: Optional[np.ndarray] = None
+):
+    """
+    接受预计算的 cached_template_gray，避免每次对固定模板重复做
+    CLAHE + GaussianBlur，节省约 10-30ms/请求。
+    """
     MATCH_SIZE = (512, 512)
 
     def resize_with_scale(img):
-        h, w   = img.shape[:2]
-        r      = cv2.resize(img, MATCH_SIZE)
+        h, w = img.shape[:2]
+        r    = cv2.resize(img, MATCH_SIZE)
         return r, w / MATCH_SIZE[0], h / MATCH_SIZE[1]
 
     tr, t_sx, t_sy = resize_with_scale(template_img)
     pr, p_sx, p_sy = resize_with_scale(pred_img)
-    tg, pg         = enhance_for_matching(tr), enhance_for_matching(pr)
+
+    tg = cached_template_gray if cached_template_gray is not None \
+        else enhance_for_matching(tr)
+    pg = enhance_for_matching(pr)
 
     H, strategy = None, None
     for fn, name in [
@@ -520,9 +746,11 @@ def find_alignment_homography(template_img, pred_img):
     S_p_inv = np.diag([p_sx, p_sy, 1.0])
     H_orig  = S_p_inv @ H @ S_t
 
-    logger.info(f"[Homography] strategy={strategy}, "
-                f"template=({template_img.shape[1]},{template_img.shape[0]}), "
-                f"pred=({pred_img.shape[1]},{pred_img.shape[0]})")
+    logger.info(
+        f"[Homography] strategy={strategy}, "
+        f"template=({template_img.shape[1]},{template_img.shape[0]}), "
+        f"pred=({pred_img.shape[1]},{pred_img.shape[0]})"
+    )
     logger.info(f"[Homography] H_orig:\n{H_orig}")
     return H_orig, strategy
 
@@ -532,9 +760,9 @@ def transform_bbox_with_H(bbox, H, img_size=None):
     corners = np.array(
         [[x, y], [x+w, y], [x+w, y+h], [x, y+h]], dtype=np.float32
     ).reshape(-1, 1, 2)
-    t   = cv2.perspectiveTransform(corners, H).reshape(-1, 2)
-    x0, y0 = np.min(t[:, 0]), np.min(t[:, 1])
-    x1, y1 = np.max(t[:, 0]), np.max(t[:, 1])
+    t        = cv2.perspectiveTransform(corners, H).reshape(-1, 2)
+    x0, y0   = np.min(t[:, 0]), np.min(t[:, 1])
+    x1, y1   = np.max(t[:, 0]), np.max(t[:, 1])
     if img_size:
         iw, ih = img_size
         x0, y0 = max(0, min(x0, iw)), max(0, min(y0, ih))
@@ -551,25 +779,32 @@ def detect_with_annotations(
     image: np.ndarray,
     template_image: np.ndarray,
     annotations: List[Dict],
-    request_id: str = ""
+    request_id: str = "",
+    cached_template_gray: Optional[np.ndarray] = None,
+    monitor: Optional[PerformanceMonitor] = None,
 ) -> List[Dict[str, Any]]:
     """
     Homography 对齐 + 按 category 批量推理（带 OOM 自动降级）。
-
-    显存管理策略：
-      - 批量推理失败时立即降级为逐个推理，并在失败后 cleanup
-      - 每个 category 处理完后 cleanup 一次（category 间隙）
-      - 整个函数 finally 里再 cleanup 一次兜底
+    接受 cached_template_gray，跳过固定模板的重复增强计算。
     """
     if template_image is None or not annotations:
         return []
+
+    # 创建本地monitor（如果外部未提供）
+    local_monitor = monitor if monitor else PerformanceMonitor(request_id or "internal")
 
     pred_h, pred_w = image.shape[:2]
     results_map: Dict[int, Dict] = {}
     skipped_count = 0
 
     # ── 1. Homography 对齐 ────────────────────────────────────────────────
-    H, strategy = find_alignment_homography(template_image, image)
+    local_monitor.start_step("alignment")
+    H, strategy = find_alignment_homography(
+        template_image, image,
+        cached_template_gray=cached_template_gray
+    )
+    local_monitor.end_step("alignment")
+
     if H is None:
         logger.warning(f"[{request_id}] Homography 对齐失败，使用原图坐标")
         H, strategy = np.eye(3, dtype=np.float64), "none"
@@ -577,7 +812,7 @@ def detect_with_annotations(
         logger.info(f"[{request_id}] Homography 对齐成功，策略: {strategy}")
 
     # ── 2. 变换 bbox，收集有效 ROI，按 category 分组 ─────────────────────
-    pending: Dict[str, List] = {}   # {category: [(ann_idx, roi, base_item)]}
+    pending: Dict[str, List] = {}
 
     for i, ann in enumerate(annotations):
         category      = ann.get('category')
@@ -586,7 +821,8 @@ def detect_with_annotations(
         if not category or not template_bbox or category not in detector.models:
             logger.warning(
                 f"[{request_id}] Annotation {i+1}: 跳过 - "
-                f"category={category}, in_models={category in detector.models if category else False}"
+                f"category={category}, "
+                f"in_models={category in detector.models if category else False}"
             )
             skipped_count += 1
             continue
@@ -594,51 +830,86 @@ def detect_with_annotations(
         pred_bbox = transform_bbox_with_H(template_bbox, H, img_size=(pred_w, pred_h))
         x, y, w, h = [int(v) for v in pred_bbox]
 
-        x_clip = max(0, min(x, pred_w - 1))
-        y_clip = max(0, min(y, pred_h - 1))
-        w_clip = max(0, min(w, pred_w - x_clip))
-        h_clip = max(0, min(h, pred_h - y_clip))
+        x_clip     = max(0, min(x, pred_w - 1))
+        y_clip     = max(0, min(y, pred_h - 1))
+        w_clip     = max(0, min(w, pred_w - x_clip))
+        h_clip     = max(0, min(h, pred_h - y_clip))
         is_outside = (x < 0 or y < 0 or x + w > pred_w or y + h > pred_h)
 
         if w_clip < 5 or h_clip < 5:
             logger.warning(
-                f"[{request_id}] Annotation {i+1} ({category}): 跳过 - "
-                f"ROI太小 ({w_clip}x{h_clip})"
+                f"[{request_id}] Annotation {i+1} ({category}): ROI太小 ({w_clip}x{h_clip}), 返回异常结果"
             )
-            skipped_count += 1
+            base_item = {
+                'category':           category,
+                'template_bbox':      template_bbox,
+                'bbox':               [float(x),      float(y),      float(w),      float(h)],
+                'bbox_clipped':       [float(x_clip), float(y_clip), float(w_clip), float(h_clip)],
+                'is_outside':         is_outside,
+                'alignment_strategy': strategy,
+                'is_anomaly':         True,
+                'anomaly_score':      1.0,
+                'error':              1.0,
+                'threshold':          0.5,
+                'infer_failed':       False,
+                'skip_reason':        f'roi_too_small_{w_clip}x{h_clip}',
+            }
+            results_map[i] = base_item
             continue
 
         roi = image[y_clip:y_clip + h_clip, x_clip:x_clip + w_clip]
         if roi.size == 0:
-            logger.warning(f"[{request_id}] Annotation {i+1} ({category}): 跳过 - ROI为空")
-            skipped_count += 1
+            logger.warning(
+                f"[{request_id}] Annotation {i+1} ({category}): ROI为空, 返回异常结果"
+            )
+            base_item = {
+                'category':           category,
+                'template_bbox':      template_bbox,
+                'bbox':               [float(x),      float(y),      float(w),      float(h)],
+                'bbox_clipped':       [float(x_clip), float(y_clip), float(w_clip), float(h_clip)],
+                'is_outside':         is_outside,
+                'alignment_strategy': strategy,
+                'is_anomaly':         True,
+                'anomaly_score':      1.0,
+                'error':              1.0,
+                'threshold':          0.5,
+                'infer_failed':       False,
+                'skip_reason':        'roi_empty',
+            }
+            results_map[i] = base_item
             continue
 
         t_x, t_y, t_w, t_h = template_bbox
-        t_iw, t_ih = template_image.shape[1], template_image.shape[0]
+        t_iw, t_ih          = template_image.shape[1], template_image.shape[0]
         logger.info(
             f"[{request_id}] Annotation {i+1} ({category}): "
-            f"template rel=({t_x/t_iw:.3f},{t_y/t_ih:.3f},{t_w/t_iw:.3f},{t_h/t_ih:.3f}) "
-            f"pred rel=({x/pred_w:.3f},{y/pred_h:.3f},{w/pred_w:.3f},{h/pred_h:.3f}) "
+            f"template rel=({t_x/t_iw:.3f},{t_y/t_ih:.3f},"
+            f"{t_w/t_iw:.3f},{t_h/t_ih:.3f}) "
+            f"pred rel=({x/pred_w:.3f},{y/pred_h:.3f},"
+            f"{w/pred_w:.3f},{h/pred_h:.3f}) "
             f"outside={is_outside}"
         )
 
         base_item = {
             'category':           category,
             'template_bbox':      template_bbox,
-            'bbox':               [float(x), float(y), float(w), float(h)],
+            'bbox':               [float(x),      float(y),      float(w),      float(h)],
             'bbox_clipped':       [float(x_clip), float(y_clip), float(w_clip), float(h_clip)],
             'is_outside':         is_outside,
             'alignment_strategy': strategy,
         }
         pending.setdefault(category, []).append((i, roi, base_item))
 
-    # ── 3. 按 category 批量推理（内置 OOM 降级 + category 间隙清理）──────
+    # ── 3. 按 category 批量推理 ───────────────────────────────────────────
+    local_monitor.start_step("roi_preprocessing")
     try:
+        local_monitor.end_step("roi_preprocessing")
+
+        local_monitor.start_step("inference")
         for category, items in pending.items():
-            ann_indices  = [it[0] for it in items]
-            rois         = [it[1] for it in items]
-            base_items   = [it[2] for it in items]
+            ann_indices = [it[0] for it in items]
+            rois        = [it[1] for it in items]
+            base_items  = [it[2] for it in items]
 
             logger.info(
                 f"[{request_id}] Inferring category={category}, count={len(rois)}"
@@ -651,18 +922,21 @@ def detect_with_annotations(
                     result_item.update(det)
                 else:
                     result_item.update({
-                        'is_anomaly': False, 'anomaly_score': 0.0,
-                        'error': 0.0, 'threshold': 0.0,
+                        'is_anomaly':    False,
+                        'anomaly_score': 0.0,
+                        'error':         0.0,
+                        'threshold':     0.0,
+                        'infer_failed':  True,
                     })
                 results_map[ann_idx] = result_item
+        local_monitor.end_step("inference")
     finally:
-        # 兜底清理（即使中途异常也执行）
         _cleanup(f"[{request_id}] detect_with_annotations finally")
 
     results = [results_map[idx] for idx in sorted(results_map.keys())]
     logger.info(
         f"[{request_id}] Completed: {len(results)} processed, "
-        f"{skipped_count} skipped, total {len(annotations)}"
+        f"{skipped_count} skipped, total={len(annotations)}"
     )
     return results
 
@@ -671,26 +945,29 @@ def detect_with_annotations(
 # FastAPI
 # ─────────────────────────────────────────────────────────────────────────────
 
-MODELS: Dict[str, Any] = {}
-MODEL_PATHS = {{ models_config | tojson(indent=4) }}
-STFPM_DETECTOR: Optional[MultiSTFPMDetector] = None
-TEMPLATE_IMAGE: Optional[np.ndarray] = None
-TEMPLATE_ANNOTATIONS: List[Dict[str, Any]] = []
+MODELS:                Dict[str, Any]       = {}
+MODEL_PATHS                                 = {{ models_config | tojson(indent=4) }}
+STFPM_DETECTOR:        Optional[MultiSTFPMDetector] = None
+TEMPLATE_IMAGE:        Optional[np.ndarray] = None
+TEMPLATE_ANNOTATIONS:  List[Dict[str, Any]] = []
+CACHED_TEMPLATE_GRAY:  Optional[np.ndarray] = None
 
 
 class PredictROIResponse(BaseModel):
-    results: List[Dict[str, Any]]
-    processing_time: float
-    total_detections: int
-    anomaly_count: int
+    results:            List[Dict[str, Any]]
+    processing_time:    float
+    total_detections:   int
+    anomaly_count:      int
+    infer_failed_count: int   # 推理失败的 ROI 数量，方便监控
 
 
 def load_models():
-    global STFPM_DETECTOR, MODELS, TEMPLATE_IMAGE, TEMPLATE_ANNOTATIONS
+    global STFPM_DETECTOR, MODELS, TEMPLATE_IMAGE, TEMPLATE_ANNOTATIONS, CACHED_TEMPLATE_GRAY
 
     model_dirs = {
         path for key, path in MODEL_PATHS.items()
-        if not key.endswith('_type') and key not in ('_labels', '_model_type')
+        if not key.endswith('_type')
+        and key not in ('_labels', '_model_type')
     }
     if not model_dirs:
         logger.warning("No model directories found")
@@ -698,7 +975,10 @@ def load_models():
 
     base_dir       = Path(list(model_dirs)[0]).parent
     STFPM_DETECTOR = MultiSTFPMDetector(base_dir)
-    MODELS         = {cat: {'loaded': True} for cat in STFPM_DETECTOR.get_loaded_categories()}
+    MODELS         = {
+        cat: {'loaded': True}
+        for cat in STFPM_DETECTOR.get_loaded_categories()
+    }
     logger.info(f"Loaded {len(MODELS)} models: {list(MODELS.keys())}")
 
     # 优先从 annotations.json 加载模板
@@ -726,10 +1006,25 @@ def load_models():
 
     if TEMPLATE_IMAGE is None:
         logger.warning("No template image found")
+        return
+
+    # 预计算并缓存模板增强灰度图（固定 512×512 分辨率）
+    try:
+        MATCH_SIZE           = (512, 512)
+        tpl_resized          = cv2.resize(TEMPLATE_IMAGE, MATCH_SIZE)
+        CACHED_TEMPLATE_GRAY = enhance_for_matching(tpl_resized)
+        logger.info("Cached enhanced template gray image for fast alignment")
+    except Exception as e:
+        logger.warning(f"Failed to cache template gray: {e}")
+        CACHED_TEMPLATE_GRAY = None
 
 
 @app.on_event("startup")
 async def startup_event():
+    global _infer_semaphore
+    # 修复：在事件循环内初始化 Semaphore 和 ExecutorManager 的 Lock
+    _infer_semaphore = asyncio.Semaphore(1)
+    _executor_manager.init_lock()
     load_models()
 
 
@@ -742,6 +1037,7 @@ async def health_check():
         "task_uuid":     "{{ task_uuid }}",
         "loaded_models": list(MODELS.keys()),
         "total_models":  len(MODELS),
+        "gpu_memory":    _get_gpu_memory_info(),
     }
 
 
@@ -757,106 +1053,157 @@ async def predict(
 ):
     """
     支持文件上传（file=）和 base64（image=）两种方式。
-    推理设有超时保护（INFERENCE_TIMEOUT_SEC），超时后自动重建线程池。
-    """
-    global executor
 
+    修复：
+    - 使用 asyncio.get_running_loop()（替代已废弃的 get_event_loop()）
+    - 超时/异常后先 cleanup 再调用 ExecutorManager.rebuild()，
+      rebuild() 内部用 wait=True 确保旧线程真正结束，
+      彻底避免旧线程里的 Paddle 张量与新线程产生 CUDA context 冲突
+    - Semaphore 保证同一时刻只有一个请求进入推理链路
+    - 新增：完整的性能监控和资源使用日志
+    """
     start_time = time.time()
     request_id = f"{int(start_time * 1000)}"
+
+    # 初始化性能监控器
+    monitor = PerformanceMonitor(request_id)
+
     logger.info(f"[{request_id}] ========== PREDICTION REQUEST ==========")
 
-    try:
-        # ── 解码图片 ──────────────────────────────────────────────────────
-        image_data: Optional[np.ndarray] = None
+    # 记录请求开始时的系统资源状态
+    initial_resources = monitor.get_full_resource_snapshot()
+    logger.info(f"[{request_id}] 🖥️ INITIAL SYSTEM STATE:")
+    logger.info(f"[{request_id}]    CPU: {initial_resources['cpu']['usage_percent']:.1f}% (cores: {initial_resources['cpu']['core_count']})")
+    logger.info(f"[{request_id}]    Memory: {initial_resources['memory']['used_gb']:.2f}GB / {initial_resources['memory']['total_gb']:.2f}GB ({initial_resources['memory']['usage_percent']}%)")
+    if 'error' not in initial_resources['gpu']:
+        logger.info(f"[{request_id}]    GPU: {initial_resources['gpu']['allocated_mb']:.1f}MB allocated, {initial_resources['gpu']['reserved_mb']:.1f}MB reserved")
 
-        if file is not None:
-            logger.info(f"[{request_id}] file upload: {file.filename}")
-            contents   = await file.read()
-            nparr      = np.frombuffer(contents, np.uint8)
-            image_data = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            logger.info(f"[{request_id}] file size={len(contents)} bytes")
-        elif image is not None:
-            logger.info(f"[{request_id}] base64 input")
-            b64 = image.split(",")[1] if "," in image else image
-            nparr      = np.frombuffer(base64.b64decode(b64), np.uint8)
-            image_data = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        else:
-            raise HTTPException(status_code=400, detail="No image provided")
-
-        if image_data is None:
-            raise HTTPException(status_code=400, detail="Invalid image")
-
-        logger.info(f"[{request_id}] decoded image shape={image_data.shape}")
-
-        if STFPM_DETECTOR is None:
-            raise HTTPException(status_code=500, detail="Models not loaded")
-        if TEMPLATE_IMAGE is None:
-            raise HTTPException(status_code=500, detail="Template image not loaded")
-        if not TEMPLATE_ANNOTATIONS:
-            raise HTTPException(status_code=400, detail="No template annotations available")
-
-        # ── 带超时的推理 ──────────────────────────────────────────────────
-        loop = asyncio.get_event_loop()
+    async with _infer_semaphore:
         try:
-            roi_results = await asyncio.wait_for(
-                loop.run_in_executor(
-                    executor,
-                    detect_with_annotations,
-                    STFPM_DETECTOR,
-                    image_data,
-                    TEMPLATE_IMAGE,
-                    TEMPLATE_ANNOTATIONS,
-                    request_id
-                ),
-                timeout=INFERENCE_TIMEOUT_SEC
-            )
-        except asyncio.TimeoutError:
-            # 线程挂起（常见于 GPU OOM 后 Paddle 不抛异常的情况）
-            logger.error(
-                f"[{request_id}] Inference timeout after {INFERENCE_TIMEOUT_SEC}s, "
-                "rebuilding thread pool"
-            )
-            executor.shutdown(wait=False)
-            executor = ThreadPoolExecutor(max_workers=1)
-            raise HTTPException(status_code=503, detail="Inference timeout, please retry")
-        except Exception as exec_err:
-            # 线程内抛出异常，同样重建线程池防止后续请求卡住
-            logger.error(
-                f"[{request_id}] Executor error, rebuilding thread pool: {exec_err}"
-            )
-            executor.shutdown(wait=False)
-            executor = ThreadPoolExecutor(max_workers=1)
-            raise
+            # ── 解码图片 ──────────────────────────────────────────────────
+            with monitor.step("image_decode"):
+                image_data: Optional[np.ndarray] = None
 
-        processing_time = time.time() - start_time
-        anomaly_count   = sum(1 for r in roi_results if r.get('is_anomaly', False))
+                if file is not None:
+                    logger.info(f"[{request_id}] file upload: {file.filename}")
+                    contents   = await file.read()
+                    nparr      = np.frombuffer(contents, np.uint8)
+                    image_data = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                    logger.info(f"[{request_id}] file size={len(contents)} bytes")
+                elif image is not None:
+                    logger.info(f"[{request_id}] base64 input")
+                    b64        = image.split(",")[1] if "," in image else image
+                    nparr      = np.frombuffer(base64.b64decode(b64), np.uint8)
+                    image_data = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                else:
+                    raise HTTPException(status_code=400, detail="No image provided")
 
-        logger.info(f"[{request_id}] ========== RESULTS ==========")
-        logger.info(f"[{request_id}] ROIs={len(roi_results)}, anomalies={anomaly_count}, "
-                    f"time={processing_time:.3f}s")
-        for i, r in enumerate(roi_results):
+                if image_data is None:
+                    raise HTTPException(status_code=400, detail="Invalid image")
+
+                logger.info(f"[{request_id}] decoded image shape={image_data.shape}")
+
+            if STFPM_DETECTOR is None:
+                raise HTTPException(status_code=500, detail="Models not loaded")
+            if TEMPLATE_IMAGE is None:
+                raise HTTPException(status_code=500, detail="Template image not loaded")
+            if not TEMPLATE_ANNOTATIONS:
+                raise HTTPException(
+                    status_code=400, detail="No template annotations available"
+                )
+
+            # ── 带超时的推理 ──────────────────────────────────────────────
+            monitor.start_step("total_inference")
+            loop = asyncio.get_running_loop()
+            try:
+                roi_results = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        _executor_manager.executor,
+                        lambda: detect_with_annotations(
+                            STFPM_DETECTOR,
+                            image_data,
+                            TEMPLATE_IMAGE,
+                            TEMPLATE_ANNOTATIONS,
+                            request_id,
+                            CACHED_TEMPLATE_GRAY,
+                            monitor,  # 传递monitor到内部
+                        )
+                    ),
+                    timeout=INFERENCE_TIMEOUT_SEC
+                )
+                monitor.end_step("total_inference")
+            except asyncio.TimeoutError:
+                monitor.end_step("total_inference")
+                logger.error(
+                    f"[{request_id}] Inference timeout after {INFERENCE_TIMEOUT_SEC}s, "
+                    "rebuilding thread pool"
+                )
+                _cleanup(f"[{request_id}] timeout cleanup")
+                await _executor_manager.rebuild(reason=f"timeout [{request_id}]")
+                raise HTTPException(
+                    status_code=503, detail="Inference timeout, please retry"
+                )
+            except Exception as exec_err:
+                monitor.end_step("total_inference")
+                logger.error(
+                    f"[{request_id}] Executor error: {exec_err}, rebuilding thread pool"
+                )
+                _cleanup(f"[{request_id}] executor error cleanup")
+                await _executor_manager.rebuild(reason=f"executor error [{request_id}]")
+                raise
+
+            processing_time    = time.time() - start_time
+            anomaly_count      = sum(1 for r in roi_results if r.get('is_anomaly', False))
+            infer_failed_count = sum(1 for r in roi_results if r.get('infer_failed', False))
+
+            # 输出性能摘要
+            monitor.log_summary()
+
+            logger.info(f"[{request_id}] ========== RESULTS ==========")
             logger.info(
-                f"[{request_id}] ROI {i+1:2d}: {r.get('category','?'):8s} | "
-                f"{'ANOMALY' if r.get('is_anomaly') else 'NORMAL ':7s} | "
-                f"score={r.get('anomaly_score',0):.3f} | "
-                f"error={r.get('error',0):.3f} | "
-                f"threshold={r.get('threshold',0):.3f} | "
-                f"strategy={r.get('alignment_strategy','?')}"
+                f"[{request_id}] ROIs={len(roi_results)}, "
+                f"anomalies={anomaly_count}, "
+                f"infer_failed={infer_failed_count}, "
+                f"time={processing_time:.3f}s"
             )
-        logger.info(f"[{request_id}] ========== REQUEST COMPLETED ==========")
+            for i, r in enumerate(roi_results):
+                failed_tag = " [FAILED]" if r.get('infer_failed') else ""
+                logger.info(
+                    f"[{request_id}] ROI {i+1:2d}: "
+                    f"{r.get('category','?'):8s} | "
+                    f"{'ANOMALY' if r.get('is_anomaly') else 'NORMAL ':7s} | "
+                    f"score={r.get('anomaly_score',0):.3f} | "
+                    f"error={r.get('error',0):.3f} | "
+                    f"threshold={r.get('threshold',0):.3f} | "
+                    f"strategy={r.get('alignment_strategy','?')}"
+                    f"{failed_tag}"
+                )
 
-        return PredictROIResponse(
-            results=roi_results,
-            processing_time=processing_time,
-            total_detections=len(roi_results),
-            anomaly_count=anomaly_count
-        )
+            # 记录请求结束时的系统资源状态
+            final_resources = monitor.get_full_resource_snapshot()
+            logger.info(f"[{request_id}] 🖥️ FINAL SYSTEM STATE:")
+            logger.info(f"[{request_id}]    CPU: {final_resources['cpu']['usage_percent']:.1f}%")
+            logger.info(f"[{request_id}]    Memory: {final_resources['memory']['used_gb']:.2f}GB ({final_resources['memory']['usage_percent']}%)")
+            if 'error' not in final_resources['gpu']:
+                logger.info(f"[{request_id}]    GPU: {final_resources['gpu']['allocated_mb']:.1f}MB allocated")
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"[{request_id}] Prediction error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+            logger.info(f"[{request_id}] ========== REQUEST COMPLETED ==========")
+            for handler in logger.handlers:
+                handler.flush()
+
+            return PredictROIResponse(
+                results=roi_results,
+                processing_time=processing_time,
+                total_detections=len(roi_results),
+                anomaly_count=anomaly_count,
+                infer_failed_count=infer_failed_count,
+            )
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"[{request_id}] Prediction error: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 def signal_handler(sig, frame):
@@ -864,7 +1211,7 @@ def signal_handler(sig, frame):
     sys.exit(0)
 
 
-signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGINT,  signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 if __name__ == "__main__":

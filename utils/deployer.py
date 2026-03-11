@@ -260,8 +260,8 @@ class ModelDeployer:
                 import sys
                 proc = subprocess.Popen(
                     [sys.executable, script_path],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    stdout=None,
+                    stderr=None,
                     start_new_session=True,
                     cwd=os.getcwd()
                 )
