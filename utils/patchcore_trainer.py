@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-PatchCore 异常检测模型训练脚本
-遵循与 trainer.py 相同的输出格式和训练流程
+PatchCore 异常检测模型训练脚本 - ROI级别训练
+每个标注框（ROI）训练一个独立的模型
+使用 PyTorch 进行特征提取
 """
 import os
 import sys
@@ -12,104 +13,22 @@ import shutil
 import logging
 import traceback
 import threading
-import subprocess
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 import numpy as np
 import cv2
-
-# 延迟导入paddle，避免初始化冲突
-_paddle_module = None
-_nn_module = None
-_F_module = None
-
-def _import_paddle():
-    global _paddle_module, _nn_module, _F_module
-    if _paddle_module is None:
-        import paddle
-        import paddle.nn as nn
-        import paddle.nn.functional as F
-        _paddle_module = paddle
-        _nn_module = nn
-        _F_module = F
-    return _paddle_module, _nn_module, _F_module
-
-def _get_resnet(backbone_name):
-    """动态获取ResNet模型"""
-    paddle, _, _ = _import_paddle()
-
-    # 手动定义ResNet18/50，避免通过paddle.vision.models导入
-    from paddle.vision.models.resnet import BasicBlock, BottleneckBlock
-
-    class SimpleResNet(paddle.nn.Layer):
-        def __init__(self, block, depth, num_classes=1000, with_pool=True):
-            super(SimpleResNet, self).__init__()
-            layer_cfg = {
-                18: [2, 2, 2, 2],
-                34: [3, 4, 6, 3],
-                50: [3, 4, 6, 3],
-                101: [3, 4, 23, 3],
-                152: [3, 8, 36, 3],
-            }
-            layers = layer_cfg[depth]
-            self.with_pool = with_pool
-            self.num_classes = num_classes
-
-            self.conv1 = paddle.nn.Conv2D(3, 64, 7, stride=2, padding=3, bias_attr=False)
-            self.bn1 = paddle.nn.BatchNorm2D(64)
-            self.relu = paddle.nn.ReLU()
-            self.maxpool = paddle.nn.MaxPool2D(kernel_size=3, stride=2, padding=1)
-
-            self.inplanes = 64
-            self.layer1 = self._make_layer(block, 64, layers[0])
-            self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
-            self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
-            self.layer4 = self._make_layer(block, 512, layers[3], stride=2)
-
-        def _make_layer(self, block, planes, blocks, stride=1):
-            downsample = None
-            if stride != 1 or self.inplanes != planes * block.expansion:
-                downsample = paddle.nn.Sequential(
-                    paddle.nn.Conv2D(self.inplanes, planes * block.expansion, 1, stride=stride, bias_attr=False),
-                    paddle.nn.BatchNorm2D(planes * block.expansion),
-                )
-
-            layers = []
-            layers.append(block(self.inplanes, planes, stride, downsample))
-            self.inplanes = planes * block.expansion
-            for _ in range(1, blocks):
-                layers.append(block(self.inplanes, planes))
-
-            return paddle.nn.Sequential(*layers)
-
-    if backbone_name == "resnet18":
-        model = SimpleResNet(BasicBlock, 18)
-        # 加载预训练权重
-        try:
-            state_dict = paddle.load('/root/.paddle/weights/resnet18_pretrained.pdparams')
-            model.set_state_dict(state_dict)
-        except:
-            pass  # 如果没有预训练权重，使用随机初始化
-    elif backbone_name == "resnet50":
-        model = SimpleResNet(BottleneckBlock, 50)
-        try:
-            state_dict = paddle.load('/root/.paddle/weights/resnet50_pretrained.pdparams')
-            model.set_state_dict(state_dict)
-        except:
-            pass
-    else:
-        model = SimpleResNet(BasicBlock, 18)
-
-    return model
+import torch
+import torch.nn.functional as F
+from torchvision import models, transforms
 
 logger = logging.getLogger(__name__)
 
 
 class PatchCoreTrainer:
     """
-    PatchCore 模型训练器
-    使用预训练ResNet提取特征，构建内存库，通过核心集采样减少内存占用
+    ROI级别PatchCore训练器
+    每个标注框（ROI）训练一个独立的模型
     """
 
     def __init__(self, output_dir="output"):
@@ -118,7 +37,7 @@ class PatchCoreTrainer:
         self.threads = {}
         self._state_lock = threading.Lock()
         self._last_persist_ts = 0.0
-        self.state_file = str(Path(output_dir) / "_patchcore_trainer_state.json")
+        self.state_file = str(Path(output_dir) / "_roi_patchcore_trainer_state.json")
         Path(output_dir).mkdir(parents=True, exist_ok=True)
         self._load_state()
 
@@ -144,11 +63,12 @@ class PatchCoreTrainer:
 
     def _persist_state(self):
         """持久化训练状态"""
-        data = {
-            "version": 1,
-            "updated_at": time.time(),
-            "training_status": self.training_status.copy(),
-        }
+        with self._state_lock:
+            data = {
+                "version": 1,
+                "updated_at": time.time(),
+                "training_status": dict(self.training_status),
+            }
         tmp = f"{self.state_file}.tmp"
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
         with open(tmp, "w", encoding="utf-8") as f:
@@ -181,24 +101,78 @@ class PatchCoreTrainer:
             logger.info(f"[{task_id}] {message}")
             self._persist_state_if_due()
 
-    def _make_task_key(self, dataset_dir, config):
-        """生成任务唯一标识"""
-        return "|".join([
+    def _make_task_key(self, dataset_dir, config, roi_id=None):
+        """生成任务唯一标识 - 基于ROI ID"""
+        parts = [
             str(config.get("project_id", "")),
             str(config.get("task_uuid", "")),
             str(config.get("model_name", "")),
-            str(config.get("label_name", "")),
-            str(dataset_dir),
-        ])
+        ]
+        if roi_id is not None:
+            parts.append(f"roi_{roi_id}")
+        parts.append(str(dataset_dir))
+        return "|".join(parts)
 
     def run_training_async(self, dataset_dir, config):
         """
-        异步启动训练
+        异步启动训练 - 为每个类别创建独立的训练任务
+        返回所有创建的任务ID列表
+        
+        Args:
+            dataset_dir: 数据目录路径，应该包含 annotations.json 和 raw_images/
+            config: 配置字典，可以包含 group_by 字段来指定分组方式
+                   - 'label': 按 label 字段分组（默认）
+                   - 'category_id': 按 category_id 字段分组
+                   - 'roi_id': 按 id 字段分组（每个标注框独立）
         """
-        task_key = self._make_task_key(dataset_dir, config)
-        existing_task_id = None
+        # 加载标注数据 - dataset_dir 直接是数据目录
+        raw_data_dir = Path(dataset_dir)
+        annotation_file = raw_data_dir / "annotations.json"
+
+        if not annotation_file.exists():
+            raise ValueError(f"annotations.json not found: {annotation_file}")
+
+        with open(annotation_file, 'r', encoding='utf-8') as f:
+            annotations_data = json.load(f)
+
+        annotations = annotations_data.get('annotations', [])
+        if not annotations:
+            raise ValueError("No annotations found in annotations.json")
+
+        # 根据配置决定分组方式
+        group_by = config.get('group_by', 'label')  # 默认按 label 分组
+        
+        groups = {}
+        for ann in annotations:
+            if group_by == 'roi_id':
+                group_id = ann.get('id')
+            elif group_by == 'category_id':
+                group_id = ann.get('category_id', 'unknown')
+            else:  # 默认按 label
+                group_id = ann.get('label', 'unknown')
+            
+            if group_id not in groups:
+                groups[group_id] = []
+            groups[group_id].append(ann)
+
+        self._add_log("main", f"Found {len(groups)} unique groups to train (group_by={group_by})")
+
+        # 为每个组创建训练任务
+        task_ids = []
+        for group_id in sorted(groups.keys()):
+            task_id = self._create_group_training_task(dataset_dir, config, group_id, groups[group_id])
+            task_ids.append(task_id)
+
+        return task_ids
+
+    def _create_group_training_task(self, dataset_dir, config, group_id, group_annotations):
+        """为单个组创建训练任务"""
+        # 清理 group_id 用于文件名
+        safe_group_id = str(group_id).replace('/', '_').replace('\\', '_')
+        task_key = self._make_task_key(dataset_dir, config, safe_group_id)
 
         # 查找现有任务
+        existing_task_id = None
         for tid, s in self.training_status.items():
             if s.get("task_key") == task_key:
                 existing_task_id = tid
@@ -223,42 +197,45 @@ class PatchCoreTrainer:
                 "start_time": time.time(),
                 "error": None
             })
-            self._add_log(task_id, "Task restarted from scratch.")
+            self._add_log(task_id, f"Task restarted for group {group_id}")
         else:
-            task_id = f"patchcore_{int(time.time())}_{config.get('label_name', 'unknown')}_{random.randint(1000, 9999)}"
-            label_name = config.get("label_name", "unknown")
+            task_id = f"patchcore_{int(time.time())}_{safe_group_id}_{random.randint(1000, 9999)}"
             task_uuid = config.get("task_uuid", "unknown")
+
+            # 按 group_id 保存模型
             save_dir = os.path.join(
                 self.output_dir,
                 config.get("project_id", "default"),
                 task_uuid,
-                label_name
+                str(safe_group_id)
             )
+
             self.training_status[task_id] = {
                 "status": "starting",
                 "progress": 0,
-                "label": label_name,
+                "group_id": group_id,
                 "task_uuid": task_uuid,
-                "logs": [f"Task {task_id} initialized."],
+                "logs": [f"Task {task_id} initialized for group {group_id}."],
                 "metrics": [],
-                "total_epochs": 1,  # PatchCore不需要多轮训练
+                "total_epochs": 1,
                 "start_time": time.time(),
                 "dataset_dir": dataset_dir,
                 "save_dir": save_dir,
                 "config": config,
                 "task_key": task_key,
+                "group_annotations": group_annotations,
             }
             self._persist_state_if_due(force=True)
 
-        t = threading.Thread(target=self._train_process, args=(task_id, dataset_dir, config))
+        t = threading.Thread(target=self._train_group_process, args=(task_id, dataset_dir, config, group_id, group_annotations))
         self.threads[task_id] = t
         t.start()
         return task_id
 
-    def _train_process(self, task_id, dataset_dir, config):
-        """训练进程"""
+    def _train_group_process(self, task_id, dataset_dir, config, group_id, group_annotations):
+        """组训练进程"""
         try:
-            self._do_train(task_id, dataset_dir, config)
+            self._do_train_group(task_id, dataset_dir, config, group_id, group_annotations)
         except (SystemExit, KeyboardInterrupt):
             if task_id in self.training_status:
                 self.training_status[task_id]["status"] = "cancelled"
@@ -272,50 +249,41 @@ class PatchCoreTrainer:
             })
             self._persist_state_if_due(force=True)
 
-    def _do_train(self, task_id, dataset_dir, config):
-        """执行训练"""
-        self._add_log(task_id, f"PatchCore training started: label={config.get('label_name')}")
+    def _do_train_group(self, task_id, dataset_dir, config, group_id, group_annotations):
+        """为单个组执行训练"""
+        self._add_log(task_id, f"PatchCore training started for group '{group_id}'")
         self.training_status[task_id]["status"] = "preparing"
         self.training_status[task_id]["progress"] = 5
 
-        label_name = config.get("label_name", "unknown")
-        task_uuid = config.get("task_uuid", "unknown")
-        save_dir = self.training_status[task_id].get("save_dir") or \
-                   os.path.join(self.output_dir, config.get("project_id", "default"), task_uuid, label_name)
+        save_dir = self.training_status[task_id].get("save_dir")
         os.makedirs(save_dir, exist_ok=True)
 
-        self.training_status[task_id].update({
-            "dataset_dir": dataset_dir,
-            "save_dir": save_dir,
-            "config": config
-        })
-        self._persist_state_if_due(force=True)
+        # 提取ROI图像
+        roi_images = self._extract_roi_images(task_id, dataset_dir, group_annotations)
+        if not roi_images:
+            raise ValueError(f"No ROI images extracted for group {group_id}")
 
-        # 加载训练图像
-        train_images = self._load_train_images(task_id, dataset_dir)
-        if not train_images:
-            raise ValueError("No training images found")
-
-        num_samples = len(train_images)
+        num_samples = len(roi_images)
         self.training_status[task_id]["num_samples"] = num_samples
-        self._add_log(task_id, f"Loaded {num_samples} training images")
+        self._add_log(task_id, f"Extracted {num_samples} ROI images for training")
 
         # 构建PatchCore模型
         backbone_name = config.get("backbone", "resnet18")
         input_size = config.get("input_size", [224, 224])
-        coreset_ratio = config.get("coreset_ratio", 0.1)  # 核心集采样比例
+        coreset_ratio = config.get("coreset_ratio", 0.1)
 
         self._add_log(task_id, f"Building PatchCore model (backbone={backbone_name}, coreset_ratio={coreset_ratio})")
         self.training_status[task_id]["status"] = "training"
         self.training_status[task_id]["progress"] = 10
 
         # 创建特征提取器
-        feature_extractor = self._build_feature_extractor(backbone_name)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        feature_extractor = self._build_feature_extractor(backbone_name, device)
         feature_extractor.eval()
 
         # 提取训练集特征
-        self._add_log(task_id, "Stage 1/3: Extracting features from training images...")
-        features = self._extract_features(task_id, feature_extractor, train_images, input_size)
+        self._add_log(task_id, "Stage 1/3: Extracting features from ROI images...")
+        features = self._extract_features(task_id, feature_extractor, roi_images, input_size, device)
 
         if len(features) == 0:
             raise ValueError("No features extracted")
@@ -337,11 +305,20 @@ class PatchCoreTrainer:
         # 阈值校准
         self._add_log(task_id, "Stage 3/3: Calibrating threshold...")
         self.training_status[task_id]["progress"] = 80
-        threshold = self._calibrate_threshold(task_id, feature_extractor, memory_bank, train_images, input_size, config)
+        threshold = self._calibrate_threshold(task_id, feature_extractor, memory_bank, roi_images, input_size, config, device)
+
+        # 获取第一个标注的信息用于配置
+        first_ann = group_annotations[0] if group_annotations else {}
+        bbox = first_ann.get('bbox', [0, 0, 0, 0])
+        label = first_ann.get('label', 'unknown')
+        category_id = first_ann.get('category_id', 0)
 
         # 保存配置
         config_data = {
-            "category": label_name,
+            "group_id": group_id,
+            "category": label,
+            "category_id": category_id,
+            "bbox": bbox,
             "threshold": threshold,
             "threshold_source": "calibration_p95",
             "input_size": input_size,
@@ -357,283 +334,313 @@ class PatchCoreTrainer:
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump(config_data, f, ensure_ascii=False, indent=2)
 
-        self._add_log(task_id, f"config.json: threshold={threshold:.6f}")
+        self._add_log(task_id, f"config.json: threshold={threshold:.6f}, category={label}")
 
         # 保存训练数据和模板
-        self._save_training_data_and_template(task_id, save_dir, config)
+        self._save_group_training_data(task_id, save_dir, config, group_annotations)
 
         # 完成任务
         self.training_status[task_id]["status"] = "completed"
         self.training_status[task_id]["progress"] = 100
-        self._add_log(task_id, "All stages complete.")
+        self._add_log(task_id, f"Group '{group_id}' training complete.")
         self._persist_state_if_due(force=True)
 
-    def _build_feature_extractor(self, backbone_name: str):
+    def _extract_roi_images(self, task_id: str, dataset_dir: str, group_annotations: List[Dict]) -> List[np.ndarray]:
+        """从原始图像中提取ROI区域"""
+        raw_data_dir = Path(dataset_dir)
+        raw_images_dir = raw_data_dir / "raw_images"
+
+        if not raw_images_dir.exists():
+            self._add_log(task_id, f"raw_images directory not found: {raw_images_dir}")
+            return []
+
+        # 加载图像映射
+        annotation_file = raw_data_dir / "annotations.json"
+        with open(annotation_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        images = {img['id']: img for img in data.get('images', [])}
+
+        roi_images = []
+        failed = 0
+
+        for ann in group_annotations:
+            image_id = ann.get('image_id')
+            bbox = ann.get('bbox', [0, 0, 0, 0])
+            angle = ann.get('angle', 0)
+            h_flip = ann.get('horizontal_flip', False)
+            v_flip = ann.get('vertical_flip', False)
+
+            img_info = images.get(image_id)
+            if not img_info:
+                failed += 1
+                continue
+
+            img_path = raw_images_dir / img_info['file_name']
+            if not img_path.exists():
+                failed += 1
+                continue
+
+            try:
+                # 读取图像
+                img = cv2.imread(str(img_path))
+                if img is None:
+                    failed += 1
+                    continue
+
+                # 提取ROI
+                x, y, w, h = [int(v) for v in bbox]
+                x = max(0, x)
+                y = max(0, y)
+                w = max(1, w)
+                h = max(1, h)
+
+                # 边界检查
+                img_h, img_w = img.shape[:2]
+                x = min(x, img_w - 1)
+                y = min(y, img_h - 1)
+                w = min(w, img_w - x)
+                h = min(h, img_h - y)
+
+                roi = img[y:y+h, x:x+w]
+                if roi.size == 0:
+                    failed += 1
+                    continue
+
+                # 应用数据增强（角度、翻转）
+                roi = self._apply_augmentation(roi, angle, h_flip, v_flip)
+
+                roi_images.append(roi)
+
+            except Exception as e:
+                failed += 1
+                self._add_log(task_id, f"Failed to extract ROI from {img_path}: {e}")
+
+        self._add_log(task_id, f"Extracted {len(roi_images)} ROI images, {failed} failed")
+        return roi_images
+
+    def _apply_augmentation(self, img: np.ndarray, angle: float, h_flip: bool, v_flip: bool) -> np.ndarray:
+        """应用数据增强"""
+        # 水平翻转
+        if h_flip:
+            img = cv2.flip(img, 1)
+
+        # 垂直翻转
+        if v_flip:
+            img = cv2.flip(img, 0)
+
+        # 旋转
+        if angle != 0:
+            h, w = img.shape[:2]
+            center = (w // 2, h // 2)
+            M = cv2.getRotationMatrix2D(center, -angle, 1.0)
+            img = cv2.warpAffine(img, M, (w, h), borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+
+        return img
+
+    def _build_feature_extractor(self, backbone_name: str, device: torch.device):
         """构建特征提取器"""
-        backbone = _get_resnet(backbone_name)
+        if backbone_name == "resnet18":
+            backbone = models.resnet18(pretrained=True)
+        elif backbone_name == "resnet50":
+            backbone = models.resnet50(pretrained=True)
+        else:
+            backbone = models.resnet18(pretrained=True)
+
+        # 移除最后的全连接层
+        backbone = torch.nn.Sequential(*list(backbone.children())[:-2])
+        backbone = backbone.to(device)
+        backbone.eval()
 
         # 冻结参数
         for param in backbone.parameters():
-            param.stop_gradient = True
+            param.requires_grad = False
 
-        backbone.eval()
         return backbone
 
-    def _extract_features(self, task_id: str, feature_extractor,
-                          image_paths: List[str], input_size: List[int]) -> np.ndarray:
-        """从图像中提取patch特征"""
-        paddle, _, _ = _import_paddle()
-
+    def _extract_features(self, task_id: str, feature_extractor, roi_images: List[np.ndarray], input_size: List[int], device: torch.device) -> np.ndarray:
+        """从ROI图像中提取patch特征"""
         h, w = input_size[1], input_size[0]
-        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+        # 图像预处理
+        transform = transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.Resize((h, w)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
 
         all_features = []
         failed = 0
 
-        with paddle.no_grad():
-            for idx, img_path in enumerate(image_paths):
+        with torch.no_grad():
+            for idx, roi in enumerate(roi_images):
                 try:
-                    img = cv2.imread(img_path)
-                    if img is None:
-                        failed += 1
-                        continue
+                    # 转换 BGR -> RGB
+                    roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
 
-                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                    img = cv2.resize(img, (w, h)).astype(np.float32) / 255.0
-                    img = (img - mean) / std
-                    tensor = paddle.to_tensor(np.transpose(img, (2, 0, 1))[np.newaxis])
+                    # 预处理
+                    tensor = transform(roi_rgb).unsqueeze(0).to(device)
 
-                    # 提取多尺度特征
+                    # 提取特征
                     features = self._extract_patch_features(feature_extractor, tensor)
                     all_features.append(features)
-
-                    if (idx + 1) % 10 == 0:
-                        self._add_log(task_id, f"Processed {idx + 1}/{len(image_paths)} images")
-                        self.training_status[task_id]["progress"] = 10 + int((idx + 1) / len(image_paths) * 35)
 
                 except Exception as e:
                     failed += 1
                     if failed <= 5:
-                        self._add_log(task_id, f"Feature extraction failed for {os.path.basename(img_path)}: {e}")
+                        self._add_log(task_id, f"Feature extraction failed for ROI {idx}: {e}")
 
-        if failed > 0:
-            self._add_log(task_id, f"Feature extraction: {len(all_features)} succeeded, {failed} failed")
+        if failed > 5:
+            self._add_log(task_id, f"... and {failed - 5} more failures")
 
         if not all_features:
             return np.array([])
 
-        return np.concatenate(all_features, axis=0)
+        return np.vstack(all_features)
 
-    def _extract_patch_features(self, backbone, x) -> np.ndarray:
+    def _extract_patch_features(self, feature_extractor, tensor: torch.Tensor) -> np.ndarray:
         """提取patch级别的特征"""
-        paddle, _, F = _import_paddle()
-
-        B, C, H, W = x.shape
-
-        # 前向传播到layer3
-        x = backbone.conv1(x)
-        x = backbone.bn1(x)
-        x = backbone.relu(x)
-        x = backbone.maxpool(x)
-
-        x1 = backbone.layer1(x)
-        x2 = backbone.layer2(x1)
-        x3 = backbone.layer3(x2)
-
-        # 上采样到相同尺寸
-        target_size = (H // 8, W // 8)
-        x2_up = F.interpolate(x2, size=target_size, mode='bilinear', align_corners=False)
-        x3_up = F.interpolate(x3, size=target_size, mode='bilinear', align_corners=False)
-
-        # 拼接特征
-        features = paddle.concat([x2_up, x3_up], axis=1)
+        # 提取特征 [B, C, H, W]
+        features = feature_extractor(tensor)
 
         # 转换为patch特征 [B, H*W, C]
         B, C, H_p, W_p = features.shape
-        patches = features.transpose([0, 2, 3, 1]).reshape([B, H_p * W_p, C])
+        patches = features.permute(0, 2, 3, 1).reshape(B, H_p * W_p, C)
 
         # 归一化
-        patches = F.normalize(patches, axis=-1)
+        patches = F.normalize(patches, dim=-1)
 
-        return patches.numpy()[0]  # [H*W, C]
+        return patches.cpu().numpy()[0]
 
     def _coreset_sampling(self, features: np.ndarray, ratio: float) -> np.ndarray:
-        """
-        使用贪心算法进行核心集采样
-        选择最具代表性的特征子集
-        """
+        """贪心核心集采样 - 使用 PyTorch 加速"""
+        import torch
+        
         n_samples = features.shape[0]
         n_coreset = max(1, int(n_samples * ratio))
 
         if n_coreset >= n_samples:
             return features
 
-        # 贪心核心集选择
-        selected_indices = [0]  # 从第一个样本开始
-        selected_features = features[0:1]
+        # 转换为 PyTorch 张量并移至 GPU（如果可用）
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        features_tensor = torch.from_numpy(features).to(device)
+        
+        selected_indices = [0]
+        selected_features = features_tensor[0:1]
 
-        for _ in range(1, n_coreset):
+        for i in range(1, n_coreset):
             # 计算每个未选样本到已选样本的最小距离
-            distances = np.min(
-                np.linalg.norm(features[:, np.newaxis] - selected_features, axis=2),
-                axis=1
-            )
-            # 选择距离最远的样本
-            next_idx = np.argmax(distances)
+            # features: [N, C], selected: [M, C]
+            # distances: [N, M] -> min -> [N]
+            distances = torch.cdist(features_tensor, selected_features).min(dim=1)[0]
+            next_idx = torch.argmax(distances).item()
             selected_indices.append(next_idx)
-            selected_features = np.vstack([selected_features, features[next_idx:next_idx+1]])
+            selected_features = torch.cat([selected_features, features_tensor[next_idx:next_idx+1]], dim=0)
+            
+            if i % 500 == 0:
+                self._add_log(f"coreset", f"  Coreset sampling progress: {i}/{n_coreset}")
 
-        return selected_features
+        return features_tensor[selected_indices].cpu().numpy()
 
-    def _calibrate_threshold(self, task_id: str, feature_extractor,
-                             memory_bank: np.ndarray, image_paths: List[str],
-                             input_size: List[int], config: Dict) -> float:
+    def _calibrate_threshold(self, task_id: str, feature_extractor, memory_bank: np.ndarray,
+                             roi_images: List[np.ndarray], input_size: List[int], config: Dict, device: torch.device) -> float:
         """校准异常检测阈值"""
-        paddle, _, F = _import_paddle()
-
         h, w = input_size[1], input_size[0]
-        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
-        # 均匀采样最多200张图像进行校准
-        max_samples = min(len(image_paths), 200)
-        if len(image_paths) > max_samples:
-            step = len(image_paths) / max_samples
-            calib_images = [image_paths[int(i * step)] for i in range(max_samples)]
+        # 图像预处理
+        transform = transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.Resize((h, w)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+
+        max_samples = min(len(roi_images), 200)
+        if len(roi_images) > max_samples:
+            step = len(roi_images) / max_samples
+            calib_images = [roi_images[int(i * step)] for i in range(max_samples)]
         else:
-            calib_images = image_paths
+            calib_images = roi_images
 
         scores = []
-        memory_tensor = paddle.to_tensor(memory_bank)
-        memory_tensor = F.normalize(memory_tensor, axis=-1)
+        memory_tensor = torch.from_numpy(memory_bank).to(device)
+        memory_tensor = F.normalize(memory_tensor, dim=-1)
 
-        with paddle.no_grad():
-            for img_path in calib_images:
+        with torch.no_grad():
+            for roi in calib_images:
                 try:
-                    img = cv2.imread(img_path)
-                    if img is None:
-                        continue
+                    # 转换 BGR -> RGB
+                    roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
 
-                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                    img = cv2.resize(img, (w, h)).astype(np.float32) / 255.0
-                    img = (img - mean) / std
-                    tensor = paddle.to_tensor(np.transpose(img, (2, 0, 1))[np.newaxis])
+                    # 预处理
+                    tensor = transform(roi_rgb).unsqueeze(0).to(device)
 
                     # 提取特征
                     features = self._extract_patch_features(feature_extractor, tensor)
-                    features_tensor = paddle.to_tensor(features)
-                    features_tensor = F.normalize(features_tensor, axis=-1)
+                    features_tensor = torch.from_numpy(features).to(device)
+                    features_tensor = F.normalize(features_tensor, dim=-1)
 
                     # 计算异常分数
-                    similarity = paddle.matmul(features_tensor, memory_tensor, transpose_y=True)
-                    max_similarity = paddle.max(similarity, axis=1)
+                    similarity = torch.matmul(features_tensor, memory_tensor.T)
+                    max_similarity = torch.max(similarity, dim=1)[0]
                     distances = 1.0 - max_similarity
-                    anomaly_score = float(paddle.max(distances).numpy())
+                    anomaly_score = float(torch.max(distances).cpu().numpy())
 
                     scores.append(anomaly_score)
-                except Exception as e:
+                except:
                     pass
 
         if not scores:
             self._add_log(task_id, "WARNING: No scores from calibration. threshold=0.5")
             return 0.5
 
-        # 使用95分位数作为阈值
         arr = np.array(scores, dtype=np.float32)
         percentile = config.get("threshold_percentile", 95)
         threshold = float(np.percentile(arr, percentile))
 
         stats = {
-            "n": len(scores),
-            "min": float(arr.min()),
-            "max": float(arr.max()),
-            "mean": float(arr.mean()),
-            "std": float(arr.std()),
+            "n": len(scores), "min": float(arr.min()), "max": float(arr.max()),
+            "mean": float(arr.mean()), "std": float(arr.std()),
             "p90": float(np.percentile(arr, 90)),
             "p95": float(np.percentile(arr, 95)),
             "p99": float(np.percentile(arr, 99)),
             "threshold": threshold,
         }
 
-        self.training_status[task_id]["calibration_stats"] = stats
-        self._add_log(
-            task_id,
-            f"Calibration OK: n={stats['n']}, mean={stats['mean']:.6f}, std={stats['std']:.6f}, "
-            f"p90={stats['p90']:.6f}, p95={stats['p95']:.6f}, p99={stats['p99']:.6f} "
-            f"-> threshold={threshold:.6f} (p{percentile})"
-        )
+        if task_id in self.training_status:
+            self.training_status[task_id]["calibration_stats"] = stats
+        self._add_log(task_id, f"Calibration OK: n={stats['n']}, mean={stats['mean']:.6f}, p95={stats['p95']:.6f} -> threshold={threshold:.6f}")
 
         return threshold
 
-    def _load_train_images(self, task_id: str, dataset_dir: str) -> List[str]:
-        """从train.txt加载训练图像路径"""
-        train_list = os.path.join(dataset_dir, "train.txt")
-        if not os.path.exists(train_list):
-            self._add_log(task_id, f"train.txt not found: {train_list}")
-            return []
-
-        paths = []
-        with open(train_list, "r") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                img_path = line.split()[0]
-                if not os.path.isabs(img_path):
-                    img_path = os.path.join(dataset_dir, img_path)
-                if os.path.exists(img_path):
-                    paths.append(img_path)
-
-        self._add_log(task_id, f"Collected {len(paths)} images from train.txt")
-        return paths
-
-    def _save_training_data_and_template(self, task_id: str, save_dir: str, config: Dict):
-        """保存训练数据和模板图像"""
+    def _save_group_training_data(self, task_id: str, save_dir: str, config: Dict, group_annotations: List[Dict]):
+        """保存组训练数据"""
         try:
-            status_info = self.training_status.get(task_id, {})
-            dataset_dir = status_info.get("dataset_dir", config.get("dataset_dir", ""))
-            if not dataset_dir:
-                return
-
-            raw_data_dir = Path(dataset_dir).parent
-            raw_images_dir = raw_data_dir / "raw_images"
-            annotation_file = raw_data_dir / "annotations.json"
-
-            if not annotation_file.exists() or not raw_images_dir.exists():
-                self._add_log(task_id, f"Warning: annotations.json or raw_images/ not found under {raw_data_dir}")
-                return
-
             td = os.path.join(save_dir, "training_data")
             os.makedirs(td, exist_ok=True)
-            shutil.copy2(annotation_file, os.path.join(td, "annotations.json"))
 
-            with open(annotation_file, 'r', encoding='utf-8') as f:
-                annotations = json.load(f)
+            # 保存组标注信息
+            group_data = {
+                "group_id": group_annotations[0].get('label') if group_annotations else None,
+                "annotations": group_annotations,
+                "num_samples": len(group_annotations),
+            }
 
-            images = annotations.get('images', [])
-            if not images:
-                return
+            with open(os.path.join(td, "group_annotations.json"), 'w', encoding='utf-8') as f:
+                json.dump(group_data, f, ensure_ascii=False, indent=2)
 
-            # 选择角度最接近0的图像作为模板
-            closest = min(images, key=lambda img: abs(img.get('angle', 0)))
-
-            cnt = 0
-            for img in images:
-                src = raw_images_dir / img['file_name']
-                if src.exists():
-                    shutil.copy2(src, os.path.join(td, img['file_name']))
-                    cnt += 1
-
-            self._add_log(task_id, f"Saved {cnt} training images.")
-
-            tmpl = os.path.join(td, closest['file_name'])
-            if os.path.exists(tmpl):
-                shutil.copy2(tmpl, os.path.join(save_dir, "template.jpg"))
-                self._add_log(task_id, f"Template: {closest['file_name']} (angle={closest.get('angle', 0)})")
+            self._add_log(task_id, f"Saved group annotations with {len(group_annotations)} samples")
 
         except Exception as e:
             self._add_log(task_id, f"Warning: save training data failed: {e}")
+
+    def get_training_status(self, task_id: str = None):
+        """获取训练状态"""
+        if task_id:
+            return self.training_status.get(task_id)
+        return self.training_status
 
     def stop_task(self, task_id):
         """停止任务"""
@@ -646,58 +653,13 @@ class PatchCoreTrainer:
 
         thread = self.threads.get(task_id)
         if thread and thread.is_alive():
-            # 设置取消标志
-            self.training_status[task_id]["status"] = "cancelled"
-            self._persist_state_if_due(force=True)
-            return {"status": "success", "message": "Cancellation requested"}
+            self.training_status[task_id]["cancel_requested"] = True
+            return {"status": "success", "message": "Cancel requested"}
 
-        self.training_status[task_id]["status"] = "cancelled"
-        self._persist_state_if_due(force=True)
-        return {"status": "success", "message": "Task marked as cancelled"}
-
-    def get_status(self, task_id):
-        """获取任务状态"""
-        if task_id in self.training_status:
-            return self.training_status[task_id]
-        for tid, status in self.training_status.items():
-            if status.get("task_uuid") == task_id:
-                return status
-        return {"status": "not_found"}
-
-
-# 全局单例
-trainer = PatchCoreTrainer()
+        return {"status": "success", "message": "Task stopped"}
 
 
 if __name__ == "__main__":
     # 测试代码
-    logging.basicConfig(level=logging.INFO)
-
-    # 示例配置
-    test_config = {
-        "project_id": "test_project",
-        "task_uuid": "test_uuid",
-        "label_name": "test_label",
-        "model_name": "PatchCore",
-        "backbone": "resnet18",
-        "input_size": [224, 224],
-        "coreset_ratio": 0.1,
-        "threshold_percentile": 95,
-    }
-
-    # 示例数据集路径（需要替换为实际路径）
-    test_dataset_dir = "/path/to/dataset"
-
-    if os.path.exists(test_dataset_dir):
-        task_id = trainer.run_training_async(test_dataset_dir, test_config)
-        print(f"Training started with task_id: {task_id}")
-
-        # 等待训练完成
-        while True:
-            status = trainer.get_status(task_id)
-            print(f"Status: {status.get('status')}, Progress: {status.get('progress')}%")
-            if status.get('status') in ['completed', 'failed', 'cancelled']:
-                break
-            time.sleep(2)
-    else:
-        print(f"Test dataset not found: {test_dataset_dir}")
+    trainer = PatchCoreTrainer(output_dir="test_output")
+    print("ROI PatchCore Trainer initialized")
