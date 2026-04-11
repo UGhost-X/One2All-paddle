@@ -110,7 +110,8 @@ class ModelDeployer:
         支持新的统一结构: {output_dir}/{project_id}/{task_uuid}/best_model/
         兼容旧结构: {output_dir}/{project_id}/{task_uuid}/{label}/best_model/
         支持扁平结构: {output_dir}/{project_id}/{task_uuid}/{label}/model.pdparams
-        支持 Paddle 模型 (.pdparams) 和 ONNX 模型 (.onnx)
+        支持 Paddle 模型 (.pdparams)
+        支持 PatchCore 模型 (memory_bank.npz 或 patchcore_model.pt)
         """
         models = {}
         base_path = Path(self.output_dir) / str(project_id) / task_uuid
@@ -122,48 +123,101 @@ class ModelDeployer:
         is_unified = labels_file.exists()
 
         if is_unified:
-            best_model_path = base_path / "best_model"
-            has_onnx = (best_model_path / "model.onnx").exists()
-            has_pdparams = (best_model_path / "model.pdparams").exists()
-            
-            if has_onnx or has_pdparams:
+            # 检查新的 anomalib PatchCore 模型格式
+            patchcore_model_path = base_path / "patchcore_model.pt"
+            has_patchcore_model = patchcore_model_path.exists()
+            # 检查旧的 memory_bank 格式
+            memory_bank_path = base_path / "memory_bank.npz"
+            has_memory_bank = memory_bank_path.exists()
+            config_path = base_path / "config.json"
+            has_config = config_path.exists()
+
+            if (has_patchcore_model or has_memory_bank) and has_config:
                 labels = []
                 try:
                     with open(labels_file, "r") as f:
                         labels = [line.strip() for line in f if line.strip()]
                 except:
                     pass
-                
-                model_type = "onnx" if has_onnx else "paddle"
-                models["multi_position"] = str(best_model_path)
+
+                models["multi_position"] = str(base_path)
                 models["_labels"] = labels
-                models["_model_type"] = model_type
+                models["_model_type"] = "patchcore"
+            else:
+                best_model_path = base_path / "best_model"
+                has_pdparams = (best_model_path / "model.pdparams").exists()
+
+                if has_pdparams:
+                    labels = []
+                    try:
+                        with open(labels_file, "r") as f:
+                            labels = [line.strip() for line in f if line.strip()]
+                    except:
+                        pass
+
+                    models["multi_position"] = str(best_model_path)
+                    models["_labels"] = labels
+                    models["_model_type"] = "paddle"
         else:
             for label_dir in base_path.iterdir():
                 if not label_dir.is_dir():
                     continue
 
-                # 尝试扁平结构: {label}/model.pdparams
+                # 检查新的 anomalib PatchCore 模型格式
+                has_patchcore_model = (label_dir / "patchcore_model.pt").exists()
+                # 检查旧的 memory_bank 格式
+                has_memory_bank = (label_dir / "memory_bank.npz").exists()
+                has_config = (label_dir / "config.json").exists()
+
+                if (has_patchcore_model or has_memory_bank) and has_config:
+                    models[label_dir.name] = str(label_dir)
+                    models[f"{label_dir.name}_type"] = "patchcore"
+                    continue
+
                 has_pdparams_flat = (label_dir / "model.pdparams").exists()
                 has_config_flat = (label_dir / "config.json").exists()
-                
-                # 尝试旧结构: {label}/best_model/model.pdparams
+
                 best_model_path = label_dir / "best_model"
-                has_onnx = (best_model_path / "model.onnx").exists()
                 has_pdparams = (best_model_path / "model.pdparams").exists()
-                
+
                 if has_pdparams_flat or (has_pdparams and has_config_flat):
-                    # 扁平结构
-                    model_type = "paddle"
                     models[label_dir.name] = str(label_dir)
-                    models[f"{label_dir.name}_type"] = model_type
-                elif has_onnx or has_pdparams:
-                    # 旧结构
-                    model_type = "onnx" if has_onnx else "paddle"
+                    models[f"{label_dir.name}_type"] = "paddle"
+                elif has_pdparams:
                     models[label_dir.name] = str(best_model_path)
-                    models[f"{label_dir.name}_type"] = model_type
+                    models[f"{label_dir.name}_type"] = "paddle"
 
         return models
+    
+    def _find_multi_workpiece_template(self, project_id: str, task_uuid: str) -> str:
+        """
+        查找多工件模板图像路径。
+        路径格式: product/{project_id}/train/{task_uuid}/工件主体/{pos_id}/raw_image_{image_id}_ann{annotation_id}.png
+        
+        Returns:
+            模板图像路径，如果未找到则返回空字符串
+        """
+        base_dir = Path("product") / str(project_id) / "train" / task_uuid
+        
+        # 检查工件主体目录是否存在
+        workpiece_dir = base_dir / "工件主体"
+        if not workpiece_dir.exists():
+            logger.warning(f"工件主体目录不存在: {workpiece_dir}")
+            return ""
+        
+        # 遍历工件主体下的所有子目录（pos_id）
+        for pos_dir in sorted(workpiece_dir.iterdir()):
+            if not pos_dir.is_dir():
+                continue
+            
+            # 查找 raw_image_*_ann*.png 文件
+            for img_file in pos_dir.glob("raw_image_*_ann*.png"):
+                if img_file.exists():
+                    logger.info(f"Found multi-workpiece template: {img_file}")
+                    return str(img_file.absolute())
+        
+        logger.warning(f"No multi-workpiece template found in: {workpiece_dir}")
+        return ""
     
     def _create_inference_service(self, service: DeployService) -> str:
         """使用 Jinja2 模板生成推理服务脚本"""
@@ -173,14 +227,19 @@ class ModelDeployer:
         template = env.get_template("inference_service.py.j2")
         
         # 构建 annotations.json 路径
-        # 路径格式: {project_id}/train/{task_uuid}/annotations.json
-        annotations_path = Path(str(service.project_id)) / "train" / service.task_uuid / "annotations.json"
+        # 路径格式: product/{project_id}/train/{task_uuid}/annotations.json
+        annotations_path = Path("product") / str(service.project_id) / "train" / service.task_uuid / "annotations.json"
         annotations_path_str = str(annotations_path.absolute()) if annotations_path.exists() else ""
         
         if annotations_path.exists():
             logger.info(f"Found annotations file: {annotations_path_str}")
         else:
             logger.warning(f"Annotations file not found: {annotations_path}")
+        
+        # 查找多工件模板路径
+        multi_workpiece_template = self._find_multi_workpiece_template(
+            service.project_id, service.task_uuid
+        )
         
         # 渲染模板
         script_content = template.render(
@@ -190,7 +249,8 @@ class ModelDeployer:
             labels=service.labels,
             port=service.port,
             models_config=service.model_paths,
-            annotations_path=annotations_path_str
+            annotations_path=annotations_path_str,
+            multi_workpiece_template=multi_workpiece_template
         )
         
         script_path = Path(self.scripts_dir) / f"service_{service.service_id}.py"
@@ -207,6 +267,8 @@ class ModelDeployer:
         port: Optional[int] = None
     ) -> Dict:
         with self._lock:
+            logger.info(f"deploy_service called: project_id={project_id}, task_uuid={task_uuid}, port={port}")
+            
             if task_uuid in self.uuid_index:
                 existing_sid = self.uuid_index[task_uuid]
                 existing = self.services.get(existing_sid)
@@ -221,6 +283,7 @@ class ModelDeployer:
                     }
             
             model_paths = self._find_models(project_id, task_uuid)
+            logger.info(f"_find_models returned: {model_paths}")
             if not model_paths:
                 return {
                     "status": "error",
@@ -241,6 +304,7 @@ class ModelDeployer:
             # 过滤掉特殊键，只保留实际的 label
             special_keys = {'_labels', '_model_type'}
             label_keys = [k for k in model_paths.keys() if not k.endswith('_type') and k not in special_keys]
+            logger.info(f"label_keys: {label_keys}")
             
             service=DeployService(
                 service_id=service_id,
@@ -256,17 +320,48 @@ class ModelDeployer:
             
             script_path = self._create_inference_service(service)
             
+            log_dir = Path(self.output_dir) / "logs"
+            log_dir.mkdir(exist_ok=True)
+            stdout_file = log_dir / f"service_{service_id}.stdout.log"
+            stderr_file = log_dir / f"service_{service_id}.stderr.log"
+            
+            import sys
             try:
-                import sys
                 proc = subprocess.Popen(
                     [sys.executable, script_path],
-                    stdout=None,
-                    stderr=None,
+                    stdout=open(stdout_file, "w"),
+                    stderr=open(stderr_file, "w"),
                     start_new_session=True,
                     cwd=os.getcwd()
                 )
+                logger.info(f"Popen succeeded: pid={proc.pid}")
+                
+                time.sleep(2)
+                
+                poll_result = proc.poll()
+                if poll_result is not None:
+                    if proc.stdout:
+                        proc.stdout.close()
+                    if proc.stderr:
+                        proc.stderr.close()
+                    service.status = ServiceStatus.FAILED.value
+                    service.error = f"Process terminated immediately with code {poll_result}"
+                    self.services[service_id] = service
+                    self._save_state()
+                    return {
+                        "status": "error",
+                        "message": f"Service process terminated immediately. Check logs: {stderr_file}",
+                        "stderr_file": str(stderr_file),
+                        "stdout_file": str(stdout_file)
+                    }
+                
+                if proc.stdout:
+                    proc.stdout.close()
+                if proc.stderr:
+                    proc.stderr.close()
                 service.pid = proc.pid
                 service.status = ServiceStatus.RUNNING.value
+                logger.info(f"Service started successfully: pid={service.pid}, service_id={service_id}")
                 
                 self.services[service_id] = service
                 self.port_index[port] = service_id

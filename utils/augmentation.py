@@ -7,6 +7,43 @@ from typing import List, Dict, Any, Tuple
 
 logger = logging.getLogger(__name__)
 
+
+def segmentation_to_rbbox(segmentation: List[float]) -> List[float]:
+    """
+    将 segmentation 4点格式转换为 rbbox [cx, cy, width, height, angle]
+    :param segmentation: [x1, y1, x2, y2, x3, y3, x4, y4] 4个角点
+    :return: [cx, cy, width, height, angle] 旋转框
+    """
+    if not segmentation or len(segmentation) < 8:
+        return None
+
+    pts = np.array(segmentation).reshape(-1, 2)
+    if len(pts) != 4:
+        return None
+
+    # 计算中心点
+    cx = np.mean(pts[:, 0])
+    cy = np.mean(pts[:, 1])
+
+    # 计算边长（4边形的对边）
+    # 假设点是按顺序排列的：左上、右上、右下、左下
+    w1 = np.linalg.norm(pts[1] - pts[0])  # 上边
+    w2 = np.linalg.norm(pts[2] - pts[3])  # 下边
+    width = (w1 + w2) / 2
+
+    h1 = np.linalg.norm(pts[3] - pts[0])  # 左边
+    h2 = np.linalg.norm(pts[2] - pts[1])  # 右边
+    height = (h1 + h2) / 2
+
+    # 计算旋转角度（使用上边的中点方向）
+    mid_top = (pts[0] + pts[1]) / 2
+    dx = mid_top[0] - cx
+    dy = mid_top[1] - cy
+    angle = np.degrees(np.arctan2(dy, dx)) - 90  # 转换为与垂直方向的夹角
+
+    return [float(cx), float(cy), float(width), float(height), float(angle)]
+
+
 class DataAugmentor:
     """
     数据增强模块，支持对图像和标注数据进行同步变换。
@@ -31,9 +68,17 @@ class DataAugmentor:
         new_annotations = copy.deepcopy(annotations)
         params = params or {}
 
-        # 预处理：坐标对齐
+        # 预处理：坐标对齐，并将 segmentation 转换为 rbbox
         for ann in new_annotations:
             self._ensure_absolute_coords(ann, w, h)
+            # 如果有 segmentation 但没有 rbbox，自动转换
+            if "segmentation" in ann and ann["segmentation"] and "rbbox" not in ann:
+                if isinstance(ann["segmentation"], list) and len(ann["segmentation"]) > 0:
+                    # 取第一个 segmentation
+                    seg = ann["segmentation"][0] if isinstance(ann["segmentation"][0], list) else ann["segmentation"]
+                    rbbox = segmentation_to_rbbox(seg)
+                    if rbbox:
+                        ann["rbbox"] = rbbox
 
         # 1. 亮度与对比度
         if "brightness" in self.config or "contrast" in self.config:
@@ -70,10 +115,10 @@ class DataAugmentor:
         # 后处理：还原坐标系
         for ann in new_annotations:
             if ann.get("_is_centered"):
-                key = "bbox" if "bbox" in ann else "points"
-                if key in ann:
-                    ann[key][0] = ann[key][0] - (w / 2)
-                    ann[key][1] = ann[key][1] - (h / 2)
+                # 处理 rbbox
+                if "rbbox" in ann and ann["rbbox"]:
+                    ann["rbbox"][0] = ann["rbbox"][0] - (w / 2)
+                    ann["rbbox"][1] = ann["rbbox"][1] - (h / 2)
                 del ann["_is_centered"]
 
         return new_image, new_annotations
@@ -140,15 +185,14 @@ class DataAugmentor:
         return results
 
     def _ensure_absolute_coords(self, ann: Dict[str, Any], w: int, h: int):
-        """确保 bbox/points 使用左上角 (0,0) 坐标系"""
-        # 兼容 points 或 bbox 字段
-        key = "bbox" if "bbox" in ann else "points"
-        if key in ann and len(ann[key]) >= 4:
-            x, y, bw, bh = ann[key][:4]
-            # 如果坐标明显是相对于中心点的（例如 x < 0）
-            if x < -1e-5: # 使用微小误差判断
-                ann[key][0] = x + (w / 2)
-                ann[key][1] = y + (h / 2)
+        """确保 rbbox 使用左上角 (0,0) 坐标系"""
+        # 处理 rbbox [cx, cy, width, height, angle]
+        if "rbbox" in ann and ann["rbbox"] and len(ann["rbbox"]) >= 2:
+            cx, cy = ann["rbbox"][:2]
+            # 如果坐标明显是相对于中心点的（例如 cx < 0）
+            if cx < -1e-5:  # 使用微小误差判断
+                ann["rbbox"][0] = cx + (w / 2)
+                ann["rbbox"][1] = cy + (h / 2)
                 ann["_is_centered"] = True
 
     def _should_apply(self, key: str) -> bool:
@@ -190,16 +234,25 @@ class DataAugmentor:
         if ksize % 2 == 0: ksize += 1
         return cv2.GaussianBlur(image, (ksize, ksize), 0)
 
+    def _normalize_angle(self, angle: float) -> float:
+        """将角度归一化到 [-180, 180] 范围内"""
+        angle = angle % 360
+        if angle > 180:
+            angle -= 360
+        return angle
+
     def _apply_horizontal_flip(self, image: np.ndarray, annotations: List[Dict[str, Any]]) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
         h, w = image.shape[:2]
         image = cv2.flip(image, 1)
         for ann in annotations:
-            key = "bbox" if "bbox" in ann else "points"
-            if key in ann:
-                x, y, bw, bh = ann[key][:4]
-                new_x = w - (x + bw)
-                ann[key][0] = new_x
-            
+            # 处理旋转框 rbbox [cx, cy, width, height, rotation_angle]
+            if "rbbox" in ann and ann["rbbox"]:
+                cx, cy, bw, bh, rot = ann["rbbox"]
+                # 水平翻转：cx -> w - cx, 旋转角度取反
+                ann["rbbox"][0] = w - cx
+                ann["rbbox"][4] = self._normalize_angle(-rot)
+
+            # 处理 segmentation（如果有）
             if "segmentation" in ann and ann["segmentation"]:
                 for i in range(len(ann["segmentation"])):
                     poly = np.array(ann["segmentation"][i]).reshape(-1, 2)
@@ -211,12 +264,14 @@ class DataAugmentor:
         h, w = image.shape[:2]
         image = cv2.flip(image, 0)
         for ann in annotations:
-            key = "bbox" if "bbox" in ann else "points"
-            if key in ann:
-                x, y, bw, bh = ann[key][:4]
-                new_y = h - (y + bh)
-                ann[key][1] = new_y
-            
+            # 处理旋转框 rbbox [cx, cy, width, height, rotation_angle]
+            if "rbbox" in ann and ann["rbbox"]:
+                cx, cy, bw, bh, rot = ann["rbbox"]
+                # 垂直翻转：cy -> h - cy, 旋转角度取反
+                ann["rbbox"][1] = h - cy
+                ann["rbbox"][4] = self._normalize_angle(-rot)
+
+            # 处理 segmentation（如果有）
             if "segmentation" in ann and ann["segmentation"]:
                 for i in range(len(ann["segmentation"])):
                     poly = np.array(ann["segmentation"][i]).reshape(-1, 2)
@@ -229,17 +284,41 @@ class DataAugmentor:
             cfg = self.config["rotate"]
             max_angle = cfg.get("max_angle", 15)
             angle = random.uniform(-max_angle, max_angle)
-        
+
         h, w = image.shape[:2]
-        center = (w / 2, h / 2)
-        M = cv2.getRotationMatrix2D(center, angle, 1.0)
+        # 输出正方形，边长为原始尺寸的最长边
+        size = max(w, h)
+        center = (size / 2, size / 2)
         
-        # 使用白色填充旋转后的边界
-        image = cv2.warpAffine(image, M, (w, h), borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
+        # 计算缩放比例，使图像在旋转时完整显示
+        # 先创建平移矩阵，将图像中心移到新画布中心
+        M_translate = np.array([
+            [1, 0, (size - w) / 2],
+            [0, 1, (size - h) / 2]
+        ], dtype=np.float32)
         
+        # 旋转矩阵（相对于新画布中心）
+        M_rotate = cv2.getRotationMatrix2D(center, angle, 1.0)
+        
+        # 组合变换：先平移，再旋转
+        M = M_rotate @ np.vstack([M_translate, [0, 0, 1]])
+        M = M[:2, :]
+
+        # 使用白色填充旋转后的边界，输出正方形尺寸
+        image = cv2.warpAffine(image, M, (size, size), borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
+
         for ann in annotations:
-            key = "bbox" if "bbox" in ann else "points"
-            # 1. 优先旋转 Segmentation
+            # 处理旋转框 rbbox [cx, cy, width, height, rotation_angle]
+            if "rbbox" in ann and ann["rbbox"]:
+                rbbox = ann["rbbox"]
+                cx, cy, bw, bh, rot = rbbox
+                # 更新中心点坐标（考虑平移）
+                ann["rbbox"][0] = cx + (size - w) / 2
+                ann["rbbox"][1] = cy + (size - h) / 2
+                # 更新旋转角度（累加）并归一化
+                ann["rbbox"][4] = self._normalize_angle(rot + angle)
+
+            # 处理 segmentation（如果有）
             if "segmentation" in ann and ann["segmentation"]:
                 for i in range(len(ann["segmentation"])):
                     poly = np.array(ann["segmentation"][i]).reshape(-1, 2)
@@ -247,32 +326,17 @@ class DataAugmentor:
                     poly_ones = np.hstack([poly, ones])
                     transformed_poly = M.dot(poly_ones.T).T
                     ann["segmentation"][i] = transformed_poly.flatten().tolist()
-                
-                # 基于旋转后的点重新计算 bbox
-                all_pts = np.concatenate([np.array(p).reshape(-1, 2) for p in ann["segmentation"]])
-                new_x, new_y = np.min(all_pts, axis=0)
-                new_w, new_h = np.max(all_pts, axis=0) - [new_x, new_y]
-                ann[key] = [float(new_x), float(new_y), float(new_w), float(new_h)]
-            
-            # 2. 如果只有 bbox/points
-            elif key in ann:
-                x, y, bw, bh = ann[key][:4]
-                pts = np.array([[x, y], [x + bw, y], [x + bw, y + bh], [x, y + bh]], dtype=np.float32)
-                ones = np.ones(shape=(len(pts), 1))
-                pts_ones = np.hstack([pts, ones])
-                transformed_pts = M.dot(pts_ones.T).T
-                
-                new_x, new_y = np.min(transformed_pts, axis=0)
-                new_w, new_h = np.max(transformed_pts, axis=0) - [new_x, new_y]
-                ann[key] = [float(new_x), float(new_y), float(new_w), float(new_h)]
-                
+
         return image, annotations
 
     def _apply_pitch_yaw(self, image, annotations, pitch=0, yaw=0):
         """
         使用 3D 投影变换实现俯视 (pitch) 和 侧视 (yaw) 效果，并保持图像内容完整 (自适应缩放)
+        输出正方形，边长为原始尺寸的最长边
         """
         h, w = image.shape[:2]
+        # 输出正方形，边长为原始尺寸的最长边
+        size = max(w, h)
         
         # 1. 转换为弧度
         pitch_rad = np.deg2rad(pitch)
@@ -329,30 +393,24 @@ class DataAugmentor:
         min_x, min_y = np.min(pts_2d[:, :2], axis=0)
         max_x, max_y = np.max(pts_2d[:, :2], axis=0)
         
-        new_w = int(max_x - min_x)
-        new_h = int(max_y - min_y)
+        proj_w = max_x - min_x
+        proj_h = max_y - min_y
         
-        # 构造偏移矩阵，使图像平移到正坐标区域
-        T_offset = np.array([
-            [1, 0, -min_x],
-            [0, 1, -min_y],
-            [0, 0, 1]
-        ])
+        # 计算缩放比例，使投影后的图像适应正方形画布
+        scale = size / max(proj_w, proj_h)
         
         # 最终的透视变换矩阵 M
-        # 原始投影矩阵 P = K @ [R | t]
-        # 这里简化处理：直接计算原四个角到新四个角的透视变换
         src_pts = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float32)
         dst_pts = pts_2d[:, :2].astype(np.float32)
         
-        # 应用偏移，确保内容在可视范围内
-        dst_pts[:, 0] -= min_x
-        dst_pts[:, 1] -= min_y
+        # 应用偏移和缩放，使内容居中并适应正方形画布
+        dst_pts[:, 0] = (dst_pts[:, 0] - min_x) * scale + (size - proj_w * scale) / 2
+        dst_pts[:, 1] = (dst_pts[:, 1] - min_y) * scale + (size - proj_h * scale) / 2
         
         M = cv2.getPerspectiveTransform(src_pts, dst_pts)
         
-        # 6. 应用变换
-        aug_image = cv2.warpPerspective(image, M, (new_w, new_h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+        # 6. 应用变换，输出正方形尺寸
+        aug_image = cv2.warpPerspective(image, M, (size, size), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
         
         # 7. 同步标注数据
         new_annotations = []

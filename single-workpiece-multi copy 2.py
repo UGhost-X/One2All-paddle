@@ -105,7 +105,7 @@ _infer_semaphore: Optional[asyncio.Semaphore] = None
 
 LOG_DIR  = Path("logs")
 LOG_DIR.mkdir(exist_ok=True)
-LOG_FILE = LOG_DIR / f"service_{{ service_id }}_{datetime.now().strftime('%Y%m%d')}.log"
+LOG_FILE = LOG_DIR / f"service_svc_1775102290_e41431d3_{datetime.now().strftime('%Y%m%d')}.log"
 
 file_handler    = logging.handlers.RotatingFileHandler(
     LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=5, encoding='utf-8'
@@ -157,7 +157,7 @@ ROI_SAVE_DIR.mkdir(exist_ok=True)
 
 app = FastAPI(
     title="Inference Service",
-    description=f"Project: {{ project_id }}, UUID: {{ task_uuid }}",
+    description=f"Project: 11, UUID: 6a5c7345",
     version="1.0.0"
 )
 
@@ -3372,7 +3372,22 @@ def create_multi_workpiece_visualization(
 # ─────────────────────────────────────────────────────────────────────────────
 
 MODELS:               Dict[str, Any]                   = {}
-MODEL_PATHS                                            = {{ models_config | tojson(indent=4) }}
+MODEL_PATHS                                            = {
+    "1": "output/23/6a5c7345/1",
+    "1_type": "patchcore",
+    "2": "output/23/6a5c7345/2",
+    "2_type": "patchcore",
+    "3": "output/23/6a5c7345/3",
+    "3_type": "patchcore",
+    "4": "output/23/6a5c7345/4",
+    "4_type": "patchcore",
+    "5": "output/23/6a5c7345/5",
+    "5_type": "patchcore",
+    "6": "output/23/6a5c7345/6",
+    "6_type": "patchcore",
+    "7": "output/23/6a5c7345/7",
+    "7_type": "patchcore"
+}
 PATCHCORE_DETECTOR:   Optional[MultiPatchCoreDetector] = None
 TEMPLATE_IMAGE:       Optional[np.ndarray]             = None
 TEMPLATE_ANNOTATIONS: List[Dict[str, Any]]             = []
@@ -3438,10 +3453,7 @@ def load_models():
         }
         logger.info(f"Loaded PatchCore models: {list(MODELS.keys())}")
 
-    if "{{ annotations_path }}":
-        annotations_path = Path("{{ annotations_path }}")
-    else:
-        annotations_path = Path("product/{{ project_id }}/train/{{ task_uuid }}/annotations.json")
+    annotations_path = Path("product/23/train/6a5c7345/annotations.json") if "product/23/train/6a5c7345/annotations.json" else None
     if annotations_path and annotations_path.exists():
         tpl_path, tpl_anns = select_best_template_from_annotations(str(annotations_path))
         if tpl_path:
@@ -3480,9 +3492,9 @@ async def startup_event():
 async def health_check():
     return {
         "status":        "healthy",
-        "service_id":    "{{ service_id }}",
-        "project_id":    "{{ project_id }}",
-        "task_uuid":     "{{ task_uuid }}",
+        "service_id":    "svc_1775102290_e41431d3",
+        "project_id":    "11",
+        "task_uuid":     "6a5c7345",
         "loaded_models": list(MODELS.keys()),
         "total_models":  len(MODELS),
         "gpu_memory":    _get_gpu_memory_info(),
@@ -4198,9 +4210,9 @@ signal.signal(signal.SIGTERM, signal_handler)
 if __name__ == "__main__":
     logger.info("=" * 60)
     logger.info("Starting inference service")
-    logger.info(f"Port:    {{ port }}")
-    logger.info(f"Project: {{ project_id }}")
-    logger.info(f"UUID:    {{ task_uuid }}")
+    logger.info(f"Port:    9795")
+    logger.info(f"Project: 11")
+    logger.info(f"UUID:    6a5c7345")
     logger.info(f"Timeout: {INFERENCE_TIMEOUT_SEC}s")
     logger.info(f"Log:     {LOG_FILE}")
     logger.info("=" * 60)
@@ -4208,7 +4220,7 @@ if __name__ == "__main__":
     uvicorn.run(
         app,
         host="0.0.0.0",
-        port={{ port }},
+        port=9795,
         log_config=None,
         access_log=True,
     )

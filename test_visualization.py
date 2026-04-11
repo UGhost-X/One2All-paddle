@@ -29,7 +29,7 @@ def test_visualization_api(image_path: str, api_url: str = "http://localhost:939
 
     try:
         response = requests.post(
-            f"{api_url}/predict_simple",
+            f"{api_url}/predict",
             files=files,
             data=data,
             timeout=120
