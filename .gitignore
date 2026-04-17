@@ -153,3 +153,6 @@ __pycache__/
 .DS_Store
 Thumbs.db
 product/
+roi_screenshots/
+templates/inference_services.py.j2-*
+debug_clahe/

@@ -10,16 +10,10 @@ import time
 import asyncio
 import psutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from functools import lru_cache
 from typing import Dict, Any, List, Optional, Union, Tuple
 from pathlib import Path
 from datetime import datetime
 from contextlib import contextmanager
-
-
-# 添加项目根目录到 sys.path（当前文件在 inference_services/ 目录下）
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from utils.image_decoder import decode_image, is_turbo_jpeg_available
 
 INFERENCE_TIMEOUT_SEC = 60
 
@@ -46,19 +40,10 @@ def get_workpiece_area_ratio_range(
 
 
 class ExecutorManager:
-    """线程池管理器，支持健康检查和智能重建。"""
-
-    # 健康检查阈值
-    MAX_CONSECUTIVE_FAILURES = 3  # 连续失败次数阈值
-    FAILURE_WINDOW_SECONDS = 60   # 失败计数窗口（秒）
-
     def __init__(self, max_workers: int = 1):
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._max_workers = max_workers
         self._lock: Optional[asyncio.Lock] = None
-        self._failure_count = 0
-        self._last_failure_time: Optional[float] = None
-        self._total_rebuilds = 0
 
     def init_lock(self):
         self._lock = asyncio.Lock()
@@ -67,69 +52,14 @@ class ExecutorManager:
     def executor(self) -> ThreadPoolExecutor:
         return self._executor
 
-    def record_failure(self, reason: str = "") -> bool:
-        """
-        记录一次失败，返回是否需要重建线程池。
-
-        Returns:
-            True: 达到重建阈值，需要重建
-            False: 未达到阈值，不需要重建
-        """
-        current_time = time.time()
-
-        # 检查是否在失败窗口内
-        if (self._last_failure_time is not None and
-            (current_time - self._last_failure_time) > self.FAILURE_WINDOW_SECONDS):
-            # 超过窗口期，重置计数
-            self._failure_count = 0
-            logger.info(f"[ExecutorManager] Failure window expired, resetting failure count")
-
-        self._failure_count += 1
-        self._last_failure_time = current_time
-
-        logger.warning(
-            f"[ExecutorManager] Failure recorded: {reason}, "
-            f"consecutive failures: {self._failure_count}/{self.MAX_CONSECUTIVE_FAILURES}"
-        )
-
-        # 达到阈值才需要重建
-        return self._failure_count >= self.MAX_CONSECUTIVE_FAILURES
-
-    def record_success(self):
-        """记录一次成功，重置失败计数。"""
-        if self._failure_count > 0:
-            logger.info(f"[ExecutorManager] Success recorded, resetting failure count from {self._failure_count}")
-            self._failure_count = 0
-            self._last_failure_time = None
-
     async def rebuild(self, reason: str = ""):
-        """
-        重建线程池。使用非阻塞方式关闭旧线程池。
-        """
         async with self._lock:
             old_executor = self._executor
             self._executor = ThreadPoolExecutor(max_workers=self._max_workers)
-            self._total_rebuilds += 1
-            self._failure_count = 0  # 重置失败计数
-
-            logger.warning(
-                f"[ExecutorManager] Rebuilding thread pool: {reason}, "
-                f"total rebuilds: {self._total_rebuilds}"
-            )
-
-            # 非阻塞方式关闭旧线程池（wait=False）
+            if reason:
+                logger.warning(f"[ExecutorManager] Rebuilding thread pool: {reason}")
             loop = asyncio.get_running_loop()
-            loop.run_in_executor(None, old_executor.shutdown, False)
-
-    def get_health_status(self) -> Dict[str, Any]:
-        """获取线程池健康状态。"""
-        return {
-            "failure_count": self._failure_count,
-            "max_consecutive_failures": self.MAX_CONSECUTIVE_FAILURES,
-            "last_failure_time": self._last_failure_time,
-            "total_rebuilds": self._total_rebuilds,
-            "max_workers": self._max_workers,
-        }
+            loop.run_in_executor(None, old_executor.shutdown, True)
 
 
 _executor_manager = ExecutorManager(max_workers=4)
@@ -192,7 +122,7 @@ ROI_SAVE_DIR.mkdir(exist_ok=True)
 
 app = FastAPI(
     title="Inference Service",
-    description=f"Project: 11, UUID: d5f95c1a",
+    description=f"Project: 11, UUID: d0337f65",
     version="1.0.0"
 )
 
@@ -209,9 +139,55 @@ class PerformanceMonitor:
         self._step_start_time: Optional[float] = None
         self._current_step: Optional[str] = None
 
+    @staticmethod
+    def get_cpu_info() -> Dict[str, Any]:
+        cpu_percent = psutil.cpu_percent(interval=0.1)
+        cpu_count = psutil.cpu_count()
+        cpu_freq = psutil.cpu_freq()
+        return {
+            "usage_percent": round(cpu_percent, 1),
+            "core_count": cpu_count,
+            "freq_mhz": round(cpu_freq.current, 0) if cpu_freq else 0,
+            "load_avg": [round(x, 2) for x in os.getloadavg()] if hasattr(os, 'getloadavg') else [],
+        }
+
+    @staticmethod
+    def get_memory_info() -> Dict[str, Any]:
+        mem = psutil.virtual_memory()
+        return {
+            "total_gb": round(mem.total / (1024**3), 2),
+            "available_gb": round(mem.available / (1024**3), 2),
+            "used_gb": round(mem.used / (1024**3), 2),
+            "usage_percent": mem.percent,
+        }
+
+    @staticmethod
+    def get_gpu_info() -> Dict[str, Any]:
+        try:
+            allocated = torch.cuda.memory_allocated(0)
+            reserved = torch.cuda.memory_reserved(0)
+            max_mem = torch.cuda.max_memory_allocated(0)
+            return {
+                "allocated_mb": round(allocated / 1024**2, 1),
+                "reserved_mb": round(reserved / 1024**2, 1),
+                "max_allocated_mb": round(max_mem / 1024**2, 1),
+                "free_mb": round((reserved - allocated) / 1024**2, 1),
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    def get_full_resource_snapshot(self) -> Dict[str, Any]:
+        return {
+            "cpu": self.get_cpu_info(),
+            "memory": self.get_memory_info(),
+            "gpu": self.get_gpu_info(),
+            "timestamp": time.time(),
+        }
+
     def start_step(self, step_name: str):
         self._current_step = step_name
         self._step_start_time = time.time()
+        self.resource_snapshots[f"{step_name}_start"] = self.get_full_resource_snapshot()
         logger.info(f"[{self.request_id}] ▶️ STEP START: {step_name}")
 
     def end_step(self, step_name: str = None):
@@ -219,7 +195,20 @@ class PerformanceMonitor:
         if step and self._step_start_time:
             elapsed = time.time() - self._step_start_time
             self.step_times[step] = elapsed
-            logger.info(f"[{self.request_id}] ✅ STEP END: {step} | Time: {elapsed:.3f}s")
+            self.resource_snapshots[f"{step}_end"] = self.get_full_resource_snapshot()
+            start = self.resource_snapshots.get(f"{step}_start", {})
+            end = self.resource_snapshots.get(f"{step}_end", {})
+            log_parts = [f"[{self.request_id}] ✅ STEP END: {step} | Time: {elapsed:.3f}s"]
+            cpu_start = start.get("cpu", {})
+            cpu_end = end.get("cpu", {})
+            if cpu_start and cpu_end:
+                log_parts.append(f"CPU: {cpu_start.get('usage_percent',0):.1f}% → {cpu_end.get('usage_percent',0):.1f}%")
+            mem_start = start.get("memory", {})
+            mem_end = end.get("memory", {})
+            if mem_start and mem_end:
+                delta = mem_end.get("used_gb", 0) - mem_start.get("used_gb", 0)
+                log_parts.append(f"Memory: {mem_start.get('used_gb',0):.2f}GB → {mem_end.get('used_gb',0):.2f}GB (Δ{delta:+.3f}GB)")
+            logger.info(" | ".join(log_parts))
         self._current_step = None
         self._step_start_time = None
 
@@ -277,26 +266,13 @@ def _get_gpu_memory_info() -> Dict[str, Any]:
 
 
 def chunked_cdist(x: torch.Tensor, y: torch.Tensor, chunk_size: int = 1024) -> torch.Tensor:
-    """
-    计算余弦距离（归一化后点积的负值）。
-    余弦距离 = 1 - cosine_similarity，范围 [0, 2]
-    """
-    # 归一化特征向量
-    x_norm = F.normalize(x, p=2, dim=1)
-    y_norm = F.normalize(y, p=2, dim=1)
-
-    n = x_norm.shape[0]
-    if n * y_norm.shape[0] < chunk_size * chunk_size * 4:
-        # 计算余弦相似度并转换为距离
-        similarity = torch.mm(x_norm, y_norm.t())
-        return 1 - similarity
-
+    n = x.shape[0]
+    if n * y.shape[0] < chunk_size * chunk_size * 4:
+        return torch.cdist(x, y)
     distances = []
     for i in range(0, n, chunk_size):
         end_i = min(i + chunk_size, n)
-        # 分批计算余弦相似度
-        similarity = torch.mm(x_norm[i:end_i], y_norm.t())
-        distances.append(1 - similarity)
+        distances.append(torch.cdist(x[i:end_i], y))
     return torch.cat(distances, dim=0)
 
 
@@ -531,19 +507,14 @@ class AnomalibPatchCoreWrapper:
                 # 批量计算所有样本与 memory_bank 的距离
                 memory_bank = self.model.memory_bank  # [M, C]
 
-                # 使用余弦距离分批计算，避免内存溢出
-                # 归一化特征向量
-                embeddings_flat_norm = F.normalize(embeddings_flat, p=2, dim=2)
-                memory_bank_norm = F.normalize(memory_bank, p=2, dim=1)
-
+                # 使用 chunked_cdist 分批计算距离，避免内存溢出
                 distances_list = []
                 chunk_size = 1024
-                for i in range(0, embeddings_flat_norm.shape[1], chunk_size):
-                    end_i = min(i + chunk_size, embeddings_flat_norm.shape[1])
-                    chunk = embeddings_flat_norm[:, i:end_i, :]  # [B, chunk_size, C]
-                    # 计算余弦相似度并转换为距离: [B, chunk_size, M]
-                    similarity = torch.bmm(chunk, memory_bank_norm.unsqueeze(0).expand(chunk.shape[0], -1, -1).transpose(1, 2))
-                    dist_chunk = 1 - similarity
+                for i in range(0, embeddings_flat.shape[1], chunk_size):
+                    end_i = min(i + chunk_size, embeddings_flat.shape[1])
+                    chunk = embeddings_flat[:, i:end_i, :]  # [B, chunk_size, C]
+                    # 计算距离: [B, chunk_size, M]
+                    dist_chunk = torch.cdist(chunk, memory_bank.unsqueeze(0))
                     distances_list.append(dist_chunk)
                 distances = torch.cat(distances_list, dim=1)  # [B, N_patches, M]
 
@@ -607,7 +578,7 @@ class AnomalibPatchCoreWrapper:
         memory_bank: torch.Tensor,
     ) -> torch.Tensor:
         """
-        根据 embedding 和 memory bank 计算异常分数（使用余弦距离）。
+        根据 embedding 和 memory bank 计算异常分数。
 
         Args:
             embeddings_flat: [B, N_patches, C] 展平后的 embedding
@@ -619,17 +590,7 @@ class AnomalibPatchCoreWrapper:
         try:
             num_neighbors = self.num_neighbors
 
-            # 归一化特征向量，计算余弦距离
-            embeddings_flat_norm = F.normalize(embeddings_flat, p=2, dim=2)
-            memory_bank_norm = F.normalize(memory_bank, p=2, dim=1)
-
-            # 计算余弦相似度并转换为距离
-            similarity = torch.bmm(
-                embeddings_flat_norm,
-                memory_bank_norm.unsqueeze(0).expand(embeddings_flat_norm.shape[0], -1, -1).transpose(1, 2)
-            )
-            distances = 1 - similarity
-
+            distances = torch.cdist(embeddings_flat, memory_bank.unsqueeze(0))
             topk_vals, _ = torch.topk(distances, k=num_neighbors + 1, largest=False, dim=2)
             patch_scores = topk_vals[:, :, 1:].mean(dim=2)
 
@@ -646,79 +607,19 @@ class AnomalibPatchCoreWrapper:
 # 多模型管理器
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _load_single_model(pos_id_dir: Path) -> Optional[Tuple[str, AnomalibPatchCoreWrapper, Dict[str, Any]]]:
-    """
-    加载单个 PatchCore 模型的辅助函数（用于并行加载）。
-
-    Returns:
-        (pos_id, wrapper, config) 元组，加载失败返回 None
-    """
-    pos_id = pos_id_dir.name
-    model_path = pos_id_dir / "patchcore_model.pt"
-
-    if not model_path.exists():
-        best = pos_id_dir / "best_model"
-        if best.exists():
-            model_path = best / "patchcore_model.pt"
-
-    if not model_path.exists():
-        logger.warning(f"PatchCore model not found for pos_id={pos_id}, skipping")
-        return None
-
-    try:
-        checkpoint = torch.load(model_path, map_location="cpu")
-        backbone = checkpoint.get("backbone", "resnet18")
-        layers = checkpoint.get("layers", ["layer2", "layer3"])
-        num_neighbors = checkpoint.get("num_neighbors", 9)
-
-        wrapper = AnomalibPatchCoreWrapper(
-            backbone=backbone, layers=layers, num_neighbors=num_neighbors,
-            device="cuda" if torch.cuda.is_available() else "cpu",
-        )
-        wrapper.load_from_checkpoint_dict(checkpoint)
-
-        config_path = pos_id_dir / "config.json"
-        config = {}
-        if config_path.exists():
-            with open(config_path, "r", encoding="utf-8") as f:
-                config = json.load(f)
-            wrapper.load_config(str(config_path))
-
-        bank_shape = wrapper.memory_bank.shape if wrapper.memory_bank is not None else "N/A"
-        logger.info(
-            f"Loaded PatchCore model: pos_id={pos_id} "
-            f"(backbone={backbone}, layers={layers}, bank={bank_shape}, "
-            f"threshold={config.get('threshold', 'N/A')}, "
-            f"target_size={config.get('target_size', 'N/A')})"
-        )
-        return pos_id, wrapper, config
-    except Exception as e:
-        logger.error(f"Failed to load PatchCore model pos_id={pos_id}: {e}")
-        return None
-
-
 class MultiPatchCoreDetector:
-    def __init__(self, models_dir: Path, lazy_load: bool = True, max_workers: int = 4):
+    def __init__(self, models_dir: Path):
         self.models_dir = models_dir
         self.models: Dict[str, AnomalibPatchCoreWrapper] = {}
         self.configs: Dict[str, Dict[str, Any]] = {}
-        self._model_metadata: Dict[str, Dict[str, Any]] = {}  # 懒加载用：存储模型元数据
         self._shared_backbone: Optional[torch.nn.Module] = None
         self._shared_feature_pooler: Optional[torch.nn.Module] = None
         self._shared_wrapper: Optional[AnomalibPatchCoreWrapper] = None
         self._compatible_pos_ids: List[str] = []
-        self._lazy_load = lazy_load
-        self._max_workers = max_workers
-        self._load_lock = asyncio.Lock() if lazy_load else None
-
-        if lazy_load:
-            self._scan_model_metadata()
-        else:
-            self._load_models_parallel()
+        self._load_models()
         self._find_and_create_shared_backbone()
 
-    def _scan_model_metadata(self):
-        """懒加载模式：仅扫描模型元数据，不实际加载模型权重。"""
+    def _load_models(self):
         if not self.models_dir.exists():
             logger.warning(f"Models directory not found: {self.models_dir}")
             return
@@ -736,115 +637,53 @@ class MultiPatchCoreDetector:
                     model_path = best / "patchcore_model.pt"
 
             if not model_path.exists():
+                logger.warning(f"PatchCore model not found for pos_id={pos_id}, skipping")
                 continue
 
-            config_path = pos_id_dir / "config.json"
-            config = {}
-            if config_path.exists():
-                try:
+            try:
+                checkpoint = torch.load(model_path, map_location="cpu")
+                backbone = checkpoint.get("backbone", "resnet18")
+                layers = checkpoint.get("layers", ["layer2", "layer3"])
+                num_neighbors = checkpoint.get("num_neighbors", 9)
+
+                wrapper = AnomalibPatchCoreWrapper(
+                    backbone=backbone, layers=layers, num_neighbors=num_neighbors,
+                    device="cuda" if torch.cuda.is_available() else "cpu",
+                )
+                wrapper.load_from_checkpoint_dict(checkpoint)
+
+                config_path = pos_id_dir / "config.json"
+                config = {}
+                if config_path.exists():
                     with open(config_path, "r", encoding="utf-8") as f:
                         config = json.load(f)
-                except Exception as e:
-                    logger.warning(f"Failed to load config for pos_id={pos_id}: {e}")
+                    wrapper.load_config(str(config_path))
 
-            self._model_metadata[pos_id] = {
-                "model_path": str(model_path),
-                "config_path": str(config_path) if config_path.exists() else None,
-                "config": config,
-            }
-            logger.info(f"Scanned model metadata: pos_id={pos_id}")
+                self.models[pos_id] = wrapper
+                self.configs[pos_id] = config
 
-    def _load_models_parallel(self):
-        """并行加载所有模型（非懒加载模式）。"""
-        if not self.models_dir.exists():
-            logger.warning(f"Models directory not found: {self.models_dir}")
-            return
-
-        pos_id_dirs = [d for d in self.models_dir.iterdir() if d.is_dir()]
-
-        if not pos_id_dirs:
-            return
-
-        logger.info(f"Loading {len(pos_id_dirs)} models in parallel with {self._max_workers} workers...")
-        start_time = time.time()
-
-        with ThreadPoolExecutor(max_workers=self._max_workers) as executor:
-            futures = {executor.submit(_load_single_model, d): d for d in pos_id_dirs}
-            for future in as_completed(futures):
-                result = future.result()
-                if result:
-                    pos_id, wrapper, config = result
-                    self.models[pos_id] = wrapper
-                    self.configs[pos_id] = config
-
-        elapsed = time.time() - start_time
-        logger.info(f"Parallel model loading completed: {len(self.models)} models in {elapsed:.2f}s")
-
-    async def _load_model_async(self, pos_id: str) -> Optional[AnomalibPatchCoreWrapper]:
-        """异步加载单个模型（懒加载模式），带缓存。"""
-        if pos_id in self.models:
-            return self.models[pos_id]
-
-        if pos_id not in self._model_metadata:
-            return None
-
-        async with self._load_lock:
-            # 双重检查，避免并发重复加载
-            if pos_id in self.models:
-                return self.models[pos_id]
-
-            metadata = self._model_metadata[pos_id]
-            model_path = Path(metadata["model_path"])
-
-            try:
-                # 在线程池中执行同步的模型加载
-                loop = asyncio.get_running_loop()
-                result = await loop.run_in_executor(
-                    None, _load_single_model, model_path.parent
+                bank_shape = wrapper.memory_bank.shape if wrapper.memory_bank is not None else "N/A"
+                logger.info(
+                    f"Loaded PatchCore model: pos_id={pos_id} "
+                    f"(backbone={backbone}, layers={layers}, bank={bank_shape}, "
+                    f"threshold={config.get('threshold', 'N/A')}, "
+                    f"target_size={config.get('target_size', 'N/A')})"
                 )
-
-                if result:
-                    _, wrapper, config = result
-                    self.models[pos_id] = wrapper
-                    self.configs[pos_id] = config
-                    logger.info(f"Lazy loaded model for pos_id={pos_id}")
-                    return wrapper
             except Exception as e:
-                logger.error(f"Failed to lazy load model pos_id={pos_id}: {e}")
-
-        return None
+                logger.error(f"Failed to load PatchCore model pos_id={pos_id}: {e}")
 
     def _find_and_create_shared_backbone(self):
         """
         检测是否存在可共享的 backbone 配置。
         如果存在 2 个或以上 pos_id 使用相同的 backbone + layers，
         则创建一个共享的 backbone 供批量推理使用。
-
-        注意：在懒加载模式下，此函数只记录兼容的 pos_ids，
-        实际的共享 backbone 会在首次需要时创建。
         """
-        # 收集所有可用的 pos_id 和配置
-        all_configs = {}
-
-        # 从已加载的模型中获取配置
-        for pos_id, wrapper in self.models.items():
-            all_configs[pos_id] = (wrapper.backbone, tuple(wrapper.layers))
-
-        # 在懒加载模式下，从元数据中获取配置
-        if self._lazy_load:
-            for pos_id, metadata in self._model_metadata.items():
-                if pos_id not in all_configs:
-                    config = metadata.get("config", {})
-                    backbone = config.get("backbone", "resnet18")
-                    layers = tuple(config.get("layers", ["layer2", "layer3"]))
-                    all_configs[pos_id] = (backbone, layers)
-
-        if len(all_configs) < 2:
+        if len(self.models) < 2:
             return
 
         config_groups: Dict[Tuple, List[str]] = {}
-        for pos_id, (backbone, layers) in all_configs.items():
-            key = (backbone, layers)
+        for pos_id, wrapper in self.models.items():
+            key = (wrapper.backbone, tuple(wrapper.layers))
             config_groups.setdefault(key, []).append(pos_id)
 
         compatible_groups = [(k, v) for k, v in config_groups.items() if len(v) > 1]
@@ -855,42 +694,33 @@ class MultiPatchCoreDetector:
         best_key, best_pos_ids = compatible_groups[0]
         backbone, layers = best_key
 
-        # 只有在至少加载了一个模型时才创建共享 backbone
-        if len(self.models) > 0:
-            try:
-                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                self._shared_wrapper = AnomalibPatchCoreWrapper(
-                    backbone=backbone, layers=layers, num_neighbors=9, device=str(device)
-                )
-
-                first_wrapper = list(self.models.values())[0]
-                self._shared_wrapper.model = first_wrapper.model
-                self._shared_wrapper.memory_bank = first_wrapper.memory_bank
-                self._shared_wrapper.num_neighbors = first_wrapper.num_neighbors
-
-                self._shared_backbone = self._shared_wrapper.model.feature_extractor
-                self._shared_feature_pooler = self._shared_wrapper.model.feature_pooler
-                self._compatible_pos_ids = best_pos_ids
-
-                logger.info(
-                    f"[MultiPatchCore] 创建共享 backbone: {backbone}, layers: {layers}, "
-                    f"兼容 pos_ids: {best_pos_ids}"
-                )
-            except Exception as e:
-                logger.error(f"[MultiPatchCore] 创建共享 backbone 失败: {e}")
-                self._shared_backbone = None
-                self._shared_feature_pooler = None
-                self._shared_wrapper = None
-                self._compatible_pos_ids = []
-        else:
-            # 懒加载模式：只记录兼容的 pos_ids，延迟创建共享 backbone
-            self._compatible_pos_ids = best_pos_ids
-            logger.info(
-                f"[MultiPatchCore] 延迟创建共享 backbone: {backbone}, layers: {layers}, "
-                f"兼容 pos_ids: {best_pos_ids}"
+        try:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self._shared_wrapper = AnomalibPatchCoreWrapper(
+                backbone=backbone, layers=layers, num_neighbors=9, device=str(device)
             )
 
-    async def detect_by_pos_id(
+            first_wrapper = list(self.models.values())[0]
+            self._shared_wrapper.model = first_wrapper.model
+            self._shared_wrapper.memory_bank = first_wrapper.memory_bank
+            self._shared_wrapper.num_neighbors = first_wrapper.num_neighbors
+
+            self._shared_backbone = self._shared_wrapper.model.feature_extractor
+            self._shared_feature_pooler = self._shared_wrapper.model.feature_pooler
+            self._compatible_pos_ids = best_pos_ids
+
+            logger.info(
+                f"[MultiPatchCore] 创建共享 backbone: {backbone}, layers: {layers}, "
+                f"兼容 pos_ids: {best_pos_ids}"
+            )
+        except Exception as e:
+            logger.error(f"[MultiPatchCore] 创建共享 backbone 失败: {e}")
+            self._shared_backbone = None
+            self._shared_feature_pooler = None
+            self._shared_wrapper = None
+            self._compatible_pos_ids = []
+
+    def detect_by_pos_id(
         self,
         rois: List[np.ndarray],
         category: str,
@@ -914,16 +744,6 @@ class MultiPatchCoreDetector:
                 pos_id_groups.setdefault(pos_id, []).append((idx, roi, ann))
 
             all_pos_ids = list(pos_id_groups.keys())
-
-            # 懒加载模式：按需加载所需模型
-            if self._lazy_load:
-                load_tasks = []
-                for pos_id in all_pos_ids:
-                    if pos_id not in self.models and pos_id in self._model_metadata:
-                        load_tasks.append(self._load_model_async(pos_id))
-                if load_tasks:
-                    await asyncio.gather(*load_tasks, return_exceptions=True)
-
             can_use_shared = (
                 self._shared_backbone is not None and
                 all(pid in self._compatible_pos_ids for pid in all_pos_ids if pid in self.models)
@@ -1075,7 +895,7 @@ class MultiPatchCoreDetector:
 
                 def make_result(error: float, infer_failed: bool = False) -> Dict[str, Any]:
                     return {
-                        "is_anomaly": (not infer_failed) and (error > threshold*1.1),
+                        "is_anomaly": (not infer_failed) and (error > threshold*1.05),
                         "anomaly_score": min(error / threshold, 1.0) if threshold > 0 else error,
                         "error": error,
                         "threshold": threshold,
@@ -1104,27 +924,20 @@ class MultiPatchCoreDetector:
 
         return result_pairs
 
-    async def detect_category(
+    def detect_category(
         self,
         rois: List[np.ndarray],
         category: str,
         request_id: str = "",
         annotations: List[Dict] = None,
     ) -> List[Dict[str, Any]]:
-        return await self.detect_by_pos_id(
+        return self.detect_by_pos_id(
             rois=rois, category=category, request_id=request_id,
             annotations=annotations,
         )
 
     def get_loaded_categories(self) -> List[str]:
-        """获取所有可用的类别（懒加载模式下包括未加载的）。"""
-        if self._lazy_load:
-            return list(self._model_metadata.keys())
         return list(self.models.keys())
-
-    def is_model_loaded(self, pos_id: str) -> bool:
-        """检查指定 pos_id 的模型是否已加载。"""
-        return pos_id in self.models
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1944,7 +1757,7 @@ def _transform_template_pts_to_roi(
     return pts_out.reshape(-1, 2)
 
 
-async def process_single_workpiece_roi(
+def process_single_workpiece_roi(
     detector: MultiPatchCoreDetector,
     roi_image: np.ndarray,
     roi_info: Dict,
@@ -1994,7 +1807,7 @@ async def process_single_workpiece_roi(
 
     for ann in template_annotations:
         category = ann.get("category")
-        if not category or category not in detector.get_loaded_categories():
+        if not category or category not in detector.models:
             continue
 
         segmentation = ann.get("segmentation", [])
@@ -2041,7 +1854,7 @@ async def process_single_workpiece_roi(
         indices = [i for i, c in enumerate(categories) if c == cat]
         cat_rois = [rois_for_inference[i] for i in indices]
         cat_anns = [anns_for_inference[i] for i in indices]
-        det_results = await detector.detect_category(cat_rois, cat, f"{request_id}_wp{wp_idx}", annotations=cat_anns)
+        det_results = detector.detect_category(cat_rois, cat, f"{request_id}_wp{wp_idx}", annotations=cat_anns)
 
         for idx, det_res in zip(indices, det_results):
             ann = anns_for_inference[idx]
@@ -2145,7 +1958,7 @@ async def process_single_workpiece_roi(
 # FIX: 解包新增的 H_scene_to_roi 并传给 process_single_workpiece_roi
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def detect_multiple_workpieces(
+def detect_multiple_workpieces(
     detector: MultiPatchCoreDetector,
     image: np.ndarray,
     template_image: np.ndarray,
@@ -2198,46 +2011,45 @@ async def detect_multiple_workpieces(
     # 3. 对每个工件并行执行异常检测
     local_monitor.start_step("per_workpiece_inference")
     num_wp = len(detections)
-    logger.info(f"[{request_id}] 并行处理 {num_wp} 个工件")
+    max_workers = min(num_wp, 4)
+    logger.info(f"[{request_id}] 并行处理 {num_wp} 个工件，并行度={max_workers}")
     t_parallel = time.time()
 
-    # 使用 asyncio.gather 并行处理所有工件
-    tasks = []
-    for i, (roi, info, _, A_template, A_scene_to_roi, A_template_to_roi_image) in enumerate(detections):
-        task = process_single_workpiece_roi(
-            detector,
-            roi,
-            info,
-            A_template,       # A_template_to_scene
-            A_scene_to_roi,   # 场景→roi_image 仿射变换
-            A_template_to_roi_image,  # 直接计算的模板→roi_image 仿射变换矩阵
-            annotations,
-            template_image,
-            f"{request_id}_wp{i+1}",
-            i + 1
-        )
-        tasks.append(task)
-
-    # 并行执行所有任务
-    wp_results_list = await asyncio.gather(*tasks, return_exceptions=True)
-
-    # 处理结果
-    wp_results: List[Dict] = []
-    for i, result in enumerate(wp_results_list):
-        if isinstance(result, Exception):
-            logger.error(f"[{request_id}] 工件 {i+1} 推理异常: {result}")
-            _, info, _, _, _, _ = detections[i]
-            wp_results.append({
-                "workpiece_id": i + 1,
-                "bbox": list(info.get("bbox", (0, 0, 0, 0))),
-                "results": [],
-                "anomaly_count": 0,
-                "strategy": "lightglue",
-                "roi_info": info,
-                "error": str(result),
-            })
-        else:
-            wp_results.append(result)
+    wp_results: List[Dict] = [None] * num_wp
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        # 解包仿射变换矩阵，传给 process_single_workpiece_roi
+        future_to_idx = {
+            pool.submit(
+                process_single_workpiece_roi,
+                detector,
+                roi,
+                info,
+                A_template,       # A_template_to_scene
+                A_scene_to_roi,   # 场景→roi_image 仿射变换
+                A_template_to_roi_image,  # 直接计算的模板→roi_image 仿射变换矩阵
+                annotations,
+                template_image,
+                f"{request_id}_wp{i+1}",
+                i + 1
+            ): i
+            for i, (roi, info, _, A_template, A_scene_to_roi, A_template_to_roi_image) in enumerate(detections)
+        }
+        for future in as_completed(future_to_idx):
+            i = future_to_idx[future]
+            try:
+                wp_results[i] = future.result()
+            except Exception as e:
+                logger.error(f"[{request_id}] 工件 {i+1} 推理异常: {e}")
+                _, info, _, _, _, _ = detections[i]
+                wp_results[i] = {
+                    "workpiece_id": i + 1,
+                    "bbox": list(info.get("bbox", (0, 0, 0, 0))),
+                    "results": [],
+                    "anomaly_count": 0,
+                    "strategy": "lightglue",
+                    "roi_info": info,
+                    "error": str(e),
+                }
 
     logger.info(f"[{request_id}] 并行处理完成，总耗时 {time.time()-t_parallel:.3f}s")
     local_monitor.end_step("per_workpiece_inference")
@@ -2839,7 +2651,6 @@ async def health_check():
         "gpu_memory":    _get_gpu_memory_info(),
     }
 
-
 @app.get("/models")
 async def list_models():
     return {"models": list(MODELS.keys()), "loaded": list(MODELS.keys())}
@@ -2865,20 +2676,16 @@ async def predict_multiple(
         try:
             with monitor.step("image_decode"):
                 image_data: Optional[np.ndarray] = None
-                decode_start = time.time()
                 if file is not None:
                     contents = await file.read()
-                    image_data = decode_image(contents, use_turbo=True)
-                    decode_elapsed = time.time() - decode_start
-                    turbo_status = "TurboJPEG" if is_turbo_jpeg_available() else "OpenCV"
-                    logger.info(f"[{request_id}] 文件上传: {file.filename}, {len(contents)} bytes, 解码耗时: {decode_elapsed*1000:.1f}ms ({turbo_status})")
+                    nparr = np.frombuffer(contents, np.uint8)
+                    image_data = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                    logger.info(f"[{request_id}] 文件上传: {file.filename}, {len(contents)} bytes")
                 elif image is not None:
                     b64 = image.split(",")[1] if "," in image else image
-                    contents = base64.b64decode(b64)
-                    image_data = decode_image(contents, use_turbo=True)
-                    decode_elapsed = time.time() - decode_start
-                    turbo_status = "TurboJPEG" if is_turbo_jpeg_available() else "OpenCV"
-                    logger.info(f"[{request_id}] Base64输入, 解码耗时: {decode_elapsed*1000:.1f}ms ({turbo_status})")
+                    nparr = np.frombuffer(base64.b64decode(b64), np.uint8)
+                    image_data = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                    logger.info(f"[{request_id}] Base64输入")
                 else:
                     raise HTTPException(status_code=400, detail="No image provided")
 
@@ -2901,45 +2708,39 @@ async def predict_multiple(
                     logger.warning(f"[{request_id}] 无法解析rotations参数: {rotations}")
 
             monitor.start_step("total_inference")
+            loop = asyncio.get_running_loop()
             try:
                 detect_result = await asyncio.wait_for(
-                    detect_multiple_workpieces(
-                        PATCHCORE_DETECTOR,
-                        image_data,
-                        TEMPLATE_IMAGE,
-                        TEMPLATE_ANNOTATIONS,
-                        request_id,
-                        monitor,
-                        return_visualization=return_viz,
-                        lightglue_rotations=parsed_rotations,
-                        lightglue_min_matches=min_matches,
-                        lightglue_max_instances=max_instances,
-                        lightglue_extractor=extractor_type,
+                    loop.run_in_executor(
+                        _executor_manager.executor,
+                        lambda: detect_multiple_workpieces(
+                            PATCHCORE_DETECTOR,
+                            image_data,
+                            TEMPLATE_IMAGE,
+                            TEMPLATE_ANNOTATIONS,
+                            request_id,
+                            monitor,
+                            return_visualization=return_viz,
+                            lightglue_rotations=parsed_rotations,
+                            lightglue_min_matches=min_matches,
+                            lightglue_max_instances=max_instances,
+                            lightglue_extractor=extractor_type,
+                        )
                     ),
                     timeout=INFERENCE_TIMEOUT_SEC * 3,
                 )
                 monitor.end_step("total_inference")
-                # 成功执行，重置失败计数
-                _executor_manager.record_success()
             except asyncio.TimeoutError:
                 monitor.end_step("total_inference")
                 logger.error(f"[{request_id}] 推理超时 ({INFERENCE_TIMEOUT_SEC * 3}s)")
                 _cleanup(f"[{request_id}] timeout")
-                # 记录失败，达到阈值才重建
-                should_rebuild = _executor_manager.record_failure(f"timeout [{request_id}]")
-                if should_rebuild:
-                    logger.error(f"[{request_id}] 连续失败次数达到阈值，重建线程池")
-                    await _executor_manager.rebuild(reason=f"consecutive timeouts [{request_id}]")
+                await _executor_manager.rebuild(reason=f"timeout [{request_id}]")
                 raise HTTPException(status_code=503, detail="Inference timeout, please retry")
             except Exception as exec_err:
                 monitor.end_step("total_inference")
                 logger.error(f"[{request_id}] Executor error: {exec_err}")
                 _cleanup(f"[{request_id}] executor error")
-                # 记录失败，达到阈值才重建
-                should_rebuild = _executor_manager.record_failure(f"executor error [{request_id}]")
-                if should_rebuild:
-                    logger.error(f"[{request_id}] 连续失败次数达到阈值，重建线程池")
-                    await _executor_manager.rebuild(reason=f"consecutive executor errors [{request_id}]")
+                await _executor_manager.rebuild(reason=f"executor error [{request_id}]")
                 raise
 
             wp_results_raw = detect_result["workpiece_results"]

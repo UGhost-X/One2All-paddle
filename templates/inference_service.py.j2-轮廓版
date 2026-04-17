@@ -105,7 +105,7 @@ _infer_semaphore: Optional[asyncio.Semaphore] = None
 
 LOG_DIR  = Path("logs")
 LOG_DIR.mkdir(exist_ok=True)
-LOG_FILE = LOG_DIR / f"service_svc_1775102290_e41431d3_{datetime.now().strftime('%Y%m%d')}.log"
+LOG_FILE = LOG_DIR / f"service_{{ service_id }}_{datetime.now().strftime('%Y%m%d')}.log"
 
 file_handler    = logging.handlers.RotatingFileHandler(
     LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=5, encoding='utf-8'
@@ -157,7 +157,7 @@ ROI_SAVE_DIR.mkdir(exist_ok=True)
 
 app = FastAPI(
     title="Inference Service",
-    description=f"Project: 11, UUID: eb19ba29",
+    description=f"Project: {{ project_id }}, UUID: {{ task_uuid }}",
     version="1.0.0"
 )
 
@@ -1220,7 +1220,6 @@ class MultiPatchCoreDetector:
             os.makedirs(save_preprocessed_dir, exist_ok=True)
 
         total_rois = len(rois)
-        logger.info(f"[{request_id}] [{category}] Total ROIs to process: {total_rois}")
 
         result_pairs: List[tuple] = []
 
@@ -1231,10 +1230,6 @@ class MultiPatchCoreDetector:
                     pos_id = str(annotations[idx].get('pos_id', 'default'))
 
                 if pos_id not in self.models:
-                    logger.warning(
-                        f"[{request_id}] [{category}] No model found for pos_id={pos_id}, "
-                        f"skipping ROI {idx+1}"
-                    )
                     result_pairs.append((0.0, True))
                     continue
 
@@ -1275,20 +1270,12 @@ class MultiPatchCoreDetector:
                         if dual_info.get("is_negative_match"):
                             log_msg += " [NEGATIVE_MATCH]"
                         logger.info(log_msg)
-                    else:
-                        logger.info(
-                            f"[{request_id}] [{category}] ROI {idx+1}/{total_rois} "
-                            f"pos_id={pos_id} roi_size={roi.shape[1]}x{roi.shape[0]} "
-                            f"score={score:.4f} threshold={threshold:.4f} (raw={raw_threshold:.4f} x {threshold_buffer})"
-                        )
-
                     result_pairs.append((make_result(score, result["infer_failed"], dual_info), False))
 
                 except Exception as e:
                     logger.error(f"[{request_id}] [{category}] Error ROI {idx+1} pos_id={pos_id}: {e}")
                     result_pairs.append((make_result(0.0, True), True))
 
-            logger.info(f"[{request_id}] [{category}] Processed {len(result_pairs)}/{total_rois} ROIs")
         finally:
             _cleanup(f"{category} done")
 
@@ -1534,7 +1521,16 @@ def detect_multiple_workpiece_bboxes(
     """
     h_img, w_img = image.shape[:2]
     img_area = h_img * w_img
-    
+
+    if background_frame is None:
+        default_bg_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "test", "multi-demo-bg-light.jpg"
+        )
+        if os.path.exists(default_bg_path):
+            background_frame = cv2.imread(default_bg_path)
+            logger.info(f"[detect_multiple_workpiece_bboxes] 自动加载背景图: {default_bg_path}")
+
     # 根据参考工件尺寸自适应调整参数
     if reference_workpiece_size is not None:
         ref_w, ref_h = reference_workpiece_size
@@ -1584,7 +1580,49 @@ def detect_multiple_workpiece_bboxes(
     all_bboxes = detector.detect(
         image, img_area, adaptive_min_ratio, adaptive_max_ratio, padding
     )
-    
+
+    logger.info(f"[detect_multiple_workpiece_bboxes] detector.detect() 返回 {len(all_bboxes)} 个bbox:")
+    for i, bbox in enumerate(all_bboxes):
+        x, y, bw, bh = bbox
+        area = bw * bh
+        area_ratio = area / img_area
+        ref_w, ref_h = reference_workpiece_size if reference_workpiece_size else (0, 0)
+        if reference_workpiece_size:
+            ref_area = ref_w * ref_h
+            ref_area_ratio = ref_area / img_area
+            ratio = area_ratio / ref_area_ratio
+            logger.info(f"  bbox[{i}]: ({x},{y},{bw},{bh}), 面积比例={area_ratio:.2%}, 参考比例={ratio:.2f}x")
+            if area_ratio < adaptive_min_ratio:
+                logger.info(f"    ❌ 被过滤: 面积比例 {area_ratio:.2%} < 最小阈值 {adaptive_min_ratio:.2%}")
+            if area_ratio > adaptive_max_ratio:
+                logger.info(f"    ❌ 被过滤: 面积比例 {area_ratio:.2%} > 最大阈值 {adaptive_max_ratio:.2%}")
+            if ratio >= 1.8:
+                logger.info(f"    ✅ 将触发连通域比例切割法 (ratio={ratio:.2f}x)")
+        else:
+            logger.info(f"  bbox[{i}]: ({x},{y},{bw},{bh}), 面积比例={area_ratio:.2%}")
+
+    if reference_workpiece_size is not None:
+        ref_w, ref_h = reference_workpiece_size
+        ref_area = ref_w * ref_h
+        ref_area_ratio = ref_area / img_area
+        split_threshold_ratio_min = 1.8
+        split_threshold_ratio_max = 4.2
+        all_bboxes_split = []
+        for bbox in all_bboxes:
+            x, y, bw, bh = bbox
+            cluster_area_ratio = (bw * bh) / img_area
+            ratio = cluster_area_ratio / ref_area_ratio
+            if ratio >= split_threshold_ratio_min and ratio <= split_threshold_ratio_max:
+                logger.info(f"[detect_multiple_workpiece_bboxes] 检测到大面积连通域({ratio:.2f}x参考面积), 触发连通域比例切割法")
+                split = _cluster_split_by_ratio(
+                    bbox, img_area, reference_workpiece_size, padding,
+                    adaptive_min_ratio, split_threshold_ratio_max
+                )
+                all_bboxes_split.extend(split)
+            else:
+                all_bboxes_split.append(bbox)
+        all_bboxes = all_bboxes_split
+
     # 使用NMS合并重叠的bbox
     selected_bboxes = _nms_bboxes(all_bboxes, min_distance, w_img, h_img)
     
@@ -1612,26 +1650,30 @@ def detect_multiple_workpiece_bboxes(
         
         # 合并并去重
         all_bboxes_aux.extend(selected_bboxes)
+        if reference_workpiece_size is not None:
+            ref_w, ref_h = reference_workpiece_size
+            ref_area = ref_w * ref_h
+            ref_area_ratio = ref_area / img_area
+            split_threshold_ratio_min = 2.2
+            split_threshold_ratio_max = 4.2
+            all_bboxes_aux_split = []
+            for bbox in all_bboxes_aux:
+                bx, by, bw, bh = bbox
+                cluster_area_ratio = (bw * bh) / img_area
+                ratio = cluster_area_ratio / ref_area_ratio
+                if ratio >= split_threshold_ratio_min and ratio <= split_threshold_ratio_max:
+                    logger.info(f"[detect_multiple_workpiece_bboxes] 辅助策略检测到大面积连通域({ratio:.2f}x参考面积), 触发连通域比例切割法")
+                    split = _cluster_split_by_ratio(
+                        bbox, img_area, reference_workpiece_size, padding,
+                        adaptive_min_ratio * 0.5, split_threshold_ratio_max
+                    )
+                    all_bboxes_aux_split.extend(split)
+                elif ratio > split_threshold_ratio_max:
+                    continue
+                else:
+                    all_bboxes_aux_split.append(bbox)
+            all_bboxes_aux = all_bboxes_aux_split
         selected_bboxes = _nms_bboxes(all_bboxes_aux, min_distance * 0.5, w_img, h_img)
-    
-    # 如果提供了期望数量，但仍未检测到足够的工件，进一步降低阈值
-    if expected_count and len(selected_bboxes) < expected_count:
-        logger.info(f"[detect_multiple_workpiece_bboxes] 检测到 {len(selected_bboxes)} 个工件，期望 {expected_count} 个，尝试更低阈值")
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
-        all_bboxes_low = []
-        for canny_thresh1 in [15, 25]:
-            for canny_thresh2 in [60, 80]:
-                bboxes = _detect_workpieces_by_edges(
-                    gray, img_area, adaptive_min_ratio * 0.3, adaptive_max_ratio, padding,
-                    canny_thresh1, canny_thresh2
-                )
-                all_bboxes_low.extend(bboxes)
-        
-        # 合并所有检测结果
-        all_bboxes_low.extend(selected_bboxes)
-        selected_bboxes_low = _nms_bboxes(all_bboxes_low, min_distance * 0.3, w_img, h_img)
-        if len(selected_bboxes_low) > len(selected_bboxes):
-            selected_bboxes = selected_bboxes_low
     
     # 按x坐标排序（从左到右）
     selected_bboxes.sort(key=lambda b: b[0])
@@ -1671,6 +1713,8 @@ def detect_multiple_workpiece_bboxes(
             if need_align:
                 new_x = int(center_x - new_bw / 2)
                 new_y = int(center_y - new_bh / 2)
+                new_x = max(0, min(new_x, w_img - new_bw))
+                new_y = max(0, min(new_y, h_img - new_bh))
                 aligned_bboxes.append((new_x, new_y, new_bw, new_bh))
             else:
                 aligned_bboxes.append(bbox)
@@ -1718,10 +1762,11 @@ def _detect_workpieces_by_edges(
                 continue
             bbox = (x, y, bw, bh)
             if area_ratio > max_area_ratio * 0.8 and bw > 150 and bh > 150:
-                split = _watershed_split_bbox(
-                    gray, bbox, img_area, min_area_ratio, max_area_ratio, padding
-                )
-                bboxes.extend(split)
+                x1 = max(0, x - padding)
+                y1 = max(0, y - padding)
+                x2 = min(w, x + bw + padding)
+                y2 = min(h, y + bh + padding)
+                bboxes.append((x1, y1, x2 - x1, y2 - y1))
             else:
                 x1 = max(0, x - padding)
                 y1 = max(0, y - padding)
@@ -1775,10 +1820,11 @@ def _detect_workpieces_by_threshold(
                 x, y, bw, bh = cv2.boundingRect(cnt)
                 bbox = (x, y, bw, bh)
                 if area_ratio > max_area_ratio * 0.8 and bw > 150 and bh > 150:
-                    split = _watershed_split_bbox(
-                        gray, bbox, img_area, min_area_ratio, max_area_ratio, padding
-                    )
-                    bboxes.extend(split)
+                    x1 = max(0, x - padding)
+                    y1 = max(0, y - padding)
+                    x2 = min(w, x + bw + padding)
+                    y2 = min(h, y + bh + padding)
+                    bboxes.append((x1, y1, x2 - x1, y2 - y1))
                 else:
                     x1 = max(0, x - padding)
                     y1 = max(0, y - padding)
@@ -1789,75 +1835,79 @@ def _detect_workpieces_by_threshold(
     return bboxes
 
 
-def _watershed_split_bbox(
-    gray: np.ndarray,
+def _cluster_split_by_ratio(
     bbox: Tuple[int, int, int, int],
     img_area: float,
-    min_area_ratio: float,
-    max_area_ratio: float,
+    ref_workpiece_size: Tuple[int, int],
     padding: int,
-    watershed_min_distance: int = 60,
+    min_area_ratio: float,
+    split_threshold_ratio: float = 1.8,
 ) -> List[Tuple[int, int, int, int]]:
     """
-    使用分水岭算法拆分可能包含多个工件的bbox
+    连通域比例切割法（Cluster Splitting）
+    当连通域面积超过 split_threshold_ratio * ref_area 时，
+    利用已知参考工件尺寸对该连通域进行数学等分切割。
+
+    适用于：排列整齐、形状固定但边缘有微小粘连的刚性工件。
 
     Args:
-        gray: 灰度图像
-        bbox: 要拆分的bbox (x, y, w, h)
+        bbox: 待切割的大连通域 (x, y, w, h)
         img_area: 图像总面积
-        min_area_ratio: 最小面积比例
-        max_area_ratio: 最大面积比例
+        ref_workpiece_size: 参考工件尺寸 (width, height)
         padding: 边界扩展像素
-        watershed_min_distance: 分水岭最小峰间距
+        min_area_ratio: 最小面积比例（用于过滤）
+        split_threshold_ratio: 触发切割的面积倍数阈值（默认1.8）
 
     Returns:
-        拆分后的bbox列表
+        切割后的bbox列表
     """
     x, y, bw, bh = bbox
-    roi = gray[y:y+bh, x:x+bw]
-    roi_h, roi_w = roi.shape
+    h, w = bh, bw
+    cluster_area = bw * bh
+    ref_w, ref_h = ref_workpiece_size
+    ref_area = ref_w * ref_h
+    cluster_area_ratio = cluster_area / img_area
+    ref_area_ratio = ref_area / img_area
 
-    mask = np.zeros((roi_h, roi_w), dtype=np.uint8)
-    _, binary = cv2.threshold(roi, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    mask = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)), iterations=3)
+    ratio = cluster_area_ratio / ref_area_ratio
 
-    dist = cv2.distanceTransform(mask, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
-    dist_norm = cv2.normalize(dist, None, 0, 1.0, cv2.NORM_MINMAX)
-
-    coords = peak_local_max(
-        dist_norm,
-        min_distance=max(20, watershed_min_distance // 3),
-        threshold_rel=0.3,
-        labels=mask,
-    )
-
-    if len(coords) < 2:
+    if ratio < split_threshold_ratio:
         return [bbox]
 
-    markers = np.zeros((roi_h, roi_w), dtype=np.int32)
-    for idx, (row, col) in enumerate(coords, start=1):
-        markers[row, col] = idx
+    n_pieces = int(round(ratio))
+    n_pieces = max(2, min(n_pieces, 8))
 
-    labels = watershed(-dist, markers, mask=mask, watershed_line=True)
+    logger.info(f"[_cluster_split_by_ratio] 触发切割: ratio={ratio:.2f}x, 切割为 {n_pieces} 个工件")
+    logger.info(f"  原始cluster bbox=({x},{y},{bw},{bh}), 面积比例={cluster_area_ratio:.2%}")
 
     split_bboxes = []
-    h, w = gray.shape
-    for label_id in np.unique(labels):
-        if label_id <= 0:
-            continue
-        component_mask = (labels == label_id).astype(np.uint8) * 255
-        contours, _ = cv2.findContours(component_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            area_ratio = area / img_area
-            if min_area_ratio <= area_ratio <= max_area_ratio:
-                cx, cy, cw, ch = cv2.boundingRect(cnt)
-                x1 = max(0, x + cx - padding)
-                y1 = max(0, y + cy - padding)
-                x2 = min(w, x + cx + cw + padding)
-                y2 = min(h, y + cy + ch + padding)
-                split_bboxes.append((x1, y1, x2 - x1, y2 - y1))
 
+    overlap = 5
+    piece_width = bw // n_pieces
+    if piece_width < ref_w * 0.5:
+        piece_width = int(ref_w * 0.6)
+
+    for i in range(n_pieces):
+        px = x + i * (piece_width - overlap)
+        if px + piece_width > x + bw:
+            px = x + bw - piece_width
+        py = y
+        pw = piece_width
+        ph = bh
+
+        piece_area = pw * ph
+        piece_area_ratio = piece_area / img_area
+
+        if piece_area_ratio < min_area_ratio:
+            continue
+
+        px1 = max(0, px - padding)
+        py1 = max(0, py - padding)
+        px2 = min(w, px + pw + padding)
+        py2 = min(h, py + ph + padding)
+        split_bboxes.append((px1, py1, px2 - px1, py2 - py1))
+
+    logger.info(f"[_cluster_split_by_ratio] 切割后得到 {len(split_bboxes)} 个bbox")
     return split_bboxes if split_bboxes else [bbox]
 
 
@@ -1937,8 +1987,6 @@ def _detect_workpieces_by_template_matching(
 import cv2
 import numpy as np
 from scipy import ndimage as ndi
-from skimage.segmentation import watershed
-from skimage.feature import peak_local_max
 from typing import List, Tuple, Optional
 
 
@@ -1946,7 +1994,6 @@ class WorkpieceDetector:
     """
     主策略：背景差分（稳定、抗高光）
     兜底策略：高光感知阈值（无参考图时使用）
-    新增：距离变换 + 分水岭，解决工件靠近/重叠粘连问题
     """
 
     def __init__(
@@ -1954,21 +2001,12 @@ class WorkpieceDetector:
         min_width: int = 100,
         min_height: int = 50,
         aspect_ratio_range: Tuple[float, float] = (0.15, 6.5),
-        # ── 分水岭相关参数 ──────────────────────────────
-        # 峰值间最小像素距离，建议设为单个工件短边的 40%～60%
-        # 太小 → 一个工件被过度分割；太大 → 靠近的工件仍粘连
-        watershed_min_distance: int = 10,
-        # 是否对"过大"连通域强制执行分水岭（省算力）
-        # 设为 None 则对所有连通域执行
-        watershed_area_trigger_ratio: float = 0.01,
     ):
         self.background: Optional[np.ndarray] = None
         self.bg_blur_ksize = 5
         self.min_width = min_width
         self.min_height = min_height
         self.aspect_ratio_range = aspect_ratio_range
-        self.watershed_min_distance = watershed_min_distance
-        self.watershed_area_trigger_ratio = watershed_area_trigger_ratio
 
     # ──────────────────────────────────────────────
     # 公开接口
@@ -1993,65 +2031,14 @@ class WorkpieceDetector:
         else:
             fg_mask = self._highlight_aware_threshold(gray)
 
-        # ★ 新增：分水岭分割，再提取 bbox
-        split_mask = self._watershed_split(fg_mask, img_area)
+        fg_pixels = cv2.countNonZero(fg_mask)
+        logger.info(f"[WorkpieceDetector.detect] 前景掩码: {fg_pixels} 像素 ({fg_pixels/img_area:.2%} of image)")
 
         bboxes = self._extract_bboxes(
-            split_mask, gray, img_area, min_area_ratio, max_area_ratio, padding
+            fg_mask, gray, img_area, min_area_ratio, max_area_ratio, padding
         )
+        logger.info(f"[WorkpieceDetector.detect] 提取到 {len(bboxes)} 个bbox (过滤后)")
         return _nms(bboxes, iou_threshold=0.3)
-
-    # ──────────────────────────────────────────────
-    # ★ 核心新增：距离变换 + 分水岭
-    # ──────────────────────────────────────────────
-
-    def _watershed_split(self, mask: np.ndarray, img_area: float) -> np.ndarray:
-        """
-        对前景掩码执行分水岭分割，将粘连/重叠的工件分开。
-
-        流程：
-          1. 距离变换 → 得到每个前景像素到背景的最短距离
-          2. 寻找距离图中的局部极值峰 → 每个峰对应一个独立工件的"核心"
-          3. 以峰为种子点执行分水岭 → 沿"山谷"切割粘连区域
-          4. 把分水岭标签图作为新的连通域掩码返回
-        """
-        # Step 1：距离变换
-        # DIST_L2：欧式距离；DIST_MASK_PRECISE：精确计算
-        dist = cv2.distanceTransform(mask, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
-
-        # 归一化方便调试（不影响峰值检测）
-        dist_norm = cv2.normalize(dist, None, 0, 1.0, cv2.NORM_MINMAX)
-
-        # Step 2：寻找局部极值峰（每个工件中心）
-        # min_distance 决定两个峰至少间隔多少像素才算独立工件
-        # threshold_rel=0.3 表示峰值至少为最大峰值的 30%，滤除噪点小峰
-        coords = peak_local_max(
-            dist_norm,
-            min_distance=self.watershed_min_distance,
-            threshold_rel=0.3,
-            labels=mask,   # 只在前景内寻找
-        )
-
-        if len(coords) == 0:
-            # 没找到任何峰（mask 本身为空），直接返回原 mask
-            return mask
-
-        # Step 3：构造种子标签图
-        markers = np.zeros(mask.shape, dtype=np.int32)
-        for idx, (row, col) in enumerate(coords, start=1):
-            markers[row, col] = idx
-
-        # 用距离图的负值作为"地形"（峰→谷，符合分水岭语义）
-        # watershed 要求输入为 uint8 或 int32；用负距离图使峰成为"盆地"
-        labels = watershed(-dist, markers, mask=mask, watershed_line=True)
-        # watershed_line=True：在分割线处像素值=0，天然切断粘连
-
-        # Step 4：将标签图转换回二值掩码
-        # 每个非零标签区域 = 独立工件；分水岭线(0)自动隔离粘连
-        split_mask = np.zeros_like(mask, dtype=np.uint8)
-        split_mask[labels > 0] = 255
-
-        return split_mask
 
     # ──────────────────────────────────────────────
     # 策略1：背景差分
@@ -2123,26 +2110,39 @@ class WorkpieceDetector:
         bboxes = []
         aspect_min, aspect_max = self.aspect_ratio_range
 
+        logger.info(f"[_extract_bboxes] 发现 {num_labels - 1} 个连通域")
         for i in range(1, num_labels):
             x, y, bw, bh, area = stats[i]
-            if not (min_area_ratio <= area / img_area <= max_area_ratio):
-                continue
-            if bw < self.min_width or bh < self.min_height:
-                continue
-            if not (aspect_min <= bw / max(bh, 1) <= aspect_max):
-                continue
-            roi_mask = (labels == i).astype(np.uint8) * 255
-            cnts, _ = cv2.findContours(roi_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if cnts:
-                hull_area = cv2.contourArea(cv2.convexHull(cnts[0]))
-                if hull_area > 0 and (area / hull_area) < 0.35:
-                    continue
+            area_ratio = area / img_area
+            aspect = bw / max(bh, 1)
 
-            x1 = max(0, x - padding)
-            y1 = max(0, y - padding)
-            x2 = min(w, x + bw + padding)
-            y2 = min(h, y + bh + padding)
-            bboxes.append((x1, y1, x2 - x1, y2 - y1))
+            reason = None
+            if not (min_area_ratio <= area_ratio <= max_area_ratio):
+                if area_ratio < min_area_ratio:
+                    reason = f"面积比例 {area_ratio:.2%} < 最小阈值 {min_area_ratio:.2%}"
+                else:
+                    reason = f"面积比例 {area_ratio:.2%} > 最大阈值 {max_area_ratio:.2%}"
+            elif bw < self.min_width or bh < self.min_height:
+                reason = f"尺寸 ({bw}x{bh}) < 最小尺寸 ({self.min_width}x{self.min_height})"
+            elif not (aspect_min <= aspect <= aspect_max):
+                reason = f"长宽比 {aspect:.2f} 不在范围 [{aspect_min:.2f}, {aspect_max:.2f}]"
+            else:
+                roi_mask = (labels == i).astype(np.uint8) * 255
+                cnts, _ = cv2.findContours(roi_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if cnts:
+                    hull_area = cv2.contourArea(cv2.convexHull(cnts[0]))
+                    if hull_area > 0 and (area / hull_area) < 0.35:
+                        reason = f"填充率 {area/hull_area:.2%} < 35%"
+
+            if reason:
+                logger.info(f"  连通域[{i}]: ({x},{y},{bw},{bh}), 面积={area_ratio:.2%}, 长宽比={aspect:.2f} -> ❌ 过滤: {reason}")
+            else:
+                logger.info(f"  连通域[{i}]: ({x},{y},{bw},{bh}), 面积={area_ratio:.2%}, 长宽比={aspect:.2f} -> ✅ 通过")
+                x1 = max(0, x - padding)
+                y1 = max(0, y - padding)
+                x2 = min(w, x + bw + padding)
+                y2 = min(h, y + bh + padding)
+                bboxes.append((x1, y1, x2 - x1, y2 - y1))
 
         return bboxes
 
@@ -2914,23 +2914,17 @@ def detect_multiple_workpieces(
             
             local_monitor.end_step(f"workpiece_{wp_id}_inference")
             
-            # bbox_in_pred 现在已经是相对于全图的坐标了（在 detect_with_template_coords 中已转换）
-            # 但 workpiece_image 是裁剪后的图像，所以坐标需要加上裁剪偏移量 wx, wy
             results = single_result.get("results", [])
-            logger.info(f"[{request_id}] 工件 {wp_id} 坐标转换: 工件bbox=({wx},{wy},{ww},{wh}), 结果数={len(results)}")
             
             for r_idx, r in enumerate(results):
-                # bbox_in_pred 已经是相对于 workpiece_image 在全图中位置的坐标
-                # 需要加上工件在全图中的偏移量 wx, wy
+
                 if "bbox_in_pred" in r:
                     bx, by, bw, bh = r["bbox_in_pred"]
                     # 确保坐标是数值类型
                     bx, by, bw, bh = float(bx), float(by), float(bw), float(bh)
                     orig_bbox = [bx, by, bw, bh]
                     r["bbox_in_pred"] = [bx + wx, by + wy, bw, bh]
-                    logger.info(f"[{request_id}] 工件 {wp_id} ROI {r_idx}: bbox_in_pred 原始={orig_bbox}, 转换后={r['bbox_in_pred']}")
                 
-                # 转换segmentation_in_pred到全图坐标
                 if "segmentation_in_pred" in r and r["segmentation_in_pred"]:
                     seg = r["segmentation_in_pred"]
                     orig_seg = seg.copy()
@@ -2939,9 +2933,7 @@ def detect_multiple_workpieces(
                         float(v) + (wx if i % 2 == 0 else wy)
                         for i, v in enumerate(seg)
                     ]
-                    logger.info(f"[{request_id}] 工件 {wp_id} ROI {r_idx}: segmentation 原始前4个={orig_seg[:4]}, 转换后={r['segmentation_in_pred'][:4]}")
                 
-                # 同时转换 bbox_clipped（如果有的话）
                 if "bbox_clipped" in r:
                     bc = r["bbox_clipped"]
                     if isinstance(bc, (list, tuple)) and len(bc) >= 4:
@@ -2976,7 +2968,6 @@ def detect_multiple_workpieces(
     # 3. 合并可视化结果
     visualization = None
     if return_visualization and all_visualizations:
-        # 将所有工件的可视化结果拼接
         visualization = create_multi_workpiece_visualization(
             image, workpiece_results, workpiece_bboxes, request_id
         )
@@ -3381,22 +3372,7 @@ def create_multi_workpiece_visualization(
 # ─────────────────────────────────────────────────────────────────────────────
 
 MODELS:               Dict[str, Any]                   = {}
-MODEL_PATHS                                            = {
-    "1": "output/19/eb19ba29/1",
-    "1_type": "patchcore",
-    "2": "output/19/eb19ba29/2",
-    "2_type": "patchcore",
-    "3": "output/19/eb19ba29/3",
-    "3_type": "patchcore",
-    "4": "output/19/eb19ba29/4",
-    "4_type": "patchcore",
-    "5": "output/19/eb19ba29/5",
-    "5_type": "patchcore",
-    "6": "output/19/eb19ba29/6",
-    "6_type": "patchcore",
-    "7": "output/19/eb19ba29/7",
-    "7_type": "patchcore"
-}
+MODEL_PATHS                                            = {{ models_config | tojson(indent=4) }}
 PATCHCORE_DETECTOR:   Optional[MultiPatchCoreDetector] = None
 TEMPLATE_IMAGE:       Optional[np.ndarray]             = None
 TEMPLATE_ANNOTATIONS: List[Dict[str, Any]]             = []
@@ -3462,7 +3438,10 @@ def load_models():
         }
         logger.info(f"Loaded PatchCore models: {list(MODELS.keys())}")
 
-    annotations_path = Path("product/19/train/eb19ba29/annotations.json") if "product/19/train/eb19ba29/annotations.json" else None
+    if "{{ annotations_path }}":
+        annotations_path = Path("{{ annotations_path }}")
+    else:
+        annotations_path = Path("product/{{ project_id }}/train/{{ task_uuid }}/annotations.json")
     if annotations_path and annotations_path.exists():
         tpl_path, tpl_anns = select_best_template_from_annotations(str(annotations_path))
         if tpl_path:
@@ -3501,9 +3480,9 @@ async def startup_event():
 async def health_check():
     return {
         "status":        "healthy",
-        "service_id":    "svc_1775102290_e41431d3",
-        "project_id":    "11",
-        "task_uuid":     "eb19ba29",
+        "service_id":    "{{ service_id }}",
+        "project_id":    "{{ project_id }}",
+        "task_uuid":     "{{ task_uuid }}",
         "loaded_models": list(MODELS.keys()),
         "total_models":  len(MODELS),
         "gpu_memory":    _get_gpu_memory_info(),
@@ -4219,9 +4198,9 @@ signal.signal(signal.SIGTERM, signal_handler)
 if __name__ == "__main__":
     logger.info("=" * 60)
     logger.info("Starting inference service")
-    logger.info(f"Port:    9795")
-    logger.info(f"Project: 11")
-    logger.info(f"UUID:    eb19ba29")
+    logger.info(f"Port:    {{ port }}")
+    logger.info(f"Project: {{ project_id }}")
+    logger.info(f"UUID:    {{ task_uuid }}")
     logger.info(f"Timeout: {INFERENCE_TIMEOUT_SEC}s")
     logger.info(f"Log:     {LOG_FILE}")
     logger.info("=" * 60)
@@ -4229,7 +4208,7 @@ if __name__ == "__main__":
     uvicorn.run(
         app,
         host="0.0.0.0",
-        port=9795,
+        port={{ port }},
         log_config=None,
         access_log=True,
     )

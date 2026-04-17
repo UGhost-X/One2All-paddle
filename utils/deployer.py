@@ -12,6 +12,7 @@ import threading
 import random
 import logging
 import shutil
+import socket
 from pathlib import Path
 from typing import Dict, Optional, List
 from dataclasses import dataclass, asdict, field
@@ -98,19 +99,15 @@ class ModelDeployer:
             return False
     
     def _allocate_port(self) -> int:
-        for _ in range(100):
-            port = random.randint(self.base_port, self.max_port)
-            if port not in self.port_index:
-                return port
-        raise RuntimeError("No available port for deployment")
+        """使用 socket 让系统自动分配可用端口"""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(('', 0))
+            return s.getsockname()[1]
     
     def _find_models(self, project_id: str, task_uuid: str) -> Dict[str, str]:
         """
         查找模型路径
-        支持新的统一结构: {output_dir}/{project_id}/{task_uuid}/best_model/
-        兼容旧结构: {output_dir}/{project_id}/{task_uuid}/{label}/best_model/
-        支持扁平结构: {output_dir}/{project_id}/{task_uuid}/{label}/model.pdparams
-        支持 Paddle 模型 (.pdparams)
         支持 PatchCore 模型 (memory_bank.npz 或 patchcore_model.pt)
         """
         models = {}
@@ -143,21 +140,6 @@ class ModelDeployer:
                 models["multi_position"] = str(base_path)
                 models["_labels"] = labels
                 models["_model_type"] = "patchcore"
-            else:
-                best_model_path = base_path / "best_model"
-                has_pdparams = (best_model_path / "model.pdparams").exists()
-
-                if has_pdparams:
-                    labels = []
-                    try:
-                        with open(labels_file, "r") as f:
-                            labels = [line.strip() for line in f if line.strip()]
-                    except:
-                        pass
-
-                    models["multi_position"] = str(best_model_path)
-                    models["_labels"] = labels
-                    models["_model_type"] = "paddle"
         else:
             for label_dir in base_path.iterdir():
                 if not label_dir.is_dir():
@@ -172,52 +154,8 @@ class ModelDeployer:
                 if (has_patchcore_model or has_memory_bank) and has_config:
                     models[label_dir.name] = str(label_dir)
                     models[f"{label_dir.name}_type"] = "patchcore"
-                    continue
-
-                has_pdparams_flat = (label_dir / "model.pdparams").exists()
-                has_config_flat = (label_dir / "config.json").exists()
-
-                best_model_path = label_dir / "best_model"
-                has_pdparams = (best_model_path / "model.pdparams").exists()
-
-                if has_pdparams_flat or (has_pdparams and has_config_flat):
-                    models[label_dir.name] = str(label_dir)
-                    models[f"{label_dir.name}_type"] = "paddle"
-                elif has_pdparams:
-                    models[label_dir.name] = str(best_model_path)
-                    models[f"{label_dir.name}_type"] = "paddle"
 
         return models
-    
-    def _find_multi_workpiece_template(self, project_id: str, task_uuid: str) -> str:
-        """
-        查找多工件模板图像路径。
-        路径格式: product/{project_id}/train/{task_uuid}/工件主体/{pos_id}/raw_image_{image_id}_ann{annotation_id}.png
-        
-        Returns:
-            模板图像路径，如果未找到则返回空字符串
-        """
-        base_dir = Path("product") / str(project_id) / "train" / task_uuid
-        
-        # 检查工件主体目录是否存在
-        workpiece_dir = base_dir / "工件主体"
-        if not workpiece_dir.exists():
-            logger.warning(f"工件主体目录不存在: {workpiece_dir}")
-            return ""
-        
-        # 遍历工件主体下的所有子目录（pos_id）
-        for pos_dir in sorted(workpiece_dir.iterdir()):
-            if not pos_dir.is_dir():
-                continue
-            
-            # 查找 raw_image_*_ann*.png 文件
-            for img_file in pos_dir.glob("raw_image_*_ann*.png"):
-                if img_file.exists():
-                    logger.info(f"Found multi-workpiece template: {img_file}")
-                    return str(img_file.absolute())
-        
-        logger.warning(f"No multi-workpiece template found in: {workpiece_dir}")
-        return ""
     
     def _create_inference_service(self, service: DeployService) -> str:
         """使用 Jinja2 模板生成推理服务脚本"""
@@ -236,11 +174,6 @@ class ModelDeployer:
         else:
             logger.warning(f"Annotations file not found: {annotations_path}")
         
-        # 查找多工件模板路径
-        multi_workpiece_template = self._find_multi_workpiece_template(
-            service.project_id, service.task_uuid
-        )
-        
         # 渲染模板
         script_content = template.render(
             service_id=service.service_id,
@@ -249,8 +182,7 @@ class ModelDeployer:
             labels=service.labels,
             port=service.port,
             models_config=service.model_paths,
-            annotations_path=annotations_path_str,
-            multi_workpiece_template=multi_workpiece_template
+            annotations_path=annotations_path_str
         )
         
         script_path = Path(self.scripts_dir) / f"service_{service.service_id}.py"
@@ -261,14 +193,15 @@ class ModelDeployer:
         return str(script_path)
     
     def deploy_service(
-        self, 
-        project_id: str, 
+        self,
+        project_id: str,
         task_uuid: str,
         port: Optional[int] = None
     ) -> Dict:
+        logger.info(f"deploy_service called: project_id={project_id}, task_uuid={task_uuid}, port={port}")
+
+        # 步骤1: 在锁内检查已有服务
         with self._lock:
-            logger.info(f"deploy_service called: project_id={project_id}, task_uuid={task_uuid}, port={port}")
-            
             if task_uuid in self.uuid_index:
                 existing_sid = self.uuid_index[task_uuid]
                 existing = self.services.get(existing_sid)
@@ -281,17 +214,20 @@ class ModelDeployer:
                         "labels": existing.labels,
                         "message": "Service already running for this task_uuid"
                     }
-            
-            model_paths = self._find_models(project_id, task_uuid)
-            logger.info(f"_find_models returned: {model_paths}")
-            if not model_paths:
-                return {
-                    "status": "error",
-                    "message": f"No models found: project={project_id}, uuid={task_uuid}"
-                }
-            
+
+        # 步骤2: I/O 操作在锁外执行
+        model_paths = self._find_models(project_id, task_uuid)
+        logger.info(f"_find_models returned: {model_paths}")
+        if not model_paths:
+            return {
+                "status": "error",
+                "message": f"No models found: project={project_id}, uuid={task_uuid}"
+            }
+
+        # 步骤3: 在锁内分配端口和创建服务记录
+        with self._lock:
             service_id = f"svc_{int(time.time())}_{task_uuid}"
-            
+
             if port:
                 if port in self.port_index:
                     return {
@@ -300,13 +236,13 @@ class ModelDeployer:
                     }
             else:
                 port = self._allocate_port()
-            
+
             # 过滤掉特殊键，只保留实际的 label
             special_keys = {'_labels', '_model_type'}
             label_keys = [k for k in model_paths.keys() if not k.endswith('_type') and k not in special_keys]
             logger.info(f"label_keys: {label_keys}")
-            
-            service=DeployService(
+
+            service = DeployService(
                 service_id=service_id,
                 project_id=project_id,
                 task_uuid=task_uuid,
@@ -317,76 +253,85 @@ class ModelDeployer:
                 created_at=time.time(),
                 inference_url=f"http://0.0.0.0:{port}"
             )
-            
+
+            # 预先注册服务，防止并发冲突
+            self.services[service_id] = service
+            self.port_index[port] = service_id
+            self.uuid_index[task_uuid] = service_id
+
+        # 步骤4: I/O 操作在锁外执行
+        try:
             script_path = self._create_inference_service(service)
-            
+
             log_dir = Path(self.output_dir) / "logs"
             log_dir.mkdir(exist_ok=True)
             stdout_file = log_dir / f"service_{service_id}.stdout.log"
             stderr_file = log_dir / f"service_{service_id}.stderr.log"
-            
+
             import sys
-            try:
-                proc = subprocess.Popen(
-                    [sys.executable, script_path],
-                    stdout=open(stdout_file, "w"),
-                    stderr=open(stderr_file, "w"),
-                    start_new_session=True,
-                    cwd=os.getcwd()
-                )
-                logger.info(f"Popen succeeded: pid={proc.pid}")
-                
-                time.sleep(2)
-                
-                poll_result = proc.poll()
-                if poll_result is not None:
-                    if proc.stdout:
-                        proc.stdout.close()
-                    if proc.stderr:
-                        proc.stderr.close()
-                    service.status = ServiceStatus.FAILED.value
-                    service.error = f"Process terminated immediately with code {poll_result}"
-                    self.services[service_id] = service
-                    self._save_state()
-                    return {
-                        "status": "error",
-                        "message": f"Service process terminated immediately. Check logs: {stderr_file}",
-                        "stderr_file": str(stderr_file),
-                        "stdout_file": str(stdout_file)
-                    }
-                
+            proc = subprocess.Popen(
+                [sys.executable, script_path],
+                stdout=open(stdout_file, "w"),
+                stderr=open(stderr_file, "w"),
+                start_new_session=True,
+                cwd=os.getcwd()
+            )
+            logger.info(f"Popen succeeded: pid={proc.pid}")
+
+            time.sleep(2)
+
+            poll_result = proc.poll()
+            if poll_result is not None:
                 if proc.stdout:
                     proc.stdout.close()
                 if proc.stderr:
                     proc.stderr.close()
+
+                # 步骤5: 在锁内更新失败状态
+                with self._lock:
+                    service.status = ServiceStatus.FAILED.value
+                    service.error = f"Process terminated immediately with code {poll_result}"
+                    self._save_state()
+
+                return {
+                    "status": "error",
+                    "message": f"Service process terminated immediately. Check logs: {stderr_file}",
+                    "stderr_file": str(stderr_file),
+                    "stdout_file": str(stdout_file)
+                }
+
+            if proc.stdout:
+                proc.stdout.close()
+            if proc.stderr:
+                proc.stderr.close()
+
+            # 步骤6: 在锁内更新成功状态
+            with self._lock:
                 service.pid = proc.pid
                 service.status = ServiceStatus.RUNNING.value
                 logger.info(f"Service started successfully: pid={service.pid}, service_id={service_id}")
-                
-                self.services[service_id] = service
-                self.port_index[port] = service_id
-                self.uuid_index[task_uuid] = service_id
                 self._save_state()
-                
-                return {
-                    "status": "success",
-                    "service_id": service_id,
-                    "port": port,
-                    "inference_url": service.inference_url,
-                    "pid": service.pid,
-                    "labels": service.labels,
-                    "model_count": len(model_paths)
-                }
-            except Exception as e:
+
+            return {
+                "status": "success",
+                "service_id": service_id,
+                "port": port,
+                "inference_url": service.inference_url,
+                "pid": service.pid,
+                "labels": service.labels,
+                "model_count": len(model_paths)
+            }
+        except Exception as e:
+            # 步骤7: 在锁内更新失败状态
+            with self._lock:
                 service.status = ServiceStatus.FAILED.value
                 service.error = str(e)
-                self.services[service_id] = service
                 self._save_state()
-                
-                return {
-                    "status": "error",
-                    "message": f"Failed to start service: {str(e)}"
-                }
+
+            return {
+                "status": "error",
+                "message": f"Failed to start service: {str(e)}"
+            }
     
     def stop_service(self, service_id: str) -> Dict:
         with self._lock:
