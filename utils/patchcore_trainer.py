@@ -136,6 +136,9 @@ class PatchCoreDataset(Dataset):
     def _build_augment_transform(self):
         """构建增强变换 pipeline - 使用 Compose 减少 Python 函数调用开销"""
         return transforms.Compose([
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomVerticalFlip(p=0.5),
+            transforms.RandomRotation(degrees=20, fill=0),
             transforms.ColorJitter(brightness=0.2, contrast=0.2),
         ])
 
@@ -833,13 +836,8 @@ class PatchCoreTrainer:
                 batch_size, channels, height, width = embedding.shape
                 embedding_reshaped = embedding.permute(0, 2, 3, 1).reshape(-1, channels)
 
-                # 计算与memory bank的余弦距离
-                # 归一化特征向量
-                embedding_norm = F.normalize(embedding_reshaped, p=2, dim=1)
-                memory_bank_norm = F.normalize(model.memory_bank, p=2, dim=1)
-                # 计算余弦相似度并转换为距离
-                similarity = torch.mm(embedding_norm, memory_bank_norm.t())
-                distances = 1 - similarity
+                # 计算与memory bank的距离
+                distances = torch.cdist(embedding_reshaped, model.memory_bank)
 
                 # 取k+1个最近邻（包含自身），然后排除第一个（自身距离≈0）
                 top_k_plus_1_distances, _ = torch.topk(

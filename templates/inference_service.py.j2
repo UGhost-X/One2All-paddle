@@ -16,8 +16,7 @@ from pathlib import Path
 from datetime import datetime
 from contextlib import contextmanager
 
-
-# 添加项目根目录到 sys.path（当前文件在 inference_services/ 目录下）
+# 导入 TurboJPEG 解码工具
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from utils.image_decoder import decode_image, is_turbo_jpeg_available
 
@@ -46,19 +45,10 @@ def get_workpiece_area_ratio_range(
 
 
 class ExecutorManager:
-    """线程池管理器，支持健康检查和智能重建。"""
-
-    # 健康检查阈值
-    MAX_CONSECUTIVE_FAILURES = 3  # 连续失败次数阈值
-    FAILURE_WINDOW_SECONDS = 60   # 失败计数窗口（秒）
-
     def __init__(self, max_workers: int = 1):
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._max_workers = max_workers
         self._lock: Optional[asyncio.Lock] = None
-        self._failure_count = 0
-        self._last_failure_time: Optional[float] = None
-        self._total_rebuilds = 0
 
     def init_lock(self):
         self._lock = asyncio.Lock()
@@ -67,69 +57,14 @@ class ExecutorManager:
     def executor(self) -> ThreadPoolExecutor:
         return self._executor
 
-    def record_failure(self, reason: str = "") -> bool:
-        """
-        记录一次失败，返回是否需要重建线程池。
-
-        Returns:
-            True: 达到重建阈值，需要重建
-            False: 未达到阈值，不需要重建
-        """
-        current_time = time.time()
-
-        # 检查是否在失败窗口内
-        if (self._last_failure_time is not None and
-            (current_time - self._last_failure_time) > self.FAILURE_WINDOW_SECONDS):
-            # 超过窗口期，重置计数
-            self._failure_count = 0
-            logger.info(f"[ExecutorManager] Failure window expired, resetting failure count")
-
-        self._failure_count += 1
-        self._last_failure_time = current_time
-
-        logger.warning(
-            f"[ExecutorManager] Failure recorded: {reason}, "
-            f"consecutive failures: {self._failure_count}/{self.MAX_CONSECUTIVE_FAILURES}"
-        )
-
-        # 达到阈值才需要重建
-        return self._failure_count >= self.MAX_CONSECUTIVE_FAILURES
-
-    def record_success(self):
-        """记录一次成功，重置失败计数。"""
-        if self._failure_count > 0:
-            logger.info(f"[ExecutorManager] Success recorded, resetting failure count from {self._failure_count}")
-            self._failure_count = 0
-            self._last_failure_time = None
-
     async def rebuild(self, reason: str = ""):
-        """
-        重建线程池。使用非阻塞方式关闭旧线程池。
-        """
         async with self._lock:
             old_executor = self._executor
             self._executor = ThreadPoolExecutor(max_workers=self._max_workers)
-            self._total_rebuilds += 1
-            self._failure_count = 0  # 重置失败计数
-
-            logger.warning(
-                f"[ExecutorManager] Rebuilding thread pool: {reason}, "
-                f"total rebuilds: {self._total_rebuilds}"
-            )
-
-            # 非阻塞方式关闭旧线程池（wait=False）
+            if reason:
+                logger.warning(f"[ExecutorManager] Rebuilding thread pool: {reason}")
             loop = asyncio.get_running_loop()
-            loop.run_in_executor(None, old_executor.shutdown, False)
-
-    def get_health_status(self) -> Dict[str, Any]:
-        """获取线程池健康状态。"""
-        return {
-            "failure_count": self._failure_count,
-            "max_consecutive_failures": self.MAX_CONSECUTIVE_FAILURES,
-            "last_failure_time": self._last_failure_time,
-            "total_rebuilds": self._total_rebuilds,
-            "max_workers": self._max_workers,
-        }
+            loop.run_in_executor(None, old_executor.shutdown, True)
 
 
 _executor_manager = ExecutorManager(max_workers=4)
@@ -192,7 +127,6 @@ ROI_SAVE_DIR.mkdir(exist_ok=True)
 
 app = FastAPI(
     title="Inference Service",
-    description=f"Project: 11, UUID: d5f95c1a",
     version="1.0.0"
 )
 
@@ -277,26 +211,13 @@ def _get_gpu_memory_info() -> Dict[str, Any]:
 
 
 def chunked_cdist(x: torch.Tensor, y: torch.Tensor, chunk_size: int = 1024) -> torch.Tensor:
-    """
-    计算余弦距离（归一化后点积的负值）。
-    余弦距离 = 1 - cosine_similarity，范围 [0, 2]
-    """
-    # 归一化特征向量
-    x_norm = F.normalize(x, p=2, dim=1)
-    y_norm = F.normalize(y, p=2, dim=1)
-
-    n = x_norm.shape[0]
-    if n * y_norm.shape[0] < chunk_size * chunk_size * 4:
-        # 计算余弦相似度并转换为距离
-        similarity = torch.mm(x_norm, y_norm.t())
-        return 1 - similarity
-
+    n = x.shape[0]
+    if n * y.shape[0] < chunk_size * chunk_size * 4:
+        return torch.cdist(x, y)
     distances = []
     for i in range(0, n, chunk_size):
         end_i = min(i + chunk_size, n)
-        # 分批计算余弦相似度
-        similarity = torch.mm(x_norm[i:end_i], y_norm.t())
-        distances.append(1 - similarity)
+        distances.append(torch.cdist(x[i:end_i], y))
     return torch.cat(distances, dim=0)
 
 
@@ -531,19 +452,14 @@ class AnomalibPatchCoreWrapper:
                 # 批量计算所有样本与 memory_bank 的距离
                 memory_bank = self.model.memory_bank  # [M, C]
 
-                # 使用余弦距离分批计算，避免内存溢出
-                # 归一化特征向量
-                embeddings_flat_norm = F.normalize(embeddings_flat, p=2, dim=2)
-                memory_bank_norm = F.normalize(memory_bank, p=2, dim=1)
-
+                # 使用 chunked_cdist 分批计算距离，避免内存溢出
                 distances_list = []
                 chunk_size = 1024
-                for i in range(0, embeddings_flat_norm.shape[1], chunk_size):
-                    end_i = min(i + chunk_size, embeddings_flat_norm.shape[1])
-                    chunk = embeddings_flat_norm[:, i:end_i, :]  # [B, chunk_size, C]
-                    # 计算余弦相似度并转换为距离: [B, chunk_size, M]
-                    similarity = torch.bmm(chunk, memory_bank_norm.unsqueeze(0).expand(chunk.shape[0], -1, -1).transpose(1, 2))
-                    dist_chunk = 1 - similarity
+                for i in range(0, embeddings_flat.shape[1], chunk_size):
+                    end_i = min(i + chunk_size, embeddings_flat.shape[1])
+                    chunk = embeddings_flat[:, i:end_i, :]  # [B, chunk_size, C]
+                    # 计算距离: [B, chunk_size, M]
+                    dist_chunk = torch.cdist(chunk, memory_bank.unsqueeze(0))
                     distances_list.append(dist_chunk)
                 distances = torch.cat(distances_list, dim=1)  # [B, N_patches, M]
 
@@ -607,7 +523,7 @@ class AnomalibPatchCoreWrapper:
         memory_bank: torch.Tensor,
     ) -> torch.Tensor:
         """
-        根据 embedding 和 memory bank 计算异常分数（使用余弦距离）。
+        根据 embedding 和 memory bank 计算异常分数。
 
         Args:
             embeddings_flat: [B, N_patches, C] 展平后的 embedding
@@ -619,17 +535,7 @@ class AnomalibPatchCoreWrapper:
         try:
             num_neighbors = self.num_neighbors
 
-            # 归一化特征向量，计算余弦距离
-            embeddings_flat_norm = F.normalize(embeddings_flat, p=2, dim=2)
-            memory_bank_norm = F.normalize(memory_bank, p=2, dim=1)
-
-            # 计算余弦相似度并转换为距离
-            similarity = torch.bmm(
-                embeddings_flat_norm,
-                memory_bank_norm.unsqueeze(0).expand(embeddings_flat_norm.shape[0], -1, -1).transpose(1, 2)
-            )
-            distances = 1 - similarity
-
+            distances = torch.cdist(embeddings_flat, memory_bank.unsqueeze(0))
             topk_vals, _ = torch.topk(distances, k=num_neighbors + 1, largest=False, dim=2)
             patch_scores = topk_vals[:, :, 1:].mean(dim=2)
 
@@ -2830,13 +2736,13 @@ async def startup_event():
 @app.get("/health")
 async def health_check():
     return {
-        "status":        "healthy",
-        "service_id":    "{{ service_id }}",
-        "project_id":    "{{ project_id }}",
-        "task_uuid":     "{{ task_uuid }}",
+        "status": "healthy",
+        "service_id": "{{ service_id }}",
+        "project_id": "{{ project_id }}",
+        "task_uuid": "{{ task_uuid }}",
         "loaded_models": list(MODELS.keys()),
-        "total_models":  len(MODELS),
-        "gpu_memory":    _get_gpu_memory_info(),
+        "total_models": len(MODELS),
+        "gpu_memory": _get_gpu_memory_info(),
     }
 
 
@@ -2919,27 +2825,17 @@ async def predict_multiple(
                     timeout=INFERENCE_TIMEOUT_SEC * 3,
                 )
                 monitor.end_step("total_inference")
-                # 成功执行，重置失败计数
-                _executor_manager.record_success()
             except asyncio.TimeoutError:
                 monitor.end_step("total_inference")
                 logger.error(f"[{request_id}] 推理超时 ({INFERENCE_TIMEOUT_SEC * 3}s)")
                 _cleanup(f"[{request_id}] timeout")
-                # 记录失败，达到阈值才重建
-                should_rebuild = _executor_manager.record_failure(f"timeout [{request_id}]")
-                if should_rebuild:
-                    logger.error(f"[{request_id}] 连续失败次数达到阈值，重建线程池")
-                    await _executor_manager.rebuild(reason=f"consecutive timeouts [{request_id}]")
+                await _executor_manager.rebuild(reason=f"timeout [{request_id}]")
                 raise HTTPException(status_code=503, detail="Inference timeout, please retry")
             except Exception as exec_err:
                 monitor.end_step("total_inference")
                 logger.error(f"[{request_id}] Executor error: {exec_err}")
                 _cleanup(f"[{request_id}] executor error")
-                # 记录失败，达到阈值才重建
-                should_rebuild = _executor_manager.record_failure(f"executor error [{request_id}]")
-                if should_rebuild:
-                    logger.error(f"[{request_id}] 连续失败次数达到阈值，重建线程池")
-                    await _executor_manager.rebuild(reason=f"consecutive executor errors [{request_id}]")
+                await _executor_manager.rebuild(reason=f"executor error [{request_id}]")
                 raise
 
             wp_results_raw = detect_result["workpiece_results"]
@@ -2993,14 +2889,6 @@ signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 if __name__ == "__main__":
-    logger.info("=" * 60)
-    logger.info("Starting inference service")
-    logger.info(f"Port:    {{ port }}")
-    logger.info(f"Project: {{ project_id }}")
-    logger.info(f"UUID:    {{ task_uuid }}")
-    logger.info(f"Timeout: {INFERENCE_TIMEOUT_SEC}s")
-    logger.info(f"Log:     {LOG_FILE}")
-    logger.info("=" * 60)
 
     uvicorn.run(
         app,
