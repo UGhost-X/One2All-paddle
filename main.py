@@ -27,7 +27,6 @@ warnings.filterwarnings("ignore", category=UserWarning, message=".*ccache.*")
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 
-from utils.augmentation import DataAugmentor
 from utils.patchcore_trainer import PatchCoreTrainer
 from utils.deployer import ModelDeployer
 from dataclasses import asdict
@@ -69,12 +68,7 @@ app.include_router(camera_router)
 @app.on_event("startup")
 async def startup_event():
     """应用启动时执行"""
-    try:
-        from utils.template_matcher import template_matcher
-        loaded_count = template_matcher.auto_load_templates()
-        logger.info(f"Application started. Loaded {loaded_count} templates.")
-    except Exception as e:
-        logger.warning(f"Failed to auto-load templates: {e}")
+    logger.info("Application started.")
 
 
 class COCOAnnotation(BaseModel):
@@ -115,22 +109,7 @@ class COCOData(BaseModel):
     categories: Optional[List[COCOCategory]] = None
 
 
-class AugmentationConfig(BaseModel):
-    horizontal_flip: Optional[Dict[str, Any]] = None
-    vertical_flip: Optional[Dict[str, Any]] = None
-    rotate: Optional[Dict[str, Any]] = None
-    brightness: Optional[Dict[str, Any]] = None
-    contrast: Optional[Dict[str, Any]] = None
-    blur: Optional[Dict[str, Any]] = None
-    pitch: Optional[Dict[str, Any]] = None
-    yaw: Optional[Dict[str, Any]] = None
 
-
-class AugmentRequest(BaseModel):
-    image_base64: str
-    coco_data: COCOData
-    config: AugmentationConfig
-    num_results: Optional[int] = 1
 
 
 class TrainRequest(BaseModel):
@@ -906,65 +885,6 @@ async def delete_project_model(
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete model: {e}")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 数据增强接口
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.post("/augment")
-async def augment_data(request: AugmentRequest):
-    try:
-        img_data = base64.b64decode(request.image_base64)
-        nparr = np.frombuffer(img_data, np.uint8)
-        image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-
-        if image is None:
-            raise HTTPException(status_code=400, detail="Invalid image data")
-
-        annotations = [ann.dict(exclude_none=True) for ann in request.coco_data.annotations]
-        augmentor = DataAugmentor(config=request.config.dict(exclude_none=True))
-
-        results = []
-
-        if request.num_results > 1:
-            batch_results = augmentor.generate_batch(image, annotations, request.num_results)
-            for item in batch_results:
-                new_image = item["image"]
-                _, buffer = cv2.imencode(".jpg", new_image)
-                result_coco = request.coco_data.dict()
-                result_coco["annotations"] = item["annotations"]
-                if result_coco["images"]:
-                    h, w = new_image.shape[:2]
-                    for img in result_coco["images"]:
-                        img["width"] = w
-                        img["height"] = h
-                results.append({
-                    "image_base64": base64.b64encode(buffer).decode("utf-8"),
-                    "coco_data": result_coco,
-                    "params": item.get("params"),
-                })
-        else:
-            new_image, new_annotations = augmentor.apply(image, annotations)
-            _, buffer = cv2.imencode(".jpg", new_image)
-            result_coco = request.coco_data.dict()
-            result_coco["annotations"] = new_annotations
-            if result_coco["images"]:
-                h, w = new_image.shape[:2]
-                for img in result_coco["images"]:
-                    img["width"] = w
-                    img["height"] = h
-            results.append({
-                "image_base64": base64.b64encode(buffer).decode("utf-8"),
-                "coco_data": result_coco,
-            })
-
-        return {"total": len(results), "items": results}
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
