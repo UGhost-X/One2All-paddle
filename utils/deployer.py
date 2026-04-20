@@ -19,6 +19,7 @@ from dataclasses import dataclass, asdict, field
 from enum import Enum
 
 from jinja2 import Environment, FileSystemLoader
+from utils.config import get_output_dir, get_inference_scripts_dir, path_config
 
 logger = logging.getLogger(__name__)
 
@@ -43,18 +44,18 @@ class DeployService:
     inference_url: Optional[str] = None
 
 class ModelDeployer:
-    def __init__(self, output_dir: str = "output", scripts_dir: str = "inference_services"):
-        self.output_dir = output_dir
-        self.scripts_dir = scripts_dir
+    def __init__(self, output_dir: str = None, scripts_dir: str = None):
+        self.output_dir = str(output_dir) if output_dir else str(get_output_dir())
+        self.scripts_dir = str(scripts_dir) if scripts_dir else str(get_inference_scripts_dir())
         self.services: Dict[str, DeployService] = {}
         self.port_index: Dict[int, str] = {}
         self.uuid_index: Dict[str, str] = {}
-        self.state_file = str(Path(output_dir) / "_deploy_services.json")
+        self.state_file = str(Path(self.output_dir) / "_deploy_services.json")
         self._lock = threading.Lock()
         self.base_port = 9000
         self.max_port = 9999
-        Path(output_dir).mkdir(parents=True, exist_ok=True)
-        Path(scripts_dir).mkdir(parents=True, exist_ok=True)
+        Path(self.output_dir).mkdir(parents=True, exist_ok=True)
+        Path(self.scripts_dir).mkdir(parents=True, exist_ok=True)
         self._load_state()
     
     def _load_state(self):
@@ -165,9 +166,9 @@ class ModelDeployer:
         template = env.get_template("inference_service.py.j2")
         
         # 构建 annotations.json 路径
-        # 路径格式: product/{project_id}/train/{task_uuid}/annotations.json
-        annotations_path = Path("product") / str(service.project_id) / "train" / service.task_uuid / "annotations.json"
-        annotations_path_str = str(annotations_path.absolute()) if annotations_path.exists() else ""
+        # 路径格式: {PRODUCT_DIR}/{project_id}/train/{task_uuid}/annotations.json
+        annotations_path = path_config.get_project_product_path(service.project_id, service.task_uuid) / "annotations.json"
+        annotations_path_str = str(annotations_path) if annotations_path.exists() else ""
         
         if annotations_path.exists():
             logger.info(f"Found annotations file: {annotations_path_str}")

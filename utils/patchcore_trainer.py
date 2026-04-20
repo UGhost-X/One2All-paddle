@@ -18,11 +18,25 @@ from typing import List, Dict, Any, Optional, Tuple
 import numpy as np
 from PIL import Image, ImageDraw
 import torch
+
+from utils.config import get_output_dir
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from tqdm import tqdm
 from collections import defaultdict
+
+# 设置 timm 模型缓存目录为本地路径（必须在导入 timm/anomalib 之前设置）
+PROJECT_ROOT = Path(__file__).parent.parent
+PRETRAINED_DIR = PROJECT_ROOT / "models" / "pretrained"
+HUB_DIR = PRETRAINED_DIR / "hub"
+os.environ["TIMM_HOME"] = str(PRETRAINED_DIR)
+os.environ["HF_HOME"] = str(PRETRAINED_DIR)
+os.environ["TRANSFORMERS_CACHE"] = str(PRETRAINED_DIR / "transformers")
+os.environ["HUGGINGFACE_HUB_CACHE"] = str(HUB_DIR)
+# 强制离线模式，避免联网下载
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 sys.path.insert(0, '/home/software/One2All-paddle')
 from anomalib.models.image.patchcore.torch_model import PatchcoreModel
@@ -285,9 +299,11 @@ class PatchCoreTrainer:
 
     def __init__(
         self,
-        output_dir: str = "/home/software/One2All-paddle/output",
+        output_dir: str = None,
         max_concurrent: int = 2,
     ):
+        if output_dir is None:
+            output_dir = str(get_output_dir())
         self.output_dir = Path(output_dir)
         self.max_concurrent = max_concurrent
         self._semaphore = threading.Semaphore(max_concurrent)

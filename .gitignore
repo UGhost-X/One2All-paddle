@@ -3,6 +3,11 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Embedded environment
+embed/.venv/
+embed/__pycache__/
+embed/*.egg-info/
+
 # C extensions
 *.so
 

@@ -1142,32 +1142,52 @@ def _extract_roi_from_segmentation(img: np.ndarray, segmentation: List[List[floa
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LightGlue 辅助函数
+# LightGlue 辅助函数 (仅支持SuperPoint)
 # ─────────────────────────────────────────────────────────────────────────────
 
 _LIGHTGLUE_EXTRACTOR = None
 _LIGHTGLUE_MATCHER = None
 _LIGHTGLUE_DEVICE = None
 
-# 模板变体特征缓存: {extractor_type: {rotations_tuple: [variant_dict, ...]}}
-_TEMPLATE_VARIANT_FEATURES: Dict[str, Dict[Tuple[float, ...], List[Dict]]] = {}
+# 模板变体特征缓存: {rotations_tuple: [variant_dict, ...]}
+_TEMPLATE_VARIANT_FEATURES: Dict[Tuple[float, ...], List[Dict]] = {}
 _TEMPLATE_SUBJECT_IMG: Optional[np.ndarray] = None
 
+# 本地模型缓存路径
+SUPERPOINT_MODEL_PATH = Path(__file__).parent.parent / "models" / "pretrained" / "superpoint_v1.pth"
 
-def _get_lightglue_models(extractor_type: str = "superpoint", use_fp16: bool = True):
+
+def _get_lightglue_models(use_fp16: bool = True):
+    """加载LightGlue模型（仅支持SuperPoint，使用本地缓存）"""
     global _LIGHTGLUE_EXTRACTOR, _LIGHTGLUE_MATCHER, _LIGHTGLUE_DEVICE
     if _LIGHTGLUE_EXTRACTOR is None:
         try:
-            from lightglue import LightGlue, SIFT, SuperPoint, ALIKED
+            from lightglue import LightGlue, SuperPoint
+            import torch.hub
+            
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            if extractor_type == "superpoint":
+            
+            # 设置本地模型缓存路径，阻止自动下载
+            if SUPERPOINT_MODEL_PATH.exists():
+                logger.info(f"[LightGlue] 使用本地SuperPoint模型: {SUPERPOINT_MODEL_PATH}")
+                # 通过设置环境变量让lightglue使用本地模型
+                os.environ["LIGHTGLUE_CACHE"] = str(SUPERPOINT_MODEL_PATH.parent)
+                
+                # 加载SuperPoint（使用本地权重）
                 ext = SuperPoint(max_num_keypoints=2048).eval().to(device)
-            elif extractor_type == "aliked":
-                ext = ALIKED(max_num_keypoints=2048).eval().to(device)
+                
+                # 加载本地权重
+                if SUPERPOINT_MODEL_PATH.exists():
+                    state_dict = torch.load(SUPERPOINT_MODEL_PATH, map_location=device)
+                    ext.load_state_dict(state_dict)
+                    logger.info(f"[LightGlue] 已加载本地SuperPoint权重")
             else:
-                ext = SIFT(max_num_keypoints=2048).eval().to(device)
+                logger.warning(f"[LightGlue] 本地模型不存在: {SUPERPOINT_MODEL_PATH}，将尝试自动下载")
+                ext = SuperPoint(max_num_keypoints=2048).eval().to(device)
+            
+            # 加载LightGlue匹配器（SuperPoint专用）
             mat = LightGlue(
-                features=extractor_type, depth_confidence=-1, width_confidence=-1
+                features="superpoint", depth_confidence=-1, width_confidence=-1
             ).eval().to(device)
 
             if use_fp16 and device.type == "cuda":
@@ -1183,7 +1203,7 @@ def _get_lightglue_models(extractor_type: str = "superpoint", use_fp16: bool = T
             _LIGHTGLUE_EXTRACTOR = ext
             _LIGHTGLUE_MATCHER = mat
             _LIGHTGLUE_DEVICE = device
-            logger.info(f"[LightGlue] 模型加载完成 (extractor={extractor_type}, device={device}, fp16={use_fp16 and device.type == 'cuda'})")
+            logger.info(f"[LightGlue] SuperPoint模型加载完成 (device={device}, fp16={use_fp16 and device.type == 'cuda'})")
         except ImportError:
             logger.error("[LightGlue] 未安装，请执行: pip install lightglue")
         except Exception as e:
@@ -1224,11 +1244,10 @@ def _project_corners(M: np.ndarray, tmpl_h: int, tmpl_w: int) -> np.ndarray:
 
 def precompute_template_variant_features(
     template_subject_bgr: np.ndarray,
-    rotations: List[float],
-    extractor_type: str = "superpoint"
+    rotations: List[float]
 ) -> List[Dict]:
     """
-    预计算模板所有旋转变体的特征，并缓存到全局变量中。
+    预计算模板所有旋转变体的特征，并缓存到全局变量中（仅支持SuperPoint）。
     如果缓存已存在，直接返回缓存的特征。
     """
     global _TEMPLATE_VARIANT_FEATURES, _TEMPLATE_SUBJECT_IMG
@@ -1236,13 +1255,12 @@ def precompute_template_variant_features(
     rotations_tuple = tuple(rotations)
 
     # 检查缓存是否已存在
-    if extractor_type in _TEMPLATE_VARIANT_FEATURES:
-        if rotations_tuple in _TEMPLATE_VARIANT_FEATURES[extractor_type]:
-            logger.info(f"[LightGlue] 使用缓存的模板变体特征 ({len(rotations)} 个变体)")
-            return _TEMPLATE_VARIANT_FEATURES[extractor_type][rotations_tuple]
+    if rotations_tuple in _TEMPLATE_VARIANT_FEATURES:
+        logger.info(f"[LightGlue] 使用缓存的模板变体特征 ({len(rotations)} 个变体)")
+        return _TEMPLATE_VARIANT_FEATURES[rotations_tuple]
 
     # 获取提取器
-    extractor, _, device = _get_lightglue_models(extractor_type)
+    extractor, _, device = _get_lightglue_models()
     if extractor is None:
         logger.error("[LightGlue] 提取器不可用，无法预计算特征")
         return []
@@ -1263,9 +1281,7 @@ def precompute_template_variant_features(
             v["feats"] = extractor.extract(t_tensor.to(device))
 
     # 存入缓存
-    if extractor_type not in _TEMPLATE_VARIANT_FEATURES:
-        _TEMPLATE_VARIANT_FEATURES[extractor_type] = {}
-    _TEMPLATE_VARIANT_FEATURES[extractor_type][rotations_tuple] = variants
+    _TEMPLATE_VARIANT_FEATURES[rotations_tuple] = variants
     _TEMPLATE_SUBJECT_IMG = template_subject_bgr.copy()
 
     elapsed = time.time() - t_start
@@ -1583,7 +1599,6 @@ def detect_workpieces_with_lightglue(
     rotations: List[float] = None,
     min_matches: int = 4,
     max_instances: int = 20,
-    extractor_type: str = "superpoint",
     padding: int = 20,
 ) -> List[Tuple[np.ndarray, Dict, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
     """
@@ -1598,7 +1613,7 @@ def detect_workpieces_with_lightglue(
     if rotations is None:
         rotations = rotations = list(range(0, 360, 15))
 
-    extractor, matcher, device = _get_lightglue_models(extractor_type)
+    extractor, matcher, device = _get_lightglue_models()
     if extractor is None or matcher is None:
         logger.error("[LightGlue] 模型不可用，返回空结果")
         return []
@@ -2062,7 +2077,6 @@ async def detect_multiple_workpieces(
     lightglue_rotations: List[float] = None,
     lightglue_min_matches: int = 4,
     lightglue_max_instances: int = 20,
-    lightglue_extractor: str = "superpoint",
     lightglue_padding: int = 20,
 ) -> Dict[str, Any]:
     if template_image is None or not annotations:
@@ -2087,7 +2101,6 @@ async def detect_multiple_workpieces(
         rotations=lightglue_rotations,
         min_matches=lightglue_min_matches,
         max_instances=lightglue_max_instances,
-        extractor_type=lightglue_extractor,
         padding=lightglue_padding,
     )
     local_monitor.end_step("lightglue_detect")
@@ -2710,8 +2723,8 @@ def load_models():
         logger.warning("No template image found")
         return
 
-    # 加载 LightGlue 模型
-    _get_lightglue_models("superpoint")
+    # 加载 LightGlue 模型（仅SuperPoint）
+    _get_lightglue_models()
 
     # 预提取模板主体区域的变体特征
     subject_img, _, _ = extract_subject_region_from_annotations(
@@ -2719,7 +2732,7 @@ def load_models():
     )
     if subject_img is not None:
         default_rotations = list(range(0, 360, 15))
-        precompute_template_variant_features(subject_img, default_rotations, "superpoint")
+        precompute_template_variant_features(subject_img, default_rotations)
     else:
         logger.warning("[LightGlue] 未找到工件主体标注，跳过预提取模板变体特征")
 
@@ -2759,7 +2772,6 @@ async def predict_multiple(
     rotations: str = Form(None),
     min_matches: int = Form(8),
     max_instances: int = Form(20),
-    extractor_type: str = Form("superpoint"),
 ):
     start_time = time.time()
     request_id = f"{int(start_time * 1000)}"
@@ -2820,7 +2832,6 @@ async def predict_multiple(
                         lightglue_rotations=parsed_rotations,
                         lightglue_min_matches=min_matches,
                         lightglue_max_instances=max_instances,
-                        lightglue_extractor=extractor_type,
                     ),
                     timeout=INFERENCE_TIMEOUT_SEC * 3,
                 )

@@ -1,3 +1,17 @@
+import os
+from pathlib import Path
+
+# 设置模型缓存目录（必须在导入 timm/anomalib 之前）
+PROJECT_ROOT = Path(__file__).parent
+PRETRAINED_DIR = PROJECT_ROOT / "models" / "pretrained"
+HUB_DIR = PRETRAINED_DIR / "hub"
+os.environ["TIMM_HOME"] = str(PRETRAINED_DIR)
+os.environ["HF_HOME"] = str(PRETRAINED_DIR)
+os.environ["TRANSFORMERS_CACHE"] = str(PRETRAINED_DIR / "transformers")
+os.environ["HUGGINGFACE_HUB_CACHE"] = str(HUB_DIR)  # 指向 hub 子目录
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
 from fastapi import FastAPI, Header, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
@@ -12,14 +26,12 @@ import logging
 import cv2
 import numpy as np
 import base64
-import os
 import shutil
 import tempfile
 import random
 import platform
 import warnings
 import uuid as uuid_lib
-from pathlib import Path
 import uvicorn
 
 # 屏蔽框架无关紧要的日志和警告
@@ -29,12 +41,13 @@ logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 from utils.patchcore_trainer import PatchCoreTrainer
 from utils.deployer import ModelDeployer
+from utils.config import path_config, get_output_dir, get_product_dir
 from dataclasses import asdict
 
 logger = logging.getLogger(__name__)
 
-# 初始化 PatchCore 训练器
-trainer = PatchCoreTrainer(output_dir="output", max_concurrent=3)
+# 初始化 PatchCore 训练器（使用环境变量配置的output路径）
+trainer = PatchCoreTrainer(output_dir=str(get_output_dir()), max_concurrent=3)
 
 app = FastAPI(title="One2All Paddle API")
 
@@ -149,12 +162,8 @@ def train_anomaly(request: TrainRequest):
         else {}
     )
 
-    if platform.system().lower() == "linux":
-        normalized_base = os.getcwd()
-    else:
-        normalized_base = request.base_path.replace("\\", "/")
-
-    storage_base = Path(normalized_base) / "product" / request.project_id / "train" / task_uuid
+    # 使用环境变量配置的产品数据目录
+    storage_base = path_config.get_project_product_path(request.project_id, task_uuid)
 
     try:
         # ── 1. 解码所有图片 ────────────────────────────────────────────────
@@ -552,7 +561,7 @@ async def get_train_data(task_id: str):
 @app.get("/project/{project_id}/datasets")
 async def get_project_datasets(project_id: str):
     """获取项目级历史训练数据列表"""
-    base_dir = os.path.join(os.getcwd(), "product", project_id, "train")
+    base_dir = str(path_config.get_project_product_path(project_id))
 
     if not os.path.exists(base_dir):
         return {"project_id": project_id, "datasets": []}
@@ -633,9 +642,11 @@ async def delete_project_dataset(
     label: Optional[str] = Query(None, description="数据集标签（可选，不提供则删除整个任务）"),
 ):
     """删除项目下的数据集"""
-    dataset_path = os.path.join(
-        os.getcwd(), "product", project_id, "train", task_uuid, *([label] if label else [])
-    )
+    base_path = path_config.get_project_product_path(project_id, task_uuid)
+    if label:
+        dataset_path = str(base_path / label)
+    else:
+        dataset_path = str(base_path)
 
     if not os.path.exists(dataset_path):
         raise HTTPException(status_code=404, detail="Dataset not found")
@@ -798,7 +809,7 @@ def _scan_model_files(label_path: str, rel_label_path: str) -> tuple:
 @app.get("/project/{project_id}/models")
 async def get_project_models(project_id: str):
     """获取项目级历史模型列表"""
-    output_base = os.path.join(os.getcwd(), "output", project_id)
+    output_base = str(path_config.get_project_output_path(project_id))
 
     if not os.path.exists(output_base):
         return {"project_id": project_id, "models": []}
@@ -865,9 +876,11 @@ async def delete_project_model(
     label: Optional[str] = Query(None, description="模型标签（可选，不提供则删除整个任务）"),
 ):
     """删除项目下的模型"""
-    model_path = os.path.join(
-        os.getcwd(), "output", project_id, task_uuid, *([label] if label else [])
-    )
+    base_path = path_config.get_project_output_path(project_id, task_uuid)
+    if label:
+        model_path = str(base_path / label)
+    else:
+        model_path = str(base_path)
 
     if not os.path.exists(model_path):
         raise HTTPException(status_code=404, detail="Model not found")
@@ -891,7 +904,7 @@ async def delete_project_model(
 # 部署接口
 # ─────────────────────────────────────────────────────────────────────────────
 
-http_deployer = ModelDeployer(output_dir="output", scripts_dir="inference_services")
+http_deployer = ModelDeployer()  # 使用环境变量配置的output和scripts路径
 
 
 class HTTPDeployRequest(BaseModel):
