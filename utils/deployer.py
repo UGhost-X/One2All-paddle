@@ -13,12 +13,14 @@ import random
 import logging
 import shutil
 import socket
+import psutil
 from pathlib import Path
 from typing import Dict, Optional, List
 from dataclasses import dataclass, asdict, field
 from enum import Enum
 
 from jinja2 import Environment, FileSystemLoader
+from utils.config import get_output_dir, get_inference_scripts_dir, path_config
 
 logger = logging.getLogger(__name__)
 
@@ -41,20 +43,21 @@ class DeployService:
     created_at: float = 0.0
     error: Optional[str] = None
     inference_url: Optional[str] = None
+    train_mode: str = "by_pos_id"
 
 class ModelDeployer:
-    def __init__(self, output_dir: str = "output", scripts_dir: str = "inference_services"):
-        self.output_dir = output_dir
-        self.scripts_dir = scripts_dir
+    def __init__(self, output_dir: str = None, scripts_dir: str = None):
+        self.output_dir = str(output_dir) if output_dir else str(get_output_dir())
+        self.scripts_dir = str(scripts_dir) if scripts_dir else str(get_inference_scripts_dir())
         self.services: Dict[str, DeployService] = {}
         self.port_index: Dict[int, str] = {}
         self.uuid_index: Dict[str, str] = {}
-        self.state_file = str(Path(output_dir) / "_deploy_services.json")
+        self.state_file = str(Path(self.output_dir) / "_deploy_services.json")
         self._lock = threading.Lock()
         self.base_port = 9000
         self.max_port = 9999
-        Path(output_dir).mkdir(parents=True, exist_ok=True)
-        Path(scripts_dir).mkdir(parents=True, exist_ok=True)
+        Path(self.output_dir).mkdir(parents=True, exist_ok=True)
+        Path(self.scripts_dir).mkdir(parents=True, exist_ok=True)
         self._load_state()
     
     def _load_state(self):
@@ -97,7 +100,28 @@ class ModelDeployer:
             return True
         except (OSError, ProcessLookupError):
             return False
-    
+
+    def _kill_process_tree(self, pid: int) -> bool:
+        """Cross-platform process tree termination using psutil."""
+        try:
+            parent = psutil.Process(pid)
+            children = parent.children(recursive=True)
+            for child in children:
+                try:
+                    child.terminate()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            parent.terminate()
+            gone, alive = psutil.wait_procs(children + [parent], timeout=3)
+            for p in alive:
+                try:
+                    p.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            return True
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            return False
+
     def _allocate_port(self) -> int:
         """使用 socket 让系统自动分配可用端口"""
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -141,6 +165,7 @@ class ModelDeployer:
                 models["_labels"] = labels
                 models["_model_type"] = "patchcore"
         else:
+            train_mode = "by_pos_id"  # 默认值
             for label_dir in base_path.iterdir():
                 if not label_dir.is_dir():
                     continue
@@ -155,6 +180,18 @@ class ModelDeployer:
                     models[label_dir.name] = str(label_dir)
                     models[f"{label_dir.name}_type"] = "patchcore"
 
+                    # 从 config.json 读取 train_mode（读第一个即可）
+                    if train_mode == "by_pos_id":
+                        try:
+                            with open(label_dir / "config.json", "r", encoding="utf-8") as f:
+                                cfg = json.load(f)
+                                train_mode = cfg.get("train_mode", "by_pos_id")
+                        except Exception:
+                            pass
+
+            if models:
+                models["_train_mode"] = train_mode
+
         return models
     
     def _create_inference_service(self, service: DeployService) -> str:
@@ -165,9 +202,9 @@ class ModelDeployer:
         template = env.get_template("inference_service.py.j2")
         
         # 构建 annotations.json 路径
-        # 路径格式: product/{project_id}/train/{task_uuid}/annotations.json
-        annotations_path = Path("product") / str(service.project_id) / "train" / service.task_uuid / "annotations.json"
-        annotations_path_str = str(annotations_path.absolute()) if annotations_path.exists() else ""
+        # 路径格式: {PRODUCT_DIR}/{project_id}/train/{task_uuid}/annotations.json
+        annotations_path = path_config.get_project_product_path(service.project_id, service.task_uuid) / "annotations.json"
+        annotations_path_str = str(annotations_path) if annotations_path.exists() else ""
         
         if annotations_path.exists():
             logger.info(f"Found annotations file: {annotations_path_str}")
@@ -182,7 +219,8 @@ class ModelDeployer:
             labels=service.labels,
             port=service.port,
             models_config=service.model_paths,
-            annotations_path=annotations_path_str
+            annotations_path=annotations_path_str,
+            train_mode=service.train_mode
         )
         
         script_path = Path(self.scripts_dir) / f"service_{service.service_id}.py"
@@ -251,7 +289,8 @@ class ModelDeployer:
                 labels=label_keys,
                 model_paths=model_paths,
                 created_at=time.time(),
-                inference_url=f"http://0.0.0.0:{port}"
+                inference_url=f"http://0.0.0.0:{port}",
+                train_mode=model_paths.get("_train_mode", "by_pos_id")
             )
 
             # 预先注册服务，防止并发冲突
@@ -273,8 +312,8 @@ class ModelDeployer:
                 [sys.executable, script_path],
                 stdout=open(stdout_file, "w"),
                 stderr=open(stderr_file, "w"),
-                start_new_session=True,
-                cwd=os.getcwd()
+                cwd=os.getcwd(),
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
             )
             logger.info(f"Popen succeeded: pid={proc.pid}")
 
@@ -345,10 +384,8 @@ class ModelDeployer:
             
             if service.pid and self._is_process_alive(service.pid):
                 try:
-                    os.killpg(os.getpgid(service.pid), signal.SIGTERM)
-                    time.sleep(2)
-                    if self._is_process_alive(service.pid):
-                        os.killpg(os.getpgid(service.pid), signal.SIGKILL)
+                    self._kill_process_tree(service.pid)
+                    time.sleep(1)
                 except Exception as e:
                     logger.warning(f"Error killing process: {e}")
             
@@ -372,10 +409,8 @@ class ModelDeployer:
             # 直接停止进程，避免死锁（stop_service也在同一个锁内）
             if service.pid and self._is_process_alive(service.pid):
                 try:
-                    os.killpg(os.getpgid(service.pid), signal.SIGTERM)
-                    time.sleep(2)
-                    if self._is_process_alive(service.pid):
-                        os.killpg(os.getpgid(service.pid), signal.SIGKILL)
+                    self._kill_process_tree(service.pid)
+                    time.sleep(1)
                 except Exception as e:
                     logger.warning(f"Error killing process during delete: {e}")
             

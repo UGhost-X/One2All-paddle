@@ -22,8 +22,14 @@ from utils.image_decoder import decode_image, is_turbo_jpeg_available
 
 INFERENCE_TIMEOUT_SEC = 60
 
+# 推理批次大小，控制每批送入 GPU 的 ROI 数量，避免显存溢出
+# 根据 GPU 显存调整，16GB 显存建议 16-32，8GB 显存建议 8-16
+INFERENCE_BATCH_SIZE = int(os.environ.get("INFERENCE_BATCH_SIZE", 16))
+
 REFERENCE_WORKPIECE_SIZE = (1988, 683)
 REFERENCE_IMAGE_SIZE = (3200, 2100)
+
+TRAIN_MODE = "{{ train_mode }}"  # "by_pos_id" | "by_category"
 
 
 def get_workpiece_area_ratio_range(
@@ -617,6 +623,8 @@ class MultiPatchCoreDetector:
         self._max_workers = max_workers
         self._load_lock = asyncio.Lock() if lazy_load else None
 
+        logger.info(f"[MultiPatchCoreDetector] 初始化 - TRAIN_MODE: {TRAIN_MODE}, models_dir: {models_dir}")
+
         if lazy_load:
             self._scan_model_metadata()
         else:
@@ -625,9 +633,14 @@ class MultiPatchCoreDetector:
 
     def _scan_model_metadata(self):
         """懒加载模式：仅扫描模型元数据，不实际加载模型权重。"""
+        logger.info(f"[_scan_model_metadata] 扫描目录: {self.models_dir}, exists={self.models_dir.exists()}")
+
         if not self.models_dir.exists():
             logger.warning(f"Models directory not found: {self.models_dir}")
             return
+
+        subdirs = [d for d in self.models_dir.iterdir() if d.is_dir()]
+        logger.info(f"[_scan_model_metadata] 子目录: {[d.name for d in subdirs]}")
 
         for pos_id_dir in self.models_dir.iterdir():
             if not pos_id_dir.is_dir():
@@ -636,12 +649,15 @@ class MultiPatchCoreDetector:
             pos_id = pos_id_dir.name
             model_path = pos_id_dir / "patchcore_model.pt"
 
+            logger.info(f"[_scan_model_metadata] 检查: {pos_id}, model_path={model_path}, exists={model_path.exists()}")
+
             if not model_path.exists():
                 best = pos_id_dir / "best_model"
                 if best.exists():
                     model_path = best / "patchcore_model.pt"
 
             if not model_path.exists():
+                logger.warning(f"[_scan_model_metadata] 模型文件不存在: {pos_id}")
                 continue
 
             config_path = pos_id_dir / "config.json"
@@ -659,6 +675,8 @@ class MultiPatchCoreDetector:
                 "config": config,
             }
             logger.info(f"Scanned model metadata: pos_id={pos_id}")
+
+        logger.info(f"[_scan_model_metadata] 扫描完成，共 {len(self._model_metadata)} 个模型")
 
     def _load_models_parallel(self):
         """并行加载所有模型（非懒加载模式）。"""
@@ -807,19 +825,24 @@ class MultiPatchCoreDetector:
         if total_rois == 0:
             return []
 
+        logger.info(f"[detect_by_pos_id] TRAIN_MODE: {TRAIN_MODE}, category: {category}, total_rois: {total_rois}")
+
         result_pairs: List[Optional[tuple]] = [None] * total_rois
 
         try:
             pos_id_groups: Dict[str, List[Tuple[int, np.ndarray, Dict]]] = {}
             for idx, roi in enumerate(rois):
-                pos_id = "default"
-                ann = None
-                if annotations and idx < len(annotations):
-                    pos_id = str(annotations[idx].get('pos_id', 'default'))
-                    ann = annotations[idx]
-                pos_id_groups.setdefault(pos_id, []).append((idx, roi, ann))
+                ann = annotations[idx] if annotations and idx < len(annotations) else {}
+
+                if TRAIN_MODE == "by_category":
+                    lookup_key = str(ann.get('category_name') or ann.get('label', 'default'))
+                else:
+                    lookup_key = str(ann.get('pos_id', 'default'))
+
+                pos_id_groups.setdefault(lookup_key, []).append((idx, roi, ann))
 
             all_pos_ids = list(pos_id_groups.keys())
+            logger.info(f"[detect_by_pos_id] 分组结果: {all_pos_ids}")
 
             # 懒加载模式：按需加载所需模型
             if self._lazy_load:
@@ -887,20 +910,28 @@ class MultiPatchCoreDetector:
                     "infer_failed": infer_failed,
                 }
 
-            group_rois = [roi for _, roi, _ in group]
-            group_indices = [idx for idx, _, _ in group]
+            group_rois_all = [roi for _, roi, _ in group]
+            group_indices_all = [idx for idx, _, _ in group]
+            group_anns_all = [ann for _, _, ann in group]
 
+            # 分批处理，避免显存溢出
             try:
-                batch_results = model.infer_batch(group_rois)
+                for start in range(0, len(group), INFERENCE_BATCH_SIZE):
+                    end = start + INFERENCE_BATCH_SIZE
+                    group_rois = group_rois_all[start:end]
+                    group_indices = group_indices_all[start:end]
+                    group_slice = group[start:end]
 
-                for (idx, roi, _), result in zip(group, batch_results):
-                    score = result["error"]
-                    logger.info(
-                        f"[{request_id}] [{category}] ROI {idx+1}/{total_rois} "
-                        f"pos_id={pos_id} roi_size={roi.shape[1]}x{roi.shape[0]} "
-                        f"score={score:.4f} threshold={threshold:.4f} (batch)"
-                    )
-                    result_pairs[idx] = (make_result(score, result["infer_failed"]), False)
+                    batch_results = model.infer_batch(group_rois)
+
+                    for (idx, roi, _), result in zip(group_slice, batch_results):
+                        score = result["error"]
+                        logger.info(
+                            f"[{request_id}] [{category}] ROI {idx+1}/{total_rois} "
+                            f"pos_id={pos_id} roi_size={roi.shape[1]}x{roi.shape[0]} "
+                            f"score={score:.4f} threshold={threshold:.4f} (batch)"
+                        )
+                        result_pairs[idx] = (make_result(score, result["infer_failed"]), False)
 
             except Exception as e:
                 logger.error(f"[{request_id}] [{category}] Batch inference error pos_id={pos_id}: {e}")
@@ -988,21 +1019,26 @@ class MultiPatchCoreDetector:
                         "infer_failed": infer_failed,
                     }
 
-                pos_embeddings = embeddings_flat[global_indices]
                 memory_bank = model.model.memory_bank
 
-                anomaly_scores = model.compute_anomaly_scores_from_embeddings(
-                    pos_embeddings, memory_bank
-                )
+                # 分批计算异常分数，避免显存溢出
+                for start in range(0, len(global_indices), INFERENCE_BATCH_SIZE):
+                    end = start + INFERENCE_BATCH_SIZE
+                    indices_slice = global_indices[start:end]
+                    pos_embeddings_chunk = embeddings_flat[indices_slice]
 
-                for g_idx, score in zip(global_indices, anomaly_scores):
-                    idx, roi = idx_to_roi[g_idx]
-                    logger.info(
-                        f"[{request_id}] [{category}] ROI {idx+1}/{total_rois} "
-                        f"pos_id={pos_id} roi_size={roi.shape[1]}x{roi.shape[0]} "
-                        f"score={score:.4f} threshold={threshold:.4f} (shared)"
+                    anomaly_scores_chunk = model.compute_anomaly_scores_from_embeddings(
+                        pos_embeddings_chunk, memory_bank
                     )
-                    result_pairs[idx] = (make_result(float(score), False), False)
+
+                    for g_idx, score in zip(indices_slice, anomaly_scores_chunk):
+                        idx, roi = idx_to_roi[g_idx]
+                        logger.info(
+                            f"[{request_id}] [{category}] ROI {idx+1}/{total_rois} "
+                            f"pos_id={pos_id} roi_size={roi.shape[1]}x{roi.shape[0]} "
+                            f"score={score:.4f} threshold={threshold:.4f} (shared)"
+                        )
+                        result_pairs[idx] = (make_result(float(score), False), False)
 
         except Exception as e:
             logger.error(f"[{request_id}] [{category}] Shared backbone inference error: {e}")
@@ -1142,32 +1178,52 @@ def _extract_roi_from_segmentation(img: np.ndarray, segmentation: List[List[floa
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LightGlue 辅助函数
+# LightGlue 辅助函数 (仅支持SuperPoint)
 # ─────────────────────────────────────────────────────────────────────────────
 
 _LIGHTGLUE_EXTRACTOR = None
 _LIGHTGLUE_MATCHER = None
 _LIGHTGLUE_DEVICE = None
 
-# 模板变体特征缓存: {extractor_type: {rotations_tuple: [variant_dict, ...]}}
-_TEMPLATE_VARIANT_FEATURES: Dict[str, Dict[Tuple[float, ...], List[Dict]]] = {}
+# 模板变体特征缓存: {rotations_tuple: [variant_dict, ...]}
+_TEMPLATE_VARIANT_FEATURES: Dict[Tuple[float, ...], List[Dict]] = {}
 _TEMPLATE_SUBJECT_IMG: Optional[np.ndarray] = None
 
+# 本地模型缓存路径
+SUPERPOINT_MODEL_PATH = Path(__file__).parent.parent / "models" / "pretrained" / "superpoint_v1.pth"
 
-def _get_lightglue_models(extractor_type: str = "superpoint", use_fp16: bool = True):
+
+def _get_lightglue_models(use_fp16: bool = True):
+    """加载LightGlue模型（仅支持SuperPoint，使用本地缓存）"""
     global _LIGHTGLUE_EXTRACTOR, _LIGHTGLUE_MATCHER, _LIGHTGLUE_DEVICE
     if _LIGHTGLUE_EXTRACTOR is None:
         try:
-            from lightglue import LightGlue, SIFT, SuperPoint, ALIKED
+            from lightglue import LightGlue, SuperPoint
+            import torch.hub
+            
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            if extractor_type == "superpoint":
+            
+            # 设置本地模型缓存路径，阻止自动下载
+            if SUPERPOINT_MODEL_PATH.exists():
+                logger.info(f"[LightGlue] 使用本地SuperPoint模型: {SUPERPOINT_MODEL_PATH}")
+                # 通过设置环境变量让lightglue使用本地模型
+                os.environ["LIGHTGLUE_CACHE"] = str(SUPERPOINT_MODEL_PATH.parent)
+                
+                # 加载SuperPoint（使用本地权重）
                 ext = SuperPoint(max_num_keypoints=2048).eval().to(device)
-            elif extractor_type == "aliked":
-                ext = ALIKED(max_num_keypoints=2048).eval().to(device)
+                
+                # 加载本地权重
+                if SUPERPOINT_MODEL_PATH.exists():
+                    state_dict = torch.load(SUPERPOINT_MODEL_PATH, map_location=device)
+                    ext.load_state_dict(state_dict)
+                    logger.info(f"[LightGlue] 已加载本地SuperPoint权重")
             else:
-                ext = SIFT(max_num_keypoints=2048).eval().to(device)
+                logger.warning(f"[LightGlue] 本地模型不存在: {SUPERPOINT_MODEL_PATH}，将尝试自动下载")
+                ext = SuperPoint(max_num_keypoints=2048).eval().to(device)
+            
+            # 加载LightGlue匹配器（SuperPoint专用）
             mat = LightGlue(
-                features=extractor_type, depth_confidence=-1, width_confidence=-1
+                features="superpoint", depth_confidence=-1, width_confidence=-1
             ).eval().to(device)
 
             if use_fp16 and device.type == "cuda":
@@ -1183,7 +1239,7 @@ def _get_lightglue_models(extractor_type: str = "superpoint", use_fp16: bool = T
             _LIGHTGLUE_EXTRACTOR = ext
             _LIGHTGLUE_MATCHER = mat
             _LIGHTGLUE_DEVICE = device
-            logger.info(f"[LightGlue] 模型加载完成 (extractor={extractor_type}, device={device}, fp16={use_fp16 and device.type == 'cuda'})")
+            logger.info(f"[LightGlue] SuperPoint模型加载完成 (device={device}, fp16={use_fp16 and device.type == 'cuda'})")
         except ImportError:
             logger.error("[LightGlue] 未安装，请执行: pip install lightglue")
         except Exception as e:
@@ -1224,11 +1280,10 @@ def _project_corners(M: np.ndarray, tmpl_h: int, tmpl_w: int) -> np.ndarray:
 
 def precompute_template_variant_features(
     template_subject_bgr: np.ndarray,
-    rotations: List[float],
-    extractor_type: str = "superpoint"
+    rotations: List[float]
 ) -> List[Dict]:
     """
-    预计算模板所有旋转变体的特征，并缓存到全局变量中。
+    预计算模板所有旋转变体的特征，并缓存到全局变量中（仅支持SuperPoint）。
     如果缓存已存在，直接返回缓存的特征。
     """
     global _TEMPLATE_VARIANT_FEATURES, _TEMPLATE_SUBJECT_IMG
@@ -1236,13 +1291,12 @@ def precompute_template_variant_features(
     rotations_tuple = tuple(rotations)
 
     # 检查缓存是否已存在
-    if extractor_type in _TEMPLATE_VARIANT_FEATURES:
-        if rotations_tuple in _TEMPLATE_VARIANT_FEATURES[extractor_type]:
-            logger.info(f"[LightGlue] 使用缓存的模板变体特征 ({len(rotations)} 个变体)")
-            return _TEMPLATE_VARIANT_FEATURES[extractor_type][rotations_tuple]
+    if rotations_tuple in _TEMPLATE_VARIANT_FEATURES:
+        logger.info(f"[LightGlue] 使用缓存的模板变体特征 ({len(rotations)} 个变体)")
+        return _TEMPLATE_VARIANT_FEATURES[rotations_tuple]
 
     # 获取提取器
-    extractor, _, device = _get_lightglue_models(extractor_type)
+    extractor, _, device = _get_lightglue_models()
     if extractor is None:
         logger.error("[LightGlue] 提取器不可用，无法预计算特征")
         return []
@@ -1263,9 +1317,7 @@ def precompute_template_variant_features(
             v["feats"] = extractor.extract(t_tensor.to(device))
 
     # 存入缓存
-    if extractor_type not in _TEMPLATE_VARIANT_FEATURES:
-        _TEMPLATE_VARIANT_FEATURES[extractor_type] = {}
-    _TEMPLATE_VARIANT_FEATURES[extractor_type][rotations_tuple] = variants
+    _TEMPLATE_VARIANT_FEATURES[rotations_tuple] = variants
     _TEMPLATE_SUBJECT_IMG = template_subject_bgr.copy()
 
     elapsed = time.time() - t_start
@@ -1359,9 +1411,11 @@ def batch_match_template_variants(
             padded_oris.append(oris)
 
     # 构建 batch 输入
+    # 确保所有特征使用相同的 dtype（与场景特征保持一致）
+    scene_dtype = feats_scene["keypoints"].dtype
     batch_feats0 = {
-        "keypoints": torch.cat(padded_keypoints, dim=0).half(),  # [B, M, 2]
-        "descriptors": torch.cat(padded_descriptors, dim=0),  # [B, M, D]
+        "keypoints": torch.cat(padded_keypoints, dim=0).to(scene_dtype),  # [B, M, 2]
+        "descriptors": torch.cat(padded_descriptors, dim=0).to(scene_dtype),  # [B, M, D]
     }
     if padded_scales:
         batch_feats0["scales"] = torch.cat(padded_scales, dim=0)  # [B, M]
@@ -1370,13 +1424,22 @@ def batch_match_template_variants(
 
     # 场景特征复制 n_variants 份
     batch_feats1 = {
-        "keypoints": feats_scene["keypoints"].repeat(n_variants, 1, 1).half(),  # [B, N, 2]
+        "keypoints": feats_scene["keypoints"].repeat(n_variants, 1, 1),  # [B, N, 2]
         "descriptors": feats_scene["descriptors"].repeat(n_variants, 1, 1),  # [B, N, D]
     }
     if "scales" in feats_scene:
         batch_feats1["scales"] = feats_scene["scales"].repeat(n_variants, 1)
     if "oris" in feats_scene:
         batch_feats1["oris"] = feats_scene["oris"].repeat(n_variants, 1)
+
+    # 确保 batch 输入与 matcher 使用相同的 dtype（避免 float32 vs float16 不匹配）
+    matcher_dtype = next(matcher.parameters()).dtype
+    for key in list(batch_feats0.keys()):
+        if isinstance(batch_feats0[key], torch.Tensor) and batch_feats0[key].dtype != matcher_dtype:
+            batch_feats0[key] = batch_feats0[key].to(matcher_dtype)
+    for key in list(batch_feats1.keys()):
+        if isinstance(batch_feats1[key], torch.Tensor) and batch_feats1[key].dtype != matcher_dtype:
+            batch_feats1[key] = batch_feats1[key].to(matcher_dtype)
 
     # 批量匹配
     with torch.no_grad():
@@ -1583,7 +1646,6 @@ def detect_workpieces_with_lightglue(
     rotations: List[float] = None,
     min_matches: int = 4,
     max_instances: int = 20,
-    extractor_type: str = "superpoint",
     padding: int = 20,
 ) -> List[Tuple[np.ndarray, Dict, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
     """
@@ -1598,7 +1660,7 @@ def detect_workpieces_with_lightglue(
     if rotations is None:
         rotations = rotations = list(range(0, 360, 15))
 
-    extractor, matcher, device = _get_lightglue_models(extractor_type)
+    extractor, matcher, device = _get_lightglue_models()
     if extractor is None or matcher is None:
         logger.error("[LightGlue] 模型不可用，返回空结果")
         return []
@@ -1614,7 +1676,7 @@ def detect_workpieces_with_lightglue(
     sub_h, sub_w = template_subject_bgr.shape[:2]
 
     # 使用预计算的模板变体特征（如果缓存不存在则自动计算）
-    variants = precompute_template_variant_features(template_subject_bgr, rotations, extractor_type)
+    variants = precompute_template_variant_features(template_subject_bgr, rotations)
 
     results = []
 
@@ -1898,9 +1960,19 @@ async def process_single_workpiece_roi(
     anns_for_inference = []
     categories = []
 
+    loaded_categories = detector.get_loaded_categories()
+    logger.info(f"[process_single_workpiece_roi] TRAIN_MODE: {TRAIN_MODE}, loaded_categories: {loaded_categories}")
+
     for ann in template_annotations:
-        category = ann.get("category")
-        if not category or category not in detector.get_loaded_categories():
+        if TRAIN_MODE == "by_category":
+            # by_category 模式：用 category_name（label）匹配模型目录名
+            category = ann.get("category_name") or ann.get("label", "")
+        else:
+            # by_pos_id 模式：用 category（pos_id string）匹配模型目录名
+            category = ann.get("category")
+
+        if not category or category not in loaded_categories:
+            logger.debug(f"[process_single_workpiece_roi] 跳过 annotation: category={category}, 不在 loaded_categories 中")
             continue
 
         segmentation = ann.get("segmentation", [])
@@ -2062,7 +2134,6 @@ async def detect_multiple_workpieces(
     lightglue_rotations: List[float] = None,
     lightglue_min_matches: int = 4,
     lightglue_max_instances: int = 20,
-    lightglue_extractor: str = "superpoint",
     lightglue_padding: int = 20,
 ) -> Dict[str, Any]:
     if template_image is None or not annotations:
@@ -2087,7 +2158,6 @@ async def detect_multiple_workpieces(
         rotations=lightglue_rotations,
         min_matches=lightglue_min_matches,
         max_instances=lightglue_max_instances,
-        extractor_type=lightglue_extractor,
         padding=lightglue_padding,
     )
     local_monitor.end_step("lightglue_detect")
@@ -2680,15 +2750,22 @@ def encode_image_to_base64(img: np.ndarray) -> str:
 def load_models():
     global PATCHCORE_DETECTOR, MODELS, TEMPLATE_IMAGE, TEMPLATE_ANNOTATIONS
 
+    # 打印当前推理模式
+    logger.info(f"[TRAIN_MODE] 当前推理模式: {TRAIN_MODE}")
+    logger.info(f"[MODEL_PATHS] {MODEL_PATHS}")
+
     model_dirs = {
         path for key, path in MODEL_PATHS.items()
-        if not key.endswith('_type') and key not in ('_labels', '_model_type')
+        if not key.endswith('_type') and key not in ('_labels', '_model_type', '_train_mode')
     }
+    logger.info(f"[model_dirs] {model_dirs}")
+
     if not model_dirs:
         logger.warning("No model directories found")
         return
 
     base_dir = Path(list(model_dirs)[0]).parent
+    logger.info(f"[base_dir] {base_dir}")
     PATCHCORE_DETECTOR = MultiPatchCoreDetector(base_dir)
     if PATCHCORE_DETECTOR.get_loaded_categories():
         MODELS = {
@@ -2710,8 +2787,8 @@ def load_models():
         logger.warning("No template image found")
         return
 
-    # 加载 LightGlue 模型
-    _get_lightglue_models("superpoint")
+    # 加载 LightGlue 模型（仅SuperPoint）
+    _get_lightglue_models()
 
     # 预提取模板主体区域的变体特征
     subject_img, _, _ = extract_subject_region_from_annotations(
@@ -2719,7 +2796,7 @@ def load_models():
     )
     if subject_img is not None:
         default_rotations = list(range(0, 360, 15))
-        precompute_template_variant_features(subject_img, default_rotations, "superpoint")
+        precompute_template_variant_features(subject_img, default_rotations)
     else:
         logger.warning("[LightGlue] 未找到工件主体标注，跳过预提取模板变体特征")
 
@@ -2759,7 +2836,6 @@ async def predict_multiple(
     rotations: str = Form(None),
     min_matches: int = Form(8),
     max_instances: int = Form(20),
-    extractor_type: str = Form("superpoint"),
 ):
     start_time = time.time()
     request_id = f"{int(start_time * 1000)}"
@@ -2820,7 +2896,6 @@ async def predict_multiple(
                         lightglue_rotations=parsed_rotations,
                         lightglue_min_matches=min_matches,
                         lightglue_max_instances=max_instances,
-                        lightglue_extractor=extractor_type,
                     ),
                     timeout=INFERENCE_TIMEOUT_SEC * 3,
                 )

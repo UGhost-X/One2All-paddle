@@ -18,11 +18,25 @@ from typing import List, Dict, Any, Optional, Tuple
 import numpy as np
 from PIL import Image, ImageDraw
 import torch
+
+from utils.config import get_output_dir
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from tqdm import tqdm
 from collections import defaultdict
+
+# 设置 timm 模型缓存目录为本地路径（必须在导入 timm/anomalib 之前设置）
+PROJECT_ROOT = Path(__file__).parent.parent
+PRETRAINED_DIR = PROJECT_ROOT / "models" / "pretrained"
+HUB_DIR = PRETRAINED_DIR / "hub"
+os.environ["TIMM_HOME"] = str(PRETRAINED_DIR)
+os.environ["HF_HOME"] = str(PRETRAINED_DIR)
+os.environ["TRANSFORMERS_CACHE"] = str(PRETRAINED_DIR / "transformers")
+os.environ["HUGGINGFACE_HUB_CACHE"] = str(HUB_DIR)
+# 强制离线模式，避免联网下载
+os.environ["HF_HUB_OFFLINE"] = "0"
+os.environ["TRANSFORMERS_OFFLINE"] = "0"
 
 sys.path.insert(0, '/home/software/One2All-paddle')
 from anomalib.models.image.patchcore.torch_model import PatchcoreModel
@@ -285,9 +299,11 @@ class PatchCoreTrainer:
 
     def __init__(
         self,
-        output_dir: str = "/home/software/One2All-paddle/output",
+        output_dir: str = None,
         max_concurrent: int = 2,
     ):
+        if output_dir is None:
+            output_dir = str(get_output_dir())
         self.output_dir = Path(output_dir)
         self.max_concurrent = max_concurrent
         self._semaphore = threading.Semaphore(max_concurrent)
@@ -386,8 +402,11 @@ class PatchCoreTrainer:
         config: dict,
         groups: Dict[Any, List[Dict]],
         group_id: str = None,
-    ) -> List[str]:
-        """批量启动训练任务"""
+    ) -> tuple[List[str], List[str]]:
+        """批量启动训练任务
+        Returns:
+            tuple: (task_ids, filtered_group_keys) - 返回任务ID列表和实际训练的分组合并后的keys
+        """
         if group_id:
             config = dict(config)
             config["external_group_id"] = group_id
@@ -417,12 +436,14 @@ class PatchCoreTrainer:
             filtered_groups[grp_id] = annotations
 
         task_ids: List[str] = []
+        filtered_keys: List[str] = []
         for grp_id in sorted(filtered_groups.keys(), key=str):
             task_id = self._create_group_training_task(
                 dataset_dir, config, grp_id, filtered_groups[grp_id]
             )
             task_ids.append(task_id)
-        return task_ids
+            filtered_keys.append(str(grp_id))
+        return task_ids, filtered_keys
 
     def _create_group_training_task(
         self,
@@ -513,6 +534,7 @@ class PatchCoreTrainer:
             str(config.get("project_id", "")),
             str(config.get("task_uuid", "")),
             str(config.get("model_name", "")),
+            str(config.get("train_mode", "by_pos_id")),
         ]
         if roi_id is not None:
             parts.append(f"roi_{roi_id}")
@@ -775,6 +797,7 @@ class PatchCoreTrainer:
             'augment': augment,
             'num_augmentations': num_augmentations,
             'target_size': target_size,
+            'train_mode': config.get("train_mode", "by_pos_id"),
             'roi_size_stats': {
                 'avg_width': avg_width,
                 'avg_height': avg_height,

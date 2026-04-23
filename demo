@@ -1,0 +1,196 @@
+6-04-23 17:31:11 - __main__ - INFO - [LightGlue] 预计算模板变体特征 (24 个变体)...
+2026-04-23 17:31:13 - __main__ - INFO - [LightGlue] 模板变体特征预计算完成，耗时 1.933s，共 24 个变体
+2026-04-23 17:31:13 - uvicorn.error - INFO - Application startup complete.
+2026-04-23 17:31:13 - uvicorn.error - INFO - Uvicorn running on http://0.0.0.0:39605 (Press CTRL+C to quit)
+2026-04-23 17:31:16 - uvicorn.access - INFO - 127.0.0.1:45494 - "GET /health HTTP/1.1" 200
+2026-04-23 17:31:18 - uvicorn.access - INFO - 127.0.0.1:35072 - "GET /health HTTP/1.1" 200
+2026-04-23 17:31:22 - __main__ - INFO - [1776936682447] ========== PREDICT REQUEST ==========
+2026-04-23 17:31:22 - __main__ - INFO - [1776936682447] ▶️ STEP START: image_decode
+2026-04-23 17:31:22 - __main__ - INFO - [1776936682447] 文件上传: image.jpg, 3929362 bytes, 解码耗时: 77.9ms (OpenCV)
+2026-04-23 17:31:22 - __main__ - INFO - [1776936682447] 图像解码成功 shape=(1656, 1317, 3)
+2026-04-23 17:31:22 - __main__ - INFO - [1776936682447] ✅ STEP END: image_decode | Time: 0.078s
+2026-04-23 17:31:22 - __main__ - INFO - [1776936682447] ▶️ STEP START: total_inference
+2026-04-23 17:31:22 - __main__ - INFO - 使用 segmentation 提取工件主体: (1159,14,1560,2836)
+2026-04-23 17:31:22 - __main__ - INFO - [1776936682447] ▶️ STEP START: lightglue_detect
+2026-04-23 17:31:22 - __main__ - INFO - [LightGlue] 使用缓存的模板变体特征 (24 个变体)
+2026-04-23 17:31:22 - __main__ - INFO - [LightGlue] 提取场景特征（仅一次）...
+2026-04-23 17:31:22 - __main__ - INFO - [LightGlue] 初始场景特征点: 2048
+2026-04-23 17:31:22 - __main__ - INFO - [LightGlue] 开始寻找第 1 个工件...
+2026-04-23 17:31:22 - __main__ - INFO - [LightGlue] 找到工件 1: 角度=-90.06°, 内点数=687
+2026-04-23 17:31:22 - __main__ - INFO - [LightGlue] 过滤后剩余特征点: 684
+2026-04-23 17:31:22 - __main__ - INFO - [LightGlue] 开始寻找第 2 个工件...
+2026-04-23 17:31:23 - __main__ - INFO - [LightGlue] 第 2 轮未找到有效匹配，结束
+2026-04-23 17:31:23 - __main__ - INFO - [LightGlue] 共检测到 1 个工件
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447] ✅ STEP END: lightglue_detect | Time: 0.476s
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447] ▶️ STEP START: per_workpiece_inference
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447] 并行处理 1 个工件
+2026-04-23 17:31:23 - __main__ - INFO - [process_single_workpiece_roi] TRAIN_MODE: by_category, loaded_categories: ['金属低孔', '大圆孔', '螺丝孔']
+2026-04-23 17:31:23 - __main__ - INFO - [detect_by_pos_id] TRAIN_MODE: by_category, category: 螺丝孔, total_rois: 88
+2026-04-23 17:31:23 - __main__ - INFO - [detect_by_pos_id] 分组结果: ['螺丝孔']
+2026-04-23 17:31:23 - __main__ - INFO - Loaded target_size from config: [43, 43]
+2026-04-23 17:31:23 - __main__ - INFO - Loaded PatchCore model: pos_id=螺丝孔 (backbone=resnet18, layers=['layer2', 'layer3'], bank=torch.Size([68992, 384]), threshold=17.093224597049723, target_size=[43, 43])
+2026-04-23 17:31:23 - __main__ - INFO - Lazy loaded model for pos_id=螺丝孔
+2026-04-23 17:31:23 - __main__ - ERROR - [AnomalibPatchCoreWrapper] batch inference failed: CUDA out of memory. Tried to allocate 6.45 GiB. GPU 0 has a total capacity of 15.60 GiB of which 5.97 GiB is free. Process 47279 has 2.61 GiB memory in use. Including non-PyTorch memory, this process has 7.00 GiB memory in use. Of the allocated memory 6.65 GiB is allocated by PyTorch, and 149.54 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 1/88 pos_id=螺丝孔 roi_size=19x22 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 2/88 pos_id=螺丝孔 roi_size=19x20 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 3/88 pos_id=螺丝孔 roi_size=22x20 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 4/88 pos_id=螺丝孔 roi_size=17x20 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 5/88 pos_id=螺丝孔 roi_size=20x20 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 6/88 pos_id=螺丝孔 roi_size=19x22 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 7/88 pos_id=螺丝孔 roi_size=23x18 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 8/88 pos_id=螺丝孔 roi_size=22x18 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 9/88 pos_id=螺丝孔 roi_size=25x18 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 10/88 pos_id=螺丝孔 roi_size=23x17 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 11/88 pos_id=螺丝孔 roi_size=25x22 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 12/88 pos_id=螺丝孔 roi_size=28x25 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 13/88 pos_id=螺丝孔 roi_size=31x23 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 14/88 pos_id=螺丝孔 roi_size=30x22 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 15/88 pos_id=螺丝孔 roi_size=28x23 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 16/88 pos_id=螺丝孔 roi_size=30x28 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 17/88 pos_id=螺丝孔 roi_size=24x27 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 18/88 pos_id=螺丝孔 roi_size=24x24 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 19/88 pos_id=螺丝孔 roi_size=23x26 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 20/88 pos_id=螺丝孔 roi_size=22x23 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 21/88 pos_id=螺丝孔 roi_size=22x24 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 22/88 pos_id=螺丝孔 roi_size=21x24 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 23/88 pos_id=螺丝孔 roi_size=20x20 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 24/88 pos_id=螺丝孔 roi_size=23x25 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 25/88 pos_id=螺丝孔 roi_size=25x24 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 26/88 pos_id=螺丝孔 roi_size=18x24 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 27/88 pos_id=螺丝孔 roi_size=27x23 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 28/88 pos_id=螺丝孔 roi_size=25x26 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 29/88 pos_id=螺丝孔 roi_size=24x28 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 30/88 pos_id=螺丝孔 roi_size=20x23 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 31/88 pos_id=螺丝孔 roi_size=23x28 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 32/88 pos_id=螺丝孔 roi_size=22x26 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - ERROR - [AnomalibPatchCoreWrapper] batch inference failed: CUDA out of memory. Tried to allocate 6.45 GiB. GPU 0 has a total capacity of 15.60 GiB of which 6.00 GiB is free. Process 47279 has 2.61 GiB memory in use. Including non-PyTorch memory, this process has 6.98 GiB memory in use. Of the allocated memory 6.65 GiB is allocated by PyTorch, and 123.54 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 33/88 pos_id=螺丝孔 roi_size=22x25 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 34/88 pos_id=螺丝孔 roi_size=21x23 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 35/88 pos_id=螺丝孔 roi_size=20x21 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 36/88 pos_id=螺丝孔 roi_size=24x22 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 37/88 pos_id=螺丝孔 roi_size=22x25 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 38/88 pos_id=螺丝孔 roi_size=24x22 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 39/88 pos_id=螺丝孔 roi_size=19x24 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 40/88 pos_id=螺丝孔 roi_size=20x21 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 41/88 pos_id=螺丝孔 roi_size=20x28 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 42/88 pos_id=螺丝孔 roi_size=22x25 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 43/88 pos_id=螺丝孔 roi_size=23x24 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 44/88 pos_id=螺丝孔 roi_size=25x23 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 45/88 pos_id=螺丝孔 roi_size=24x27 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 46/88 pos_id=螺丝孔 roi_size=22x23 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 47/88 pos_id=螺丝孔 roi_size=23x22 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 48/88 pos_id=螺丝孔 roi_size=23x27 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 49/88 pos_id=螺丝孔 roi_size=23x21 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 50/88 pos_id=螺丝孔 roi_size=23x25 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 51/88 pos_id=螺丝孔 roi_size=29x26 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 52/88 pos_id=螺丝孔 roi_size=25x18 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 53/88 pos_id=螺丝孔 roi_size=24x19 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 54/88 pos_id=螺丝孔 roi_size=26x22 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 55/88 pos_id=螺丝孔 roi_size=23x22 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 56/88 pos_id=螺丝孔 roi_size=31x25 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 57/88 pos_id=螺丝孔 roi_size=27x25 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 58/88 pos_id=螺丝孔 roi_size=24x22 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 59/88 pos_id=螺丝孔 roi_size=23x24 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 60/88 pos_id=螺丝孔 roi_size=23x22 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 61/88 pos_id=螺丝孔 roi_size=28x26 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 62/88 pos_id=螺丝孔 roi_size=28x22 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 63/88 pos_id=螺丝孔 roi_size=27x21 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:23 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 64/88 pos_id=螺丝孔 roi_size=26x23 score=0.0000 threshold=22.2212 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 65/88 pos_id=螺丝孔 roi_size=24x26 score=14.1029 threshold=22.2212 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 66/88 pos_id=螺丝孔 roi_size=25x22 score=12.3320 threshold=22.2212 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 67/88 pos_id=螺丝孔 roi_size=28x22 score=12.2883 threshold=22.2212 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 68/88 pos_id=螺丝孔 roi_size=20x27 score=13.6078 threshold=22.2212 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 69/88 pos_id=螺丝孔 roi_size=26x27 score=12.9432 threshold=22.2212 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 70/88 pos_id=螺丝孔 roi_size=22x25 score=11.2067 threshold=22.2212 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 71/88 pos_id=螺丝孔 roi_size=27x25 score=11.4791 threshold=22.2212 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 72/88 pos_id=螺丝孔 roi_size=23x24 score=11.4342 threshold=22.2212 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 73/88 pos_id=螺丝孔 roi_size=25x18 score=14.9575 threshold=22.2212 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 74/88 pos_id=螺丝孔 roi_size=27x28 score=10.9233 threshold=22.2212 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 75/88 pos_id=螺丝孔 roi_size=19x24 score=11.2686 threshold=22.2212 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 76/88 pos_id=螺丝孔 roi_size=17x23 score=11.6195 threshold=22.2212 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 77/88 pos_id=螺丝孔 roi_size=24x27 score=11.3235 threshold=22.2212 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 78/88 pos_id=螺丝孔 roi_size=27x25 score=10.3808 threshold=22.2212 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 79/88 pos_id=螺丝孔 roi_size=26x24 score=10.9357 threshold=22.2212 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 80/88 pos_id=螺丝孔 roi_size=29x22 score=10.5417 threshold=22.2212 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 81/88 pos_id=螺丝孔 roi_size=22x26 score=10.3518 threshold=22.2212 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 82/88 pos_id=螺丝孔 roi_size=23x25 score=9.4620 threshold=22.2212 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 83/88 pos_id=螺丝孔 roi_size=23x25 score=9.7897 threshold=22.2212 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 84/88 pos_id=螺丝孔 roi_size=22x25 score=10.2335 threshold=22.2212 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 85/88 pos_id=螺丝孔 roi_size=24x27 score=9.6748 threshold=22.2212 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 86/88 pos_id=螺丝孔 roi_size=27x27 score=10.4951 threshold=22.2212 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 87/88 pos_id=螺丝孔 roi_size=31x25 score=10.2075 threshold=22.2212 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [螺丝孔] ROI 88/88 pos_id=螺丝孔 roi_size=26x24 score=10.3483 threshold=22.2212 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [detect_by_pos_id] TRAIN_MODE: by_category, category: 大圆孔, total_rois: 24
+2026-04-23 17:31:24 - __main__ - INFO - [detect_by_pos_id] 分组结果: ['大圆孔']
+2026-04-23 17:31:24 - __main__ - INFO - Loaded target_size from config: [52, 49]
+2026-04-23 17:31:24 - __main__ - INFO - Loaded PatchCore model: pos_id=大圆孔 (backbone=resnet18, layers=['layer2', 'layer3'], bank=torch.Size([18816, 384]), threshold=17.828432065130038, target_size=[52, 49])
+2026-04-23 17:31:24 - __main__ - INFO - Lazy loaded model for pos_id=大圆孔
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [大圆孔] ROI 1/24 pos_id=大圆孔 roi_size=29x28 score=15.5159 threshold=23.1770 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [大圆孔] ROI 2/24 pos_id=大圆孔 roi_size=33x32 score=14.2374 threshold=23.1770 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [大圆孔] ROI 3/24 pos_id=大圆孔 roi_size=36x31 score=14.4338 threshold=23.1770 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [大圆孔] ROI 4/24 pos_id=大圆孔 roi_size=31x30 score=14.3128 threshold=23.1770 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [大圆孔] ROI 5/24 pos_id=大圆孔 roi_size=36x30 score=15.0470 threshold=23.1770 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [大圆孔] ROI 6/24 pos_id=大圆孔 roi_size=35x29 score=14.7653 threshold=23.1770 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [大圆孔] ROI 7/24 pos_id=大圆孔 roi_size=32x26 score=15.9842 threshold=23.1770 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [大圆孔] ROI 8/24 pos_id=大圆孔 roi_size=25x28 score=16.5197 threshold=23.1770 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [大圆孔] ROI 9/24 pos_id=大圆孔 roi_size=36x27 score=15.2520 threshold=23.1770 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [大圆孔] ROI 10/24 pos_id=大圆孔 roi_size=31x31 score=20.1698 threshold=23.1770 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [大圆孔] ROI 11/24 pos_id=大圆孔 roi_size=32x33 score=15.0403 threshold=23.1770 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [大圆孔] ROI 12/24 pos_id=大圆孔 roi_size=32x29 score=15.9908 threshold=23.1770 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [大圆孔] ROI 13/24 pos_id=大圆孔 roi_size=35x27 score=16.4990 threshold=23.1770 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [大圆孔] ROI 14/24 pos_id=大圆孔 roi_size=31x32 score=17.9889 threshold=23.1770 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [大圆孔] ROI 15/24 pos_id=大圆孔 roi_size=33x32 score=15.5014 threshold=23.1770 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [大圆孔] ROI 16/24 pos_id=大圆孔 roi_size=38x32 score=17.1531 threshold=23.1770 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [大圆孔] ROI 17/24 pos_id=大圆孔 roi_size=37x34 score=16.0389 threshold=23.1770 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [大圆孔] ROI 18/24 pos_id=大圆孔 roi_size=34x33 score=15.6015 threshold=23.1770 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [大圆孔] ROI 19/24 pos_id=大圆孔 roi_size=33x33 score=14.4507 threshold=23.1770 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [大圆孔] ROI 20/24 pos_id=大圆孔 roi_size=31x29 score=15.7719 threshold=23.1770 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [大圆孔] ROI 21/24 pos_id=大圆孔 roi_size=32x29 score=15.4361 threshold=23.1770 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [大圆孔] ROI 22/24 pos_id=大圆孔 roi_size=27x28 score=17.3273 threshold=23.1770 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [大圆孔] ROI 23/24 pos_id=大圆孔 roi_size=33x28 score=16.8731 threshold=23.1770 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [1776936682447_wp1_wp1] [大圆孔] ROI 24/24 pos_id=大圆孔 roi_size=30x27 score=17.4160 threshold=23.1770 (batch)
+2026-04-23 17:31:24 - __main__ - INFO - [detect_by_pos_id] TRAIN_MODE: by_category, category: 金属低孔, total_rois: 31
+2026-04-23 17:31:24 - __main__ - INFO - [detect_by_pos_id] 分组结果: ['金属低孔']
+2026-04-23 17:31:25 - __main__ - INFO - Loaded target_size from config: [40, 39]
+2026-04-23 17:31:25 - __main__ - INFO - Loaded PatchCore model: pos_id=金属低孔 (backbone=resnet18, layers=['layer2', 'layer3'], bank=torch.Size([24304, 384]), threshold=17.777158569158853, target_size=[40, 39])
+2026-04-23 17:31:25 - __main__ - INFO - Lazy loaded model for pos_id=金属低孔
+2026-04-23 17:31:25 - __main__ - INFO - [1776936682447_wp1_wp1] [金属低孔] ROI 1/31 pos_id=金属低孔 roi_size=16x17 score=16.3549 threshold=23.1103 (batch)
+2026-04-23 17:31:25 - __main__ - INFO - [1776936682447_wp1_wp1] [金属低孔] ROI 2/31 pos_id=金属低孔 roi_size=18x17 score=16.8776 threshold=23.1103 (batch)
+2026-04-23 17:31:25 - __main__ - INFO - [1776936682447_wp1_wp1] [金属低孔] ROI 3/31 pos_id=金属低孔 roi_size=20x17 score=16.9050 threshold=23.1103 (batch)
+2026-04-23 17:31:25 - __main__ - INFO - [1776936682447_wp1_wp1] [金属低孔] ROI 4/31 pos_id=金属低孔 roi_size=17x18 score=16.4855 threshold=23.1103 (batch)
+2026-04-23 17:31:25 - __main__ - INFO - [1776936682447_wp1_wp1] [金属低孔] ROI 5/31 pos_id=金属低孔 roi_size=17x17 score=16.6109 threshold=23.1103 (batch)
+2026-04-23 17:31:25 - __main__ - INFO - [1776936682447_wp1_wp1] [金属低孔] ROI 6/31 pos_id=金属低孔 roi_size=20x16 score=15.2257 threshold=23.1103 (batch)
+2026-04-23 17:31:25 - __main__ - INFO - [1776936682447_wp1_wp1] [金属低孔] ROI 7/31 pos_id=金属低孔 roi_size=23x18 score=14.8951 threshold=23.1103 (batch)
+2026-04-23 17:31:25 - __main__ - INFO - [1776936682447_wp1_wp1] [金属低孔] ROI 8/31 pos_id=金属低孔 roi_size=19x22 score=15.3088 threshold=23.1103 (batch)
+2026-04-23 17:31:25 - __main__ - INFO - [1776936682447_wp1_wp1] [金属低孔] ROI 9/31 pos_id=金属低孔 roi_size=22x18 score=15.2886 threshold=23.1103 (batch)
+2026-04-23 17:31:25 - __main__ - INFO - [1776936682447_wp1_wp1] [金属低孔] ROI 10/31 pos_id=金属低孔 roi_size=25x19 score=16.1748 threshold=23.1103 (batch)
+2026-04-23 17:31:25 - __main__ - INFO - [1776936682447_wp1_wp1] [金属低孔] ROI 11/31 pos_id=金属低孔 roi_size=22x21 score=15.8377 threshold=23.1103 (batch)
+2026-04-23 17:31:25 - __main__ - INFO - [1776936682447_wp1_wp1] [金属低孔] ROI 12/31 pos_id=金属低孔 roi_size=20x21 score=14.7619 threshold=23.1103 (batch)
+2026-04-23 17:31:25 - __main__ - INFO - [1776936682447_wp1_wp1] [金属低孔] ROI 13/31 pos_id=金属低孔 roi_size=23x21 score=14.7338 threshold=23.1103 (batch)
+2026-04-23 17:31:25 - __main__ - INFO - [1776936682447_wp1_wp1] [金属低孔] ROI 14/31 pos_id=金属低孔 roi_size=28x20 score=15.8189 threshold=23.1103 (batch)
+2026-04-23 17:31:25 - __main__ - INFO - [1776936682447_wp1_wp1] [金属低孔] ROI 15/31 pos_id=金属低孔 roi_size=24x19 score=14.6995 threshold=23.1103 (batch)
+2026-04-23 17:31:25 - __main__ - INFO - [1776936682447_wp1_wp1] [金属低孔] ROI 16/31 pos_id=金属低孔 roi_size=21x24 score=17.6026 threshold=23.1103 (batch)
+2026-04-23 17:31:25 - __main__ - INFO - [1776936682447_wp1_wp1] [金属低孔] ROI 17/31 pos_id=金属低孔 roi_size=22x25 score=13.7096 threshold=23.1103 (batch)
+2026-04-23 17:31:25 - __main__ - INFO - [1776936682447_wp1_wp1] [金属低孔] ROI 18/31 pos_id=金属低孔 roi_size=25x22 score=14.1446 threshold=23.1103 (batch)
+2026-04-23 17:31:25 - __main__ - INFO - [1776936682447_wp1_wp1] [金属低孔] ROI 19/31 pos_id=金属低孔 roi_size=22x23 score=13.5607 threshold=23.1103 (batch)
+2026-04-23 17:31:25 - __main__ - INFO - [1776936682447_wp1_wp1] [金属低孔] ROI 20/31 pos_id=金属低孔 roi_size=20x23 score=14.0397 threshold=23.1103 (batch)
+2026-04-23 17:31:25 - __main__ - INFO - [1776936682447_wp1_wp1] [金属低孔] ROI 21/31 pos_id=金属低孔 roi_size=26x23 score=14.0317 threshold=23.1103 (batch)
+2026-04-23 17:31:25 - __main__ - INFO - [1776936682447_wp1_wp1] [金属低孔] ROI 22/31 pos_id=金属低孔 roi_size=19x24 score=13.3903 threshold=23.1103 (batch)
+2026-04-23 17:31:25 - __main__ - INFO - [1776936682447_wp1_wp1] [金属低孔] ROI 23/31 pos_id=金属低孔 roi_size=22x22 score=13.1950 threshold=23.1103 (batch)
+2026-04-23 17:31:25 - __main__ - INFO - [1776936682447_wp1_wp1] [金属低孔] ROI 24/31 pos_id=金属低孔 roi_size=22x21 score=14.0232 threshold=23.1103 (batch)
+2026-04-23 17:31:25 - __main__ - INFO - [1776936682447_wp1_wp1] [金属低孔] ROI 25/31 pos_id=金属低孔 roi_size=24x22 score=14.1135 threshold=23.1103 (batch)
+2026-04-23 17:31:25 - __main__ - INFO - [1776936682447_wp1_wp1] [金属低孔] ROI 26/31 pos_id=金属低孔 roi_size=19x19 score=13.5398 threshold=23.1103 (batch)
+2026-04-23 17:31:25 - __main__ - INFO - [1776936682447_wp1_wp1] [金属低孔] ROI 27/31 pos_id=金属低孔 roi_size=20x19 score=13.3050 threshold=23.1103 (batch)
+2026-04-23 17:31:25 - __main__ - INFO - [1776936682447_wp1_wp1] [金属低孔] ROI 28/31 pos_id=金属低孔 roi_size=22x21 score=12.8281 threshold=23.1103 (batch)
+2026-04-23 17:31:25 - __main__ - INFO - [1776936682447_wp1_wp1] [金属低孔] ROI 29/31 pos_id=金属低孔 roi_size=22x23 score=12.2830 threshold=23.1103 (batch)
+2026-04-23 17:31:25 - __main__ - INFO - [1776936682447_wp1_wp1] [金属低孔] ROI 30/31 pos_id=金属低孔 roi_size=21x20 score=13.6214 threshold=23.1103 (batch)
+2026-04-23 17:31:25 - __main__ - INFO - [1776936682447_wp1_wp1] [金属低孔] ROI 31/31 pos_id=金属低孔 roi_size=21x24 score=15.4511 threshold=23.1103 (batch)
+2026-04-23 17:31:25 - __main__ - INFO - [1776936682447] 并行处理完成，总耗时 2.436s
+2026-04-23 17:31:25 - __main__ - INFO - [1776936682447] ✅ STEP END: per_workpiece_inference | Time: 2.437s
+2026-04-23 17:31:25 - __main__ - INFO - [1776936682447] 📊 PERFORMANCE SUMMARY (Total: 2.991s)
+2026-04-23 17:31:25 - __main__ - INFO - [1776936682447]   - per_workpiece_inference: 2.437s (81.5%)
+2026-04-23 17:31:25 - __main__ - INFO - [1776936682447]   - lightglue_detect: 0.476s (15.9%)
+2026-04-23 17:31:25 - __main__ - INFO - [1776936682447]   - image_decode: 0.078s (2.6%)
+2026-04-23 17:31:25 - __main__ - INFO - [1776936682447] 完成: workpieces=1, anomalies=0, time=2.994s
+2026-04-23 17:31:25 - __main__ - INFO - [1776936682447] ========== REQUEST COMPLETED ==========
+2026-04-23 17:31:25 - uvicorn.access - INFO - 192.168.124.45:59787 - "POST /predict HTTP/1.1" 200
