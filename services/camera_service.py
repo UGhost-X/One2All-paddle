@@ -132,9 +132,47 @@ class CameraService:
 
             try:
                 tl_factory = self._pylon.TlFactory.GetInstance()
-                device_info = self._pylon.DeviceInfo()
-                device_info.SetPropertyValue("IpAddress", self._config.ip_address)
-                device_info.SetPropertyValue("DeviceClass", "BaslerGigE")
+
+                # 先尝试枚举设备，获取完整的 DeviceInfo
+                # 这样可以确保 pylon 知道相机在哪个网络接口上
+                device_info = None
+                try:
+                    all_devices = tl_factory.EnumerateDevices()
+                    for dev in all_devices:
+                        try:
+                            if dev.GetIpAddress() == self._config.ip_address:
+                                device_info = dev
+                                logger.info(
+                                    f"Found camera {self._config.ip_address} via enumeration "
+                                    f"(interface: {dev.GetInterface() if hasattr(dev, 'GetInterface') else 'unknown'})"
+                                )
+                                break
+                        except Exception:
+                            pass
+                except Exception as e:
+                    logger.warning(f"Device enumeration failed, falling back to direct connect: {e}")
+
+                # 如果枚举失败，使用部分 DeviceInfo（适用于远程相机）
+                if device_info is None:
+                    logger.warning(
+                        f"Camera {self._config.ip_address} not found via enumeration; "
+                        "using partial DeviceInfo for remote camera connection"
+                    )
+                    device_info = self._pylon.DeviceInfo()
+                    device_info.SetPropertyValue("IpAddress", self._config.ip_address)
+                    device_info.SetPropertyValue("DeviceClass", "BaslerGigE")
+                    # 对于远程相机，尝试设置子网掩码和网关信息
+                    # 这有助于 pylon 通过路由连接到远程相机
+                    try:
+                        # 尝试设置子网（可选，有助于路由）
+                        device_info.SetPropertyValue("SubnetMask", "255.255.255.0")
+                    except Exception:
+                        pass
+                    try:
+                        # 设置默认网关（如果需要跨网段通信）
+                        device_info.SetPropertyValue("DefaultGateway", "192.168.110.1")
+                    except Exception:
+                        pass
 
                 self._camera = self._pylon.InstantCamera(tl_factory.CreateDevice(device_info))
                 self._camera.MaxNumBuffer = 50
@@ -348,6 +386,7 @@ class CameraService:
                     return False, msg
 
             try:
+
                 self._camera.StartGrabbing(self._pylon.GrabStrategy_OneByOne)
 
                 for attempt in range(self._config.max_retry):

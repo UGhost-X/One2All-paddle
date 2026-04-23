@@ -1,3 +1,8 @@
+"""
+相机管理路由 V2
+支持多品牌相机，保持与V1 API兼容
+"""
+
 import os
 import logging
 from typing import Optional, List
@@ -5,49 +10,52 @@ from pydantic import BaseModel, Field
 from fastapi import APIRouter, HTTPException, Query, Form
 from fastapi.responses import StreamingResponse, JSONResponse
 
-from services.camera_manager import camera_manager, CameraConfig
+from services.camera_manager import camera_manager
+from services.camera_instance import CameraConfig
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/camera", tags=["Camera"])
 
 
+# ========== 请求模型 ==========
+
 class CreateCameraRequest(BaseModel):
     camera_id: str = Field(..., description="相机唯一标识ID")
+    vendor: str = Field(default="Basler", description="相机品牌: Basler, Hikrobot")
     ip_address: str = Field(default="192.168.110.10", description="相机IP地址")
     width: Optional[int] = Field(default=None, description="目标宽度，None表示使用最大分辨率")
     height: Optional[int] = Field(default=None, description="目标高度，None表示使用最大分辨率")
     packet_size: int = Field(default=1500, description="数据包大小")
-    # 新增参数
-    exposure_time: Optional[int] = Field(default=None, description="曝光时间（微秒），必须是52的倍数，范围52-10000016")
-    gain: Optional[int] = Field(default=None, description="增益，范围0-1957")
-    offset_x: Optional[int] = Field(default=None, description="水平偏移（像素），必须是4的倍数，全尺寸时失效")
-    offset_y: Optional[int] = Field(default=None, description="垂直偏移（像素），必须是2的倍数，全尺寸时失效")
+    exposure_time: Optional[int] = Field(default=None, description="曝光时间（微秒）")
+    gain: Optional[int] = Field(default=None, description="增益")
+    offset_x: Optional[int] = Field(default=None, description="水平偏移（像素）")
+    offset_y: Optional[int] = Field(default=None, description="垂直偏移（像素）")
 
 
 class ConnectRequest(BaseModel):
     ip_address: Optional[str] = Field(default="192.168.110.10", description="相机IP地址")
+    vendor: Optional[str] = Field(default="Basler", description="相机品牌")
     width: Optional[int] = Field(default=None, description="目标宽度")
     height: Optional[int] = Field(default=None, description="目标高度")
     packet_size: int = Field(default=1500, description="数据包大小")
-    # 新增参数
-    exposure_time: Optional[int] = Field(default=None, description="曝光时间（微秒），必须是52的倍数")
-    gain: Optional[int] = Field(default=None, description="增益，范围0-1957")
-    offset_x: Optional[int] = Field(default=None, description="水平偏移（像素），必须是4的倍数，全尺寸时失效")
-    offset_y: Optional[int] = Field(default=None, description="垂直偏移（像素），必须是2的倍数，全尺寸时失效")
+    exposure_time: Optional[int] = Field(default=None, description="曝光时间（微秒）")
+    gain: Optional[int] = Field(default=None, description="增益")
+    offset_x: Optional[int] = Field(default=None, description="水平偏移（像素）")
+    offset_y: Optional[int] = Field(default=None, description="垂直偏移（像素）")
 
 
 class ConfigRequest(BaseModel):
     ip_address: Optional[str] = None
+    vendor: Optional[str] = None
     width: Optional[int] = None
     height: Optional[int] = None
     packet_size: Optional[int] = None
     timeout_ms: Optional[int] = None
     max_retry: Optional[int] = None
-    # 新增参数
-    exposure_time: Optional[int] = Field(default=None, description="曝光时间（微秒），必须是52的倍数")
-    gain: Optional[int] = Field(default=None, description="增益，范围0-1957")
-    offset_x: Optional[int] = Field(default=None, description="水平偏移（像素），必须是4的倍数，全尺寸时失效")
-    offset_y: Optional[int] = Field(default=None, description="垂直偏移（像素），必须是2的倍数，全尺寸时失效")
+    exposure_time: Optional[int] = Field(default=None, description="曝光时间（微秒）")
+    gain: Optional[int] = Field(default=None, description="增益")
+    offset_x: Optional[int] = Field(default=None, description="水平偏移（像素）")
+    offset_y: Optional[int] = Field(default=None, description="垂直偏移（像素）")
 
 
 class CaptureResponse(BaseModel):
@@ -58,43 +66,53 @@ class CaptureResponse(BaseModel):
 
 class CameraInfo(BaseModel):
     camera_id: str
+    vendor: str
     ip_address: str
     connected: bool
     resolution: Optional[str] = None
 
 
 class DiscoveredCamera(BaseModel):
+    vendor: str
     ip_address: str
     model: str
     serial: str
     device_class: str
 
 
+class SwitchVendorRequest(BaseModel):
+    new_vendor: str = Field(..., description="新品牌: Basler, Hikrobot")
+
+
+# ========== 相机管理接口 ==========
+
 @router.post("/create", response_model=CaptureResponse)
 async def create_camera(
     camera_id: str = Form(..., description="相机唯一标识ID"),
+    vendor: str = Form(default="Basler", description="相机品牌: Basler, Hikrobot"),
     ip_address: str = Form(default="192.168.110.10", description="相机IP地址"),
     width: Optional[int] = Form(default=None, description="目标宽度"),
     height: Optional[int] = Form(default=None, description="目标高度"),
     packet_size: int = Form(default=1500, description="数据包大小"),
-    exposure_time: Optional[int] = Form(default=None, description="曝光时间（微秒），必须是52的倍数，范围52-10000016"),
-    gain: Optional[int] = Form(default=None, description="增益，范围0-1957"),
-    offset_x: Optional[int] = Form(default=None, description="水平偏移（像素），必须是4的倍数，全尺寸时失效"),
-    offset_y: Optional[int] = Form(default=None, description="垂直偏移（像素），必须是2的倍数，全尺寸时失效")
+    exposure_time: Optional[int] = Form(default=None, description="曝光时间（微秒）"),
+    gain: Optional[int] = Form(default=None, description="增益"),
+    offset_x: Optional[int] = Form(default=None, description="水平偏移（像素）"),
+    offset_y: Optional[int] = Form(default=None, description="垂直偏移（像素）")
 ):
     """
     创建新的相机实例
-
+    
     - camera_id: 唯一标识，如 "camera_1", "left_camera" 等
+    - vendor: 品牌，支持 "Basler", "Hikrobot"
     - ip_address: 相机IP地址
     - width/height: 可选，None表示使用最大分辨率
-    - exposure_time: 曝光时间（微秒），必须是52的倍数
-    - gain: 增益，范围0-1957
-    - offset_x: 水平偏移（像素），必须是4的倍数，全尺寸时失效
-    - offset_y: 垂直偏移（像素），必须是2的倍数，全尺寸时失效
+    - exposure_time: 曝光时间（微秒）
+    - gain: 增益
+    - offset_x/y: 偏移量
     """
     success, message = camera_manager.create_camera(
         camera_id=camera_id,
+        vendor=vendor,
         ip_address=ip_address,
         width=width,
         height=height,
@@ -106,7 +124,7 @@ async def create_camera(
     )
 
     if success:
-        return CaptureResponse(success=True, message=message, data={"camera_id": camera_id})
+        return CaptureResponse(success=True, message=message, data={"camera_id": camera_id, "vendor": vendor})
     else:
         raise HTTPException(status_code=400, detail=message)
 
@@ -133,10 +151,26 @@ async def list_cameras():
     }
 
 
+@router.get("/vendors")
+async def get_available_vendors():
+    """获取支持的相机品牌列表"""
+    vendors = camera_manager.get_available_vendors()
+    vendor_status = camera_manager.check_vendor_status()
+    return {
+        "success": True,
+        "vendors": vendors,
+        "status": vendor_status
+    }
+
+
 @router.get("/discover")
-async def discover_cameras():
-    """发现网络中的Basler相机"""
-    discovered = camera_manager.discover_cameras()
+async def discover_cameras(vendor: Optional[str] = Query(None, description="指定品牌，空表示所有品牌")):
+    """
+    发现网络中的相机
+    
+    - vendor: 可选，指定品牌如 "Basler", "Hikrobot"
+    """
+    discovered = camera_manager.discover_cameras(vendor=vendor)
     return {
         "success": True,
         "count": len(discovered),
@@ -144,29 +178,49 @@ async def discover_cameras():
     }
 
 
+@router.post("/{camera_id}/switch-vendor", response_model=CaptureResponse)
+async def switch_camera_vendor(camera_id: str, request: SwitchVendorRequest):
+    """
+    切换相机品牌（保留配置）
+    
+    - 用于在同一IP地址上切换不同品牌的相机驱动
+    """
+    success, message = camera_manager.switch_camera_vendor(camera_id, request.new_vendor)
+
+    if success:
+        return CaptureResponse(success=True, message=message, data={"camera_id": camera_id, "vendor": request.new_vendor})
+    else:
+        raise HTTPException(status_code=400, detail=message)
+
+
+# ========== 连接控制接口 ==========
+
 @router.post("/{camera_id}/connect", response_model=CaptureResponse)
 async def connect_camera(
     camera_id: str,
     ip_address: Optional[str] = Form(default=None, description="相机IP地址（可选，覆盖创建时的配置）"),
+    vendor: Optional[str] = Form(default=None, description="品牌（可选，覆盖创建时的配置）"),
     width: Optional[int] = Form(default=None, description="目标宽度"),
     height: Optional[int] = Form(default=None, description="目标高度"),
     packet_size: Optional[int] = Form(default=None, description="数据包大小"),
-    exposure_time: Optional[int] = Form(default=None, description="曝光时间（微秒），必须是52的倍数"),
-    gain: Optional[int] = Form(default=None, description="增益，范围0-1957"),
-    offset_x: Optional[int] = Form(default=None, description="水平偏移（像素），必须是4的倍数，全尺寸时失效"),
-    offset_y: Optional[int] = Form(default=None, description="垂直偏移（像素），必须是2的倍数，全尺寸时失效")
+    exposure_time: Optional[int] = Form(default=None, description="曝光时间（微秒）"),
+    gain: Optional[int] = Form(default=None, description="增益"),
+    offset_x: Optional[int] = Form(default=None, description="水平偏移（像素）"),
+    offset_y: Optional[int] = Form(default=None, description="垂直偏移（像素）")
 ):
     """
     连接指定相机
-
-    - 如果相机不存在，会自动创建（使用camera_id作为标识）
+    
+    - 如果相机不存在，会自动创建
     - 支持临时覆盖IP地址、分辨率、曝光、增益、偏移等配置
     """
     camera = camera_manager.get_camera(camera_id)
 
     if camera is None:
+        # 自动创建相机
         success, msg = camera_manager.create_camera(
             camera_id=camera_id,
+            vendor=vendor or "Basler",
             ip_address=ip_address or "192.168.110.10",
             width=width,
             height=height,
@@ -180,10 +234,12 @@ async def connect_camera(
             raise HTTPException(status_code=400, detail=msg)
         camera = camera_manager.get_camera(camera_id)
 
-    # 只在传入非None值时更新配置，避免覆盖创建时的设置
+    # 更新配置
     updates = {}
     if ip_address is not None:
         updates['ip_address'] = ip_address
+    if vendor is not None:
+        updates['vendor'] = vendor
     if width is not None:
         updates['width'] = width
     if height is not None:
@@ -198,6 +254,7 @@ async def connect_camera(
         updates['offset_x'] = offset_x
     if offset_y is not None:
         updates['offset_y'] = offset_y
+    
     if updates:
         camera.update_config(**updates)
 
@@ -210,6 +267,7 @@ async def connect_camera(
             message=message,
             data={
                 "camera_id": camera_id,
+                "vendor": status.vendor,
                 "resolution": f"{status.width}x{status.height}",
                 "max_resolution": f"{status.max_width}x{status.max_height}",
                 "payload_size_mb": status.payload_size_mb,
@@ -234,6 +292,8 @@ async def disconnect_camera(camera_id: str):
     return CaptureResponse(success=success, message=message)
 
 
+# ========== 状态查询接口 ==========
+
 @router.get("/{camera_id}/status")
 async def get_camera_status(camera_id: str):
     """获取指定相机状态"""
@@ -246,6 +306,7 @@ async def get_camera_status(camera_id: str):
         "success": True,
         "camera_id": camera_id,
         "status": {
+            "vendor": status.vendor,
             "connected": status.connected,
             "width": status.width,
             "height": status.height,
@@ -253,7 +314,6 @@ async def get_camera_status(camera_id: str):
             "max_height": status.max_height,
             "payload_size_mb": status.payload_size_mb,
             "packet_size": status.packet_size,
-            "scpd": status.scpd,
             "frame_retention_ms": status.frame_retention_ms,
             "last_capture_time": status.last_capture_time,
             "last_error": status.last_error,
@@ -267,6 +327,20 @@ async def get_camera_status(camera_id: str):
     }
 
 
+@router.get("/{camera_id}/driver-info")
+async def get_driver_info(camera_id: str):
+    """获取相机驱动信息"""
+    camera = camera_manager.get_camera(camera_id)
+    if camera is None:
+        raise HTTPException(status_code=404, detail=f"Camera {camera_id} not found")
+
+    return {
+        "success": True,
+        "camera_id": camera_id,
+        "driver_info": camera.get_driver_info()
+    }
+
+
 @router.get("/status/all")
 async def get_all_cameras_status():
     """获取所有相机状态"""
@@ -277,6 +351,7 @@ async def get_all_cameras_status():
         "cameras": [
             {
                 "camera_id": s.camera_id,
+                "vendor": s.vendor,
                 "connected": s.connected,
                 "resolution": f"{s.width}x{s.height}" if s.connected else None,
                 "last_error": s.last_error
@@ -286,6 +361,8 @@ async def get_all_cameras_status():
     }
 
 
+# ========== 图像采集接口 ==========
+
 @router.post("/{camera_id}/capture")
 async def capture_image(
     camera_id: str,
@@ -294,7 +371,7 @@ async def capture_image(
 ):
     """
     使用指定相机拍摄单张照片
-
+    
     - 自动连接相机（如果未连接）
     - 返回base64编码的图片数据
     - 可选保存到指定路径
@@ -310,6 +387,7 @@ async def capture_image(
             "success": True,
             "message": "Image captured successfully",
             "camera_id": camera_id,
+            "vendor": camera.status.vendor,
             "data": result
         }
     else:
@@ -324,7 +402,7 @@ async def capture_and_save(
 ):
     """
     使用指定相机拍照并保存
-
+    
     - 自动创建目录
     - 自动生成文件名（如果未指定）
     - 返回保存的文件路径
@@ -349,6 +427,7 @@ async def capture_and_save(
             "success": True,
             "message": "Image saved successfully",
             "camera_id": camera_id,
+            "vendor": camera.status.vendor,
             "file_path": save_path,
             "width": result["width"],
             "height": result["height"]
@@ -356,6 +435,8 @@ async def capture_and_save(
     else:
         raise HTTPException(status_code=500, detail=result)
 
+
+# ========== 配置管理接口 ==========
 
 @router.get("/{camera_id}/resolutions")
 async def get_supported_resolutions(camera_id: str):
@@ -368,6 +449,7 @@ async def get_supported_resolutions(camera_id: str):
     return {
         "success": True,
         "camera_id": camera_id,
+        "vendor": camera.status.vendor,
         "resolutions": resolutions
     }
 
@@ -375,14 +457,14 @@ async def get_supported_resolutions(camera_id: str):
 @router.post("/{camera_id}/parameters")
 async def update_camera_parameters(
     camera_id: str,
-    exposure_time: Optional[int] = Form(None, description="曝光时间（微秒），必须是52的倍数"),
-    gain: Optional[int] = Form(None, description="增益，范围0-1957"),
-    offset_x: Optional[int] = Form(None, description="水平偏移调整（像素），在居中基础上调整，必须是4的倍数"),
-    offset_y: Optional[int] = Form(None, description="垂直偏移调整（像素），在居中基础上调整，必须是2的倍数")
+    exposure_time: Optional[int] = Form(None, description="曝光时间（微秒）"),
+    gain: Optional[int] = Form(None, description="增益"),
+    offset_x: Optional[int] = Form(None, description="水平偏移调整（像素）"),
+    offset_y: Optional[int] = Form(None, description="垂直偏移调整（像素）")
 ):
     """
     动态更新相机参数（不需要断开重连）
-
+    
     - 在相机连接状态下直接更新参数
     - 适用于实时调试曝光、增益、偏移等参数
     - 修改立即生效，无需重新连接相机
@@ -412,6 +494,7 @@ async def update_camera_parameters(
             "success": True,
             "message": message,
             "camera_id": camera_id,
+            "vendor": status.vendor,
             "current_values": {
                 "exposure_time": status.exposure_time,
                 "gain": status.gain,
@@ -427,20 +510,21 @@ async def update_camera_parameters(
 async def update_camera_config(
     camera_id: str,
     ip_address: Optional[str] = Form(None),
+    vendor: Optional[str] = Form(None, description="切换品牌"),
     width: Optional[int] = Form(None),
     height: Optional[int] = Form(None),
     packet_size: Optional[int] = Form(None),
-    exposure_time: Optional[int] = Form(None, description="曝光时间（微秒），必须是52的倍数"),
-    gain: Optional[int] = Form(None, description="增益，范围0-1957"),
-    offset_x: Optional[int] = Form(None, description="水平偏移（像素），必须是4的倍数，全尺寸时失效"),
-    offset_y: Optional[int] = Form(None, description="垂直偏移（像素），必须是2的倍数，全尺寸时失效")
+    exposure_time: Optional[int] = Form(None, description="曝光时间（微秒）"),
+    gain: Optional[int] = Form(None, description="增益"),
+    offset_x: Optional[int] = Form(None, description="水平偏移（像素）"),
+    offset_y: Optional[int] = Form(None, description="垂直偏移（像素）")
 ):
     """
     更新指定相机配置（需要断开重连）
-
+    
     - 修改配置参数
     - 如果相机已连接，会自动断开并重新连接
-    - 适用于修改分辨率、IP地址等需要重新初始化的参数
+    - 适用于修改分辨率、IP地址、品牌等需要重新初始化的参数
     """
     camera = camera_manager.get_camera(camera_id)
     if camera is None:
@@ -449,6 +533,8 @@ async def update_camera_config(
     updates = {}
     if ip_address is not None:
         updates['ip_address'] = ip_address
+    if vendor is not None:
+        updates['vendor'] = vendor
     if width is not None:
         updates['width'] = width
     if height is not None:
@@ -483,55 +569,22 @@ async def get_camera_config(camera_id: str):
         raise HTTPException(status_code=404, detail=f"Camera {camera_id} not found")
 
     status = camera.status
+    config = camera.config
     return {
         "success": True,
         "camera_id": camera_id,
+        "vendor": config.vendor,
         "config": {
-            "ip_address": camera.config.ip_address,
-            "width": status.width if status.connected else camera.config.width,
-            "height": status.height if status.connected else camera.config.height,
-            "packet_size": camera.config.packet_size,
-            "frame_retention": camera.config.frame_retention,
-            "timeout_ms": camera.config.timeout_ms,
-            "max_retry": camera.config.max_retry,
-            "exposure_time": status.exposure_time if status.connected else camera.config.exposure_time,
-            "gain": status.gain if status.connected else camera.config.gain,
-            "offset_x": status.offset_x if status.connected else camera.config.offset_x,
-            "offset_y": status.offset_y if status.connected else camera.config.offset_y
+            "ip_address": config.ip_address,
+            "width": status.width if status.connected else config.width,
+            "height": status.height if status.connected else config.height,
+            "packet_size": config.packet_size,
+            "frame_retention": config.frame_retention,
+            "timeout_ms": config.timeout_ms,
+            "max_retry": config.max_retry,
+            "exposure_time": status.exposure_time if status.connected else config.exposure_time,
+            "gain": status.gain if status.connected else config.gain,
+            "offset_x": status.offset_x if status.connected else config.offset_x,
+            "offset_y": status.offset_y if status.connected else config.offset_y
         }
     }
-
-
-@router.get("/{camera_id}/preview")
-async def get_preview(camera_id: str):
-    """
-    获取指定相机的实时预览帧（MJPEG流）
-
-    - 返回multipart/x-mixed-replace流
-    - 适合前端<img>标签直接显示
-    """
-    camera = camera_manager.get_camera(camera_id)
-    if camera is None:
-        raise HTTPException(status_code=404, detail=f"Camera {camera_id} not found")
-
-    async def generate_frames():
-        import cv2
-        import asyncio
-
-        while True:
-            success, result = camera.capture(return_base64=False)
-            if success and result.get("save_path"):
-                frame = cv2.imread(result["save_path"])
-                if frame is not None:
-                    _, buffer = cv2.imencode('.jpg', frame)
-                    frame_bytes = buffer.tobytes()
-                    yield (
-                        b'--frame\r\n'
-                        b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n'
-                    )
-            await asyncio.sleep(0.1)
-
-    return StreamingResponse(
-        generate_frames(),
-        media_type="multipart/x-mixed-replace; boundary=frame"
-    )
