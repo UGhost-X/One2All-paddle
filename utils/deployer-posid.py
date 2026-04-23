@@ -43,7 +43,6 @@ class DeployService:
     created_at: float = 0.0
     error: Optional[str] = None
     inference_url: Optional[str] = None
-    train_mode: str = "by_pos_id"
 
 class ModelDeployer:
     def __init__(self, output_dir: str = None, scripts_dir: str = None):
@@ -165,7 +164,6 @@ class ModelDeployer:
                 models["_labels"] = labels
                 models["_model_type"] = "patchcore"
         else:
-            train_mode = "by_pos_id"  # 默认值
             for label_dir in base_path.iterdir():
                 if not label_dir.is_dir():
                     continue
@@ -179,18 +177,6 @@ class ModelDeployer:
                 if (has_patchcore_model or has_memory_bank) and has_config:
                     models[label_dir.name] = str(label_dir)
                     models[f"{label_dir.name}_type"] = "patchcore"
-
-                    # 从 config.json 读取 train_mode（读第一个即可）
-                    if train_mode == "by_pos_id":
-                        try:
-                            with open(label_dir / "config.json", "r", encoding="utf-8") as f:
-                                cfg = json.load(f)
-                                train_mode = cfg.get("train_mode", "by_pos_id")
-                        except Exception:
-                            pass
-
-            if models:
-                models["_train_mode"] = train_mode
 
         return models
     
@@ -219,8 +205,7 @@ class ModelDeployer:
             labels=service.labels,
             port=service.port,
             models_config=service.model_paths,
-            annotations_path=annotations_path_str,
-            train_mode=service.train_mode
+            annotations_path=annotations_path_str
         )
         
         script_path = Path(self.scripts_dir) / f"service_{service.service_id}.py"
@@ -289,8 +274,7 @@ class ModelDeployer:
                 labels=label_keys,
                 model_paths=model_paths,
                 created_at=time.time(),
-                inference_url=f"http://0.0.0.0:{port}",
-                train_mode=model_paths.get("_train_mode", "by_pos_id")
+                inference_url=f"http://0.0.0.0:{port}"
             )
 
             # 预先注册服务，防止并发冲突

@@ -22,14 +22,8 @@ from utils.image_decoder import decode_image, is_turbo_jpeg_available
 
 INFERENCE_TIMEOUT_SEC = 60
 
-# 推理批次大小，控制每批送入 GPU 的 ROI 数量，避免显存溢出
-# 根据 GPU 显存调整，16GB 显存建议 16-32，8GB 显存建议 8-16
-INFERENCE_BATCH_SIZE = int(os.environ.get("INFERENCE_BATCH_SIZE", 8))
-
 REFERENCE_WORKPIECE_SIZE = (1988, 683)
 REFERENCE_IMAGE_SIZE = (3200, 2100)
-
-TRAIN_MODE = "{{ train_mode }}"  # "by_pos_id" | "by_category"
 
 
 def get_workpiece_area_ratio_range(
@@ -265,7 +259,6 @@ class AnomalibPatchCoreWrapper:
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.model: Optional[AnomalibPatchCoreModel] = None
         self.memory_bank: Optional[torch.Tensor] = None
-        self.memory_bank_cpu: Optional[torch.Tensor] = None  # CPU 存储的 memory bank
         self.config: Dict[str, Any] = {}
         self.input_size = (224, 224)
         self.normalize_brightness_config = False
@@ -291,17 +284,10 @@ class AnomalibPatchCoreWrapper:
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.model.eval()
 
-        # 将 memory bank 保存在 CPU，减少 GPU 显存占用
-        self.memory_bank_cpu = checkpoint.get("memory_bank")
-        if self.memory_bank_cpu is not None:
-            # 保持在 CPU，不移动到 GPU
-            if isinstance(self.memory_bank_cpu, torch.Tensor):
-                self.memory_bank_cpu = self.memory_bank_cpu.cpu()
-            # 只在推理时临时移动到 GPU
-            self.memory_bank = None
-            self.model.memory_bank = None
-            logger.info(f"Memory bank loaded to CPU (size: {self.memory_bank_cpu.shape}, "
-                       f"memory: {self.memory_bank_cpu.element_size() * self.memory_bank_cpu.nelement() / 1024**2:.1f}MB)")
+        self.memory_bank = checkpoint.get("memory_bank")
+        if self.memory_bank is not None:
+            self.memory_bank = self.memory_bank.to(self.device)
+            self.model.memory_bank = self.memory_bank
 
     def load_config(self, config_path: str):
         if os.path.exists(config_path):
@@ -313,19 +299,6 @@ class AnomalibPatchCoreWrapper:
                 self.target_size = config.get("target_size", None)
                 if self.target_size:
                     logger.info(f"Loaded target_size from config: {self.target_size}")
-
-    def _get_memory_bank_for_inference(self) -> torch.Tensor:
-        """获取用于推理的 memory bank，临时加载到 GPU"""
-        if self.memory_bank_cpu is None:
-            raise RuntimeError("Memory bank not loaded")
-        # 临时移动到 GPU
-        return self.memory_bank_cpu.to(self.device, non_blocking=True)
-
-    def _release_memory_bank(self):
-        """释放 GPU 上的 memory bank"""
-        self.memory_bank = None
-        if self.model is not None:
-            self.model.memory_bank = None
 
     @staticmethod
     def _normalize_brightness(image: np.ndarray, target_mean: float = 168.0, threshold: int = 10) -> np.ndarray:
@@ -410,15 +383,7 @@ class AnomalibPatchCoreWrapper:
                 embedding = self.model.generate_embedding(features)
                 batch_size, channels, height, width = embedding.shape
                 embedding_reshaped = embedding.permute(0, 2, 3, 1).reshape(-1, channels)
-
-                # 临时加载 memory bank 到 GPU
-                memory_bank = self._get_memory_bank_for_inference()
-                distances = chunked_cdist(embedding_reshaped, memory_bank, chunk_size=256)
-
-                # 释放 memory_bank
-                del memory_bank
-                self._release_memory_bank()
-
+                distances = chunked_cdist(embedding_reshaped, self.model.memory_bank, chunk_size=1024)
                 top_k_plus_1, _ = torch.topk(distances, k=self.num_neighbors + 1, largest=False, dim=1)
                 top_k = top_k_plus_1[:, 1:]
                 patch_scores = top_k.mean(dim=1)
@@ -485,47 +450,25 @@ class AnomalibPatchCoreWrapper:
                 embeddings_flat = embeddings.permute(0, 2, 3, 1).reshape(B, -1, C)  # [B, N_patches, C]
 
                 # 批量计算所有样本与 memory_bank 的距离
-                memory_bank = self._get_memory_bank_for_inference()  # [M, C]
+                memory_bank = self.model.memory_bank  # [M, C]
 
                 # 使用 chunked_cdist 分批计算距离，避免内存溢出
-                # 关键优化：不存储完整的距离矩阵，直接计算 top-k
+                distances_list = []
+                chunk_size = 1024
+                for i in range(0, embeddings_flat.shape[1], chunk_size):
+                    end_i = min(i + chunk_size, embeddings_flat.shape[1])
+                    chunk = embeddings_flat[:, i:end_i, :]  # [B, chunk_size, C]
+                    # 计算距离: [B, chunk_size, M]
+                    dist_chunk = torch.cdist(chunk, memory_bank.unsqueeze(0))
+                    distances_list.append(dist_chunk)
+                distances = torch.cat(distances_list, dim=1)  # [B, N_patches, M]
+
+                # 批量计算 top-k（每个样本独立）
                 k = self.num_neighbors + 1
-                all_topk_vals = []
+                topk_vals, _ = torch.topk(distances, k=k, largest=False, dim=2)  # [B, N_patches, k]
 
-                # 对每个样本单独处理，避免同时存储大矩阵
-                for b in range(B):
-                    sample_embedding = embeddings_flat[b:b+1]  # [1, N_patches, C]
-                    sample_topk_list = []
-
-                    # 分批计算距离并收集 top-k
-                    chunk_size = 256  # 更小的 chunk 减少峰值显存
-                    for i in range(0, sample_embedding.shape[1], chunk_size):
-                        end_i = min(i + chunk_size, sample_embedding.shape[1])
-                        chunk = sample_embedding[:, i:end_i, :]  # [1, chunk_size, C]
-                        # 计算距离: [1, chunk_size, M]
-                        dist_chunk = torch.cdist(chunk, memory_bank.unsqueeze(0))
-                        # 只保留 top-k，立即释放大矩阵
-                        topk_vals_chunk, _ = torch.topk(dist_chunk, k=k, largest=False, dim=2)  # [1, chunk_size, k]
-                        sample_topk_list.append(topk_vals_chunk)
-                        del dist_chunk  # 显式释放
-
-                    # 合并该样本的所有 chunk 的 top-k
-                    sample_topk = torch.cat(sample_topk_list, dim=1)  # [1, N_patches, k]
-                    # 在所有 patch 中再次取 top-k（每个 patch 的 k 个最近邻中的最小值）
-                    all_topk_vals.append(sample_topk)
-
-                # 释放 memory_bank
-                del memory_bank
-                self._release_memory_bank()
-
-                # 处理所有样本的 top-k 结果
-                patch_scores_list = []
-                for sample_topk in all_topk_vals:
-                    # 去掉自身（第一个最近邻）-> 取第1到第k-1个
-                    patch_score = sample_topk[:, :, 1:].mean(dim=2)  # [1, N_patches]
-                    patch_scores_list.append(patch_score)
-
-                patch_scores = torch.cat(patch_scores_list, dim=0)  # [B, N_patches]
+                # 去掉自身（第一个最近邻）-> 取第1到第k-1个
+                patch_scores = topk_vals[:, :, 1:].mean(dim=2)  # [B, N_patches]
 
                 # 恢复为特征图形状
                 patch_scores_map = patch_scores.reshape(B, H, W)  # [B, H, W]
@@ -591,26 +534,12 @@ class AnomalibPatchCoreWrapper:
         """
         try:
             num_neighbors = self.num_neighbors
-            B, N_patches, C = embeddings_flat.shape
 
-            # 分批计算距离，避免显存溢出
-            chunk_size = 256
-            all_topk_vals = []
+            distances = torch.cdist(embeddings_flat, memory_bank.unsqueeze(0))
+            topk_vals, _ = torch.topk(distances, k=num_neighbors + 1, largest=False, dim=2)
+            patch_scores = topk_vals[:, :, 1:].mean(dim=2)
 
-            for i in range(0, N_patches, chunk_size):
-                end_i = min(i + chunk_size, N_patches)
-                chunk = embeddings_flat[:, i:end_i, :]  # [B, chunk_size, C]
-                # 计算距离: [B, chunk_size, M]
-                dist_chunk = torch.cdist(chunk, memory_bank.unsqueeze(0))
-                # 只保留 top-k
-                topk_vals_chunk, _ = torch.topk(dist_chunk, k=num_neighbors + 1, largest=False, dim=2)
-                all_topk_vals.append(topk_vals_chunk)
-                del dist_chunk  # 显式释放
-
-            # 合并所有 chunk 的 top-k 结果
-            topk_vals = torch.cat(all_topk_vals, dim=1)  # [B, N_patches, k]
-            patch_scores = topk_vals[:, :, 1:].mean(dim=2)  # [B, N_patches]
-
+            B = patch_scores.shape[0]
             anomaly_scores = patch_scores.view(B, -1).max(dim=1)[0]
             return anomaly_scores
 
@@ -688,8 +617,6 @@ class MultiPatchCoreDetector:
         self._max_workers = max_workers
         self._load_lock = asyncio.Lock() if lazy_load else None
 
-        logger.info(f"[MultiPatchCoreDetector] 初始化 - TRAIN_MODE: {TRAIN_MODE}, models_dir: {models_dir}")
-
         if lazy_load:
             self._scan_model_metadata()
         else:
@@ -698,14 +625,9 @@ class MultiPatchCoreDetector:
 
     def _scan_model_metadata(self):
         """懒加载模式：仅扫描模型元数据，不实际加载模型权重。"""
-        logger.info(f"[_scan_model_metadata] 扫描目录: {self.models_dir}, exists={self.models_dir.exists()}")
-
         if not self.models_dir.exists():
             logger.warning(f"Models directory not found: {self.models_dir}")
             return
-
-        subdirs = [d for d in self.models_dir.iterdir() if d.is_dir()]
-        logger.info(f"[_scan_model_metadata] 子目录: {[d.name for d in subdirs]}")
 
         for pos_id_dir in self.models_dir.iterdir():
             if not pos_id_dir.is_dir():
@@ -714,15 +636,12 @@ class MultiPatchCoreDetector:
             pos_id = pos_id_dir.name
             model_path = pos_id_dir / "patchcore_model.pt"
 
-            logger.info(f"[_scan_model_metadata] 检查: {pos_id}, model_path={model_path}, exists={model_path.exists()}")
-
             if not model_path.exists():
                 best = pos_id_dir / "best_model"
                 if best.exists():
                     model_path = best / "patchcore_model.pt"
 
             if not model_path.exists():
-                logger.warning(f"[_scan_model_metadata] 模型文件不存在: {pos_id}")
                 continue
 
             config_path = pos_id_dir / "config.json"
@@ -740,8 +659,6 @@ class MultiPatchCoreDetector:
                 "config": config,
             }
             logger.info(f"Scanned model metadata: pos_id={pos_id}")
-
-        logger.info(f"[_scan_model_metadata] 扫描完成，共 {len(self._model_metadata)} 个模型")
 
     def _load_models_parallel(self):
         """并行加载所有模型（非懒加载模式）。"""
@@ -890,24 +807,19 @@ class MultiPatchCoreDetector:
         if total_rois == 0:
             return []
 
-        logger.info(f"[detect_by_pos_id] TRAIN_MODE: {TRAIN_MODE}, category: {category}, total_rois: {total_rois}")
-
         result_pairs: List[Optional[tuple]] = [None] * total_rois
 
         try:
             pos_id_groups: Dict[str, List[Tuple[int, np.ndarray, Dict]]] = {}
             for idx, roi in enumerate(rois):
-                ann = annotations[idx] if annotations and idx < len(annotations) else {}
-
-                if TRAIN_MODE == "by_category":
-                    lookup_key = str(ann.get('category_name') or ann.get('label', 'default'))
-                else:
-                    lookup_key = str(ann.get('pos_id', 'default'))
-
-                pos_id_groups.setdefault(lookup_key, []).append((idx, roi, ann))
+                pos_id = "default"
+                ann = None
+                if annotations and idx < len(annotations):
+                    pos_id = str(annotations[idx].get('pos_id', 'default'))
+                    ann = annotations[idx]
+                pos_id_groups.setdefault(pos_id, []).append((idx, roi, ann))
 
             all_pos_ids = list(pos_id_groups.keys())
-            logger.info(f"[detect_by_pos_id] 分组结果: {all_pos_ids}")
 
             # 懒加载模式：按需加载所需模型
             if self._lazy_load:
@@ -968,35 +880,27 @@ class MultiPatchCoreDetector:
 
             def make_result(error: float, infer_failed: bool = False) -> Dict[str, Any]:
                 return {
-                    "is_anomaly": (not infer_failed) and (error > threshold*1.05),
+                    "is_anomaly": (not infer_failed) and (error > threshold*1.1),
                     "anomaly_score": min(error / threshold, 1.0) if threshold > 0 else error,
                     "error": error,
                     "threshold": threshold,
                     "infer_failed": infer_failed,
                 }
 
-            group_rois_all = [roi for _, roi, _ in group]
-            group_indices_all = [idx for idx, _, _ in group]
-            group_anns_all = [ann for _, _, ann in group]
+            group_rois = [roi for _, roi, _ in group]
+            group_indices = [idx for idx, _, _ in group]
 
-            # 分批处理，避免显存溢出
             try:
-                for start in range(0, len(group), INFERENCE_BATCH_SIZE):
-                    end = start + INFERENCE_BATCH_SIZE
-                    group_rois = group_rois_all[start:end]
-                    group_indices = group_indices_all[start:end]
-                    group_slice = group[start:end]
+                batch_results = model.infer_batch(group_rois)
 
-                    batch_results = model.infer_batch(group_rois)
-
-                    for (idx, roi, _), result in zip(group_slice, batch_results):
-                        score = result["error"]
-                        logger.info(
-                            f"[{request_id}] [{category}] ROI {idx+1}/{total_rois} "
-                            f"pos_id={pos_id} roi_size={roi.shape[1]}x{roi.shape[0]} "
-                            f"score={score:.4f} threshold={threshold:.4f} (batch)"
-                        )
-                        result_pairs[idx] = (make_result(score, result["infer_failed"]), False)
+                for (idx, roi, _), result in zip(group, batch_results):
+                    score = result["error"]
+                    logger.info(
+                        f"[{request_id}] [{category}] ROI {idx+1}/{total_rois} "
+                        f"pos_id={pos_id} roi_size={roi.shape[1]}x{roi.shape[0]} "
+                        f"score={score:.4f} threshold={threshold:.4f} (batch)"
+                    )
+                    result_pairs[idx] = (make_result(score, result["infer_failed"]), False)
 
             except Exception as e:
                 logger.error(f"[{request_id}] [{category}] Batch inference error pos_id={pos_id}: {e}")
@@ -1084,31 +988,21 @@ class MultiPatchCoreDetector:
                         "infer_failed": infer_failed,
                     }
 
-                # 临时加载 memory bank 到 GPU
-                memory_bank = model._get_memory_bank_for_inference()
+                pos_embeddings = embeddings_flat[global_indices]
+                memory_bank = model.model.memory_bank
 
-                # 分批计算异常分数，避免显存溢出
-                for start in range(0, len(global_indices), INFERENCE_BATCH_SIZE):
-                    end = start + INFERENCE_BATCH_SIZE
-                    indices_slice = global_indices[start:end]
-                    pos_embeddings_chunk = embeddings_flat[indices_slice]
+                anomaly_scores = model.compute_anomaly_scores_from_embeddings(
+                    pos_embeddings, memory_bank
+                )
 
-                    anomaly_scores_chunk = model.compute_anomaly_scores_from_embeddings(
-                        pos_embeddings_chunk, memory_bank
+                for g_idx, score in zip(global_indices, anomaly_scores):
+                    idx, roi = idx_to_roi[g_idx]
+                    logger.info(
+                        f"[{request_id}] [{category}] ROI {idx+1}/{total_rois} "
+                        f"pos_id={pos_id} roi_size={roi.shape[1]}x{roi.shape[0]} "
+                        f"score={score:.4f} threshold={threshold:.4f} (shared)"
                     )
-
-                    for g_idx, score in zip(indices_slice, anomaly_scores_chunk):
-                        idx, roi = idx_to_roi[g_idx]
-                        logger.info(
-                            f"[{request_id}] [{category}] ROI {idx+1}/{total_rois} "
-                            f"pos_id={pos_id} roi_size={roi.shape[1]}x{roi.shape[0]} "
-                            f"score={score:.4f} threshold={threshold:.4f} (shared)"
-                        )
-                        result_pairs[idx] = (make_result(float(score), False), False)
-
-                # 释放 memory_bank
-                del memory_bank
-                model._release_memory_bank()
+                    result_pairs[idx] = (make_result(float(score), False), False)
 
         except Exception as e:
             logger.error(f"[{request_id}] [{category}] Shared backbone inference error: {e}")
@@ -1280,7 +1174,7 @@ def _get_lightglue_models(use_fp16: bool = True):
                 os.environ["LIGHTGLUE_CACHE"] = str(SUPERPOINT_MODEL_PATH.parent)
                 
                 # 加载SuperPoint（使用本地权重）
-                ext = SuperPoint(max_num_keypoints=4096).eval().to(device)
+                ext = SuperPoint(max_num_keypoints=2048).eval().to(device)
                 
                 # 加载本地权重
                 if SUPERPOINT_MODEL_PATH.exists():
@@ -1289,7 +1183,7 @@ def _get_lightglue_models(use_fp16: bool = True):
                     logger.info(f"[LightGlue] 已加载本地SuperPoint权重")
             else:
                 logger.warning(f"[LightGlue] 本地模型不存在: {SUPERPOINT_MODEL_PATH}，将尝试自动下载")
-                ext = SuperPoint(max_num_keypoints=4096).eval().to(device)
+                ext = SuperPoint(max_num_keypoints=2048).eval().to(device)
             
             # 加载LightGlue匹配器（SuperPoint专用）
             mat = LightGlue(
@@ -2030,19 +1924,9 @@ async def process_single_workpiece_roi(
     anns_for_inference = []
     categories = []
 
-    loaded_categories = detector.get_loaded_categories()
-    logger.info(f"[process_single_workpiece_roi] TRAIN_MODE: {TRAIN_MODE}, loaded_categories: {loaded_categories}")
-
     for ann in template_annotations:
-        if TRAIN_MODE == "by_category":
-            # by_category 模式：用 category_name（label）匹配模型目录名
-            category = ann.get("category_name") or ann.get("label", "")
-        else:
-            # by_pos_id 模式：用 category（pos_id string）匹配模型目录名
-            category = ann.get("category")
-
-        if not category or category not in loaded_categories:
-            logger.debug(f"[process_single_workpiece_roi] 跳过 annotation: category={category}, 不在 loaded_categories 中")
+        category = ann.get("category")
+        if not category or category not in detector.get_loaded_categories():
             continue
 
         segmentation = ann.get("segmentation", [])
@@ -2820,22 +2704,15 @@ def encode_image_to_base64(img: np.ndarray) -> str:
 def load_models():
     global PATCHCORE_DETECTOR, MODELS, TEMPLATE_IMAGE, TEMPLATE_ANNOTATIONS
 
-    # 打印当前推理模式
-    logger.info(f"[TRAIN_MODE] 当前推理模式: {TRAIN_MODE}")
-    logger.info(f"[MODEL_PATHS] {MODEL_PATHS}")
-
     model_dirs = {
         path for key, path in MODEL_PATHS.items()
-        if not key.endswith('_type') and key not in ('_labels', '_model_type', '_train_mode')
+        if not key.endswith('_type') and key not in ('_labels', '_model_type')
     }
-    logger.info(f"[model_dirs] {model_dirs}")
-
     if not model_dirs:
         logger.warning("No model directories found")
         return
 
     base_dir = Path(list(model_dirs)[0]).parent
-    logger.info(f"[base_dir] {base_dir}")
     PATCHCORE_DETECTOR = MultiPatchCoreDetector(base_dir)
     if PATCHCORE_DETECTOR.get_loaded_categories():
         MODELS = {

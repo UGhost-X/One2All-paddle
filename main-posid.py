@@ -133,13 +133,12 @@ class TrainRequest(BaseModel):
     model_name: str = "PatchCore"
     label_names: Optional[List[str]] = None
     parallel_train: bool = False
-    train_mode: str = "by_pos_id"  # "by_pos_id" | "by_category"
 
     backbone: str = "resnet18"
     layers: List[str] = ["layer2", "layer3"]
     num_neighbors: int = 9
     augment: bool = True
-    num_augmentations: int = 1
+    num_augmentations: int = 100
     normalize_brightness: bool = False
     normalize_contrast: bool = False
     threshold_buffer: float = 1.0
@@ -316,24 +315,19 @@ def train_anomaly(request: TrainRequest):
                 f.write(f"{label}\n")
 
         # ── 6. 确定 pos_id 分组 ───────────────────────────────────────────
-        train_mode = request.train_mode
-
         pos_ids_in_request: set = set()
         for ann in request.coco_data.annotations:
             if ann.pos_id is not None:
                 pos_ids_in_request.add(ann.pos_id)
+
         use_pos_id = len(pos_ids_in_request) > 0
+
 
         group_id = f"group_{int(time.time())}_{request.project_id}"
 
         groups_for_trainer: Dict[Any, List[Dict]] = defaultdict(list)
         for ann in annotations_data["annotations"]:
-            if train_mode == "by_category":
-                key = ann.get("label", "unknown")
-            elif use_pos_id:
-                key = ann.get("pos_id", ann.get("label", "unknown"))
-            else:
-                key = ann.get("label", "unknown")
+            key = ann.get("pos_id") if use_pos_id else ann.get("label", "unknown")
             groups_for_trainer[key].append(ann)
 
         base_train_config = {
@@ -342,7 +336,6 @@ def train_anomaly(request: TrainRequest):
             "project_id": request.project_id,
             "task_uuid": task_uuid,
             "parallel_train": request.parallel_train,
-            "train_mode": train_mode,
             "backbone": request.backbone,
             "layers": request.layers,
             "num_neighbors": request.num_neighbors,
