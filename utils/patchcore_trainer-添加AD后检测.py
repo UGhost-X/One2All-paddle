@@ -18,11 +18,25 @@ from typing import List, Dict, Any, Optional, Tuple
 import numpy as np
 from PIL import Image, ImageDraw
 import torch
+
+from utils.config import get_output_dir
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from tqdm import tqdm
 from collections import defaultdict
+
+# 设置 timm 模型缓存目录为本地路径（必须在导入 timm/anomalib 之前设置）
+PROJECT_ROOT = Path(__file__).parent.parent
+PRETRAINED_DIR = PROJECT_ROOT / "models" / "pretrained"
+HUB_DIR = PRETRAINED_DIR / "hub"
+os.environ["TIMM_HOME"] = str(PRETRAINED_DIR)
+os.environ["HF_HOME"] = str(PRETRAINED_DIR)
+os.environ["TRANSFORMERS_CACHE"] = str(PRETRAINED_DIR / "transformers")
+os.environ["HUGGINGFACE_HUB_CACHE"] = str(HUB_DIR)
+# 强制离线模式，避免联网下载
+os.environ["HF_HUB_OFFLINE"] = "0"
+os.environ["TRANSFORMERS_OFFLINE"] = "0"
 
 sys.path.insert(0, '/home/software/One2All-paddle')
 from anomalib.models.image.patchcore.torch_model import PatchcoreModel
@@ -60,16 +74,22 @@ def normalize_contrast(image: Image.Image, target_std: float = 65.0, threshold: 
 
 
 class PatchCoreDataset(Dataset):
-    """PatchCore数据集 - 从目录读取图片"""
+    """PatchCore数据集 - 从目录读取图片
+
+    数据增强策略：
+    - by_pos_id 模式：每个 ROI 增强 num_augmentations 次（原逻辑）
+    - by_category 模式：如果 ROI 数量 < num_augmentations，则均匀增强到 num_augmentations 总数
+    """
 
     def __init__(
         self,
         image_dir: str,
         transform=None,
         augment: bool = False,
-        num_augmentations: int = 100,  # 只增强一张图
+        num_augmentations: int = 1,
         save_images: bool = False,
         save_dir: str = None,
+        train_mode: str = "by_pos_id",  # "by_pos_id" | "by_category"
     ):
         self.image_dir = Path(image_dir)
         # 读取所有png和jpg图片
@@ -77,10 +97,33 @@ class PatchCoreDataset(Dataset):
             list(self.image_dir.glob("*.png")) + list(self.image_dir.glob("*.jpg"))
         )
         self.transform = transform or self._default_transform()
-        self.augment = augment
-        self.num_augmentations = num_augmentations if augment else 1
         self.save_images = save_images
         self.save_dir = Path(save_dir) if save_dir else None
+        self.train_mode = train_mode
+        print("num_augmentations:::", num_augmentations)
+        # 根据训练模式计算数据增强策略
+        num_original = len(self.image_paths)
+
+        if train_mode == "by_category" and augment and num_original > 0:
+            # by_category 模式：增强到 num_augmentations 总数
+            if num_original >= num_augmentations:
+                # 原始数量已足够，不增强
+                self.augment = False
+                self.augmentations_per_image = 0
+                self.extra_augmentations = 0
+                self.total_samples = num_original
+            else:
+                # 需要增强到目标数量
+                self.augment = True
+                num_needed = num_augmentations - num_original
+                self.augmentations_per_image = num_needed // num_original
+                self.extra_augmentations = num_needed % num_original
+                self.total_samples = num_augmentations
+        else:
+            # by_pos_id 模式或其他：每个 ROI 增强 num_augmentations 次
+            self.augment = augment
+            self.num_augmentations = num_augmentations if augment else 1
+            self.total_samples = num_original * self.num_augmentations
 
         # 预构建增强变换 pipeline
         self._augment_transform = self._build_augment_transform()
@@ -91,6 +134,12 @@ class PatchCoreDataset(Dataset):
             (self.save_dir / "original").mkdir(exist_ok=True)
             (self.save_dir / "augmented").mkdir(exist_ok=True)
             logger.info(f"图片将保存到: {self.save_dir}")
+            if train_mode == "by_category":
+                logger.info(f"数据增强策略(by_category): 原始={num_original}, 增强={self.augment}, "
+                           f"目标总数={self.total_samples}")
+            else:
+                logger.info(f"数据增强策略(by_pos_id): 原始={num_original}, 增强={self.augment}, "
+                           f"每图增强={getattr(self, 'num_augmentations', 1)}, 总数={self.total_samples}")
 
     def _default_transform(self):
         return transforms.Compose([
@@ -103,25 +152,52 @@ class PatchCoreDataset(Dataset):
         ])
 
     def __len__(self):
-        # 如果启用增强，数据集长度 = 原始数量 * 增强倍数
-        return len(self.image_paths) * self.num_augmentations
+        return self.total_samples
 
     def __getitem__(self, idx):
-        # 计算原始图片索引和增强版本索引
-        img_idx = idx // self.num_augmentations
-        aug_idx = idx % self.num_augmentations
+        num_original = len(self.image_paths)
+
+        if self.train_mode == "by_category":
+            # by_category 模式：均匀增强逻辑
+            if idx < num_original:
+                # 原始图片
+                img_idx = idx
+                is_augmented = False
+                aug_idx = 0
+            else:
+                # 增强图片
+                is_augmented = True
+                aug_idx = idx - num_original  # 增强图片的索引 (0-based)
+                # 计算使用哪个原始图片进行增强
+                # 前extra_augmentations个图片有augmentations_per_image + 1次增强
+                # 其余图片有augmentations_per_image次增强
+                if self.augmentations_per_image == 0:
+                    img_idx = 0
+                else:
+                    threshold = self.extra_augmentations * (self.augmentations_per_image + 1)
+                    if aug_idx < threshold:
+                        img_idx = aug_idx // (self.augmentations_per_image + 1)
+                    else:
+                        remaining = aug_idx - threshold
+                        img_idx = self.extra_augmentations + (remaining // self.augmentations_per_image)
+        else:
+            # by_pos_id 模式：原逻辑，每个 ROI 增强 num_augmentations 次
+            num_augmentations = getattr(self, 'num_augmentations', 1)
+            img_idx = idx // num_augmentations
+            aug_idx = idx % num_augmentations
+            is_augmented = self.augment and aug_idx > 0
 
         img_path = self.image_paths[img_idx]
         image = Image.open(img_path).convert('RGB')
 
         # 仅在需要保存图片时才复制原始图片
-        if self.save_images and self.save_dir and aug_idx == 0:
+        if self.save_images and self.save_dir and not is_augmented:
             original_image = image.copy()
             save_path = self.save_dir / "original" / f"{img_path.stem}_normalized.png"
             original_image.save(save_path)
 
         # 数据增强 - 使用预构建的 transform pipeline
-        if self.augment:
+        if is_augmented and self.augment:
             image = self._augment_transform(image)
             # 保存增强后的图片
             if self.save_images and self.save_dir:
@@ -136,6 +212,9 @@ class PatchCoreDataset(Dataset):
     def _build_augment_transform(self):
         """构建增强变换 pipeline - 使用 Compose 减少 Python 函数调用开销"""
         return transforms.Compose([
+            # transforms.RandomHorizontalFlip(p=0.5),
+            # transforms.RandomVerticalFlip(p=0.5),
+            # transforms.RandomRotation(degrees=20, fill=0),
             transforms.ColorJitter(brightness=0.2, contrast=0.2),
         ])
 
@@ -156,8 +235,20 @@ class PatchCoreDataset(Dataset):
         return Image.fromarray(arr.astype(np.uint8))
 
 
-def extract_polygon_region(image_path: Path, segmentation: List, padding: int = 10) -> Image.Image:
-    """使用多边形segmentation从图片中提取区域"""
+def extract_polygon_region(image_path: Path, segmentation: List, padding: int = 10,
+                           bg_mode: str = "mean") -> Image.Image:
+    """
+    使用多边形segmentation从图片中提取区域。
+
+    Args:
+        image_path: 图片路径
+        segmentation: 分割多边形坐标列表
+        padding: 外扩像素数
+        bg_mode: 背景填充模式，"mean" 使用有效区域均值色，"black" 使用黑色
+
+    Returns:
+        提取的ROI图像，背景用均值色填充而非黑色
+    """
     coords = segmentation[0]  # 取第一个segmentation
 
     # 计算边界框
@@ -197,9 +288,25 @@ def extract_polygon_region(image_path: Path, segmentation: List, padding: int = 
         result = Image.new('RGBA', cropped.size, (0, 0, 0, 0))
         result.paste(cropped, (0, 0), mask)
 
-        # 转换为RGB
-        result_rgb = Image.new('RGB', result.size, (0, 0, 0))
-        result_rgb.paste(result, mask=result.split()[3])
+        if bg_mode == "mean":
+            # 计算有效区域的均值色作为背景
+            mask_array = np.array(mask)
+            cropped_array = np.array(cropped)
+            valid_pixels = cropped_array[mask_array == 255]
+
+            if len(valid_pixels) > 0:
+                # 计算RGB均值（忽略Alpha通道）
+                bg_color = tuple(valid_pixels[:, :3].mean(axis=0).astype(np.uint8))
+            else:
+                bg_color = (128, 128, 128)
+
+            # 转换为RGB，使用均值色背景
+            result_rgb = Image.new('RGB', result.size, bg_color)
+            result_rgb.paste(result, mask=result.split()[3])
+        else:
+            # 传统方式：黑色背景
+            result_rgb = Image.new('RGB', result.size, (0, 0, 0))
+            result_rgb.paste(result, mask=result.split()[3])
 
         return result_rgb
 
@@ -282,9 +389,11 @@ class PatchCoreTrainer:
 
     def __init__(
         self,
-        output_dir: str = "/home/software/One2All-paddle/output",
+        output_dir: str = None,
         max_concurrent: int = 2,
     ):
+        if output_dir is None:
+            output_dir = str(get_output_dir())
         self.output_dir = Path(output_dir)
         self.max_concurrent = max_concurrent
         self._semaphore = threading.Semaphore(max_concurrent)
@@ -383,8 +492,11 @@ class PatchCoreTrainer:
         config: dict,
         groups: Dict[Any, List[Dict]],
         group_id: str = None,
-    ) -> List[str]:
-        """批量启动训练任务"""
+    ) -> tuple[List[str], List[str]]:
+        """批量启动训练任务
+        Returns:
+            tuple: (task_ids, filtered_group_keys) - 返回任务ID列表和实际训练的分组合并后的keys
+        """
         if group_id:
             config = dict(config)
             config["external_group_id"] = group_id
@@ -414,12 +526,14 @@ class PatchCoreTrainer:
             filtered_groups[grp_id] = annotations
 
         task_ids: List[str] = []
+        filtered_keys: List[str] = []
         for grp_id in sorted(filtered_groups.keys(), key=str):
             task_id = self._create_group_training_task(
                 dataset_dir, config, grp_id, filtered_groups[grp_id]
             )
             task_ids.append(task_id)
-        return task_ids
+            filtered_keys.append(str(grp_id))
+        return task_ids, filtered_keys
 
     def _create_group_training_task(
         self,
@@ -510,6 +624,7 @@ class PatchCoreTrainer:
             str(config.get("project_id", "")),
             str(config.get("task_uuid", "")),
             str(config.get("model_name", "")),
+            str(config.get("train_mode", "by_pos_id")),
         ]
         if roi_id is not None:
             parts.append(f"roi_{roi_id}")
@@ -573,8 +688,9 @@ class PatchCoreTrainer:
         normalize_brightness = config.get("normalize_brightness", False)
         normalize_contrast = config.get("normalize_contrast", False)
         augment = config.get("augment", True)
-        num_augmentations = config.get("num_augmentations", 100)  # 只增强一张图
+        num_augmentations = config.get("num_augmentations", 1)
         save_images = config.get("save_images", True)
+        train_mode = config.get("train_mode", "by_pos_id")
 
         # 如果 category 是 "工件主体"，跳过数据增强
         category = config.get("category", "unknown")
@@ -590,10 +706,11 @@ class PatchCoreTrainer:
             task_id,
             f"Backbone: {backbone_name}, Layers: {layers}, Num neighbors: {num_neighbors}"
         )
+
         self._add_log(
             task_id,
             f"Brightness norm: {normalize_brightness}, Contrast norm: {normalize_contrast}, "
-            f"Augment: {augment}, Num augmentations: {num_augmentations}"
+            f"Augment: {augment}, Num augmentations: {num_augmentations}, Train mode: {train_mode}"
         )
 
         # 检测设备：优先尝试 CUDA，如果失败则回退到 CPU
@@ -643,6 +760,7 @@ class PatchCoreTrainer:
             num_augmentations=num_augmentations,
             save_images=save_images,
             save_dir=str(training_images_dir) if training_images_dir else None,
+            train_mode=train_mode,
         )
 
         dataloader = DataLoader(
@@ -772,6 +890,7 @@ class PatchCoreTrainer:
             'augment': augment,
             'num_augmentations': num_augmentations,
             'target_size': target_size,
+            'train_mode': config.get("train_mode", "by_pos_id"),
             'roi_size_stats': {
                 'avg_width': avg_width,
                 'avg_height': avg_height,
@@ -833,13 +952,8 @@ class PatchCoreTrainer:
                 batch_size, channels, height, width = embedding.shape
                 embedding_reshaped = embedding.permute(0, 2, 3, 1).reshape(-1, channels)
 
-                # 计算与memory bank的余弦距离
-                # 归一化特征向量
-                embedding_norm = F.normalize(embedding_reshaped, p=2, dim=1)
-                memory_bank_norm = F.normalize(model.memory_bank, p=2, dim=1)
-                # 计算余弦相似度并转换为距离
-                similarity = torch.mm(embedding_norm, memory_bank_norm.t())
-                distances = 1 - similarity
+                # 计算与memory bank的距离
+                distances = torch.cdist(embedding_reshaped, model.memory_bank)
 
                 # 取k+1个最近邻（包含自身），然后排除第一个（自身距离≈0）
                 top_k_plus_1_distances, _ = torch.topk(

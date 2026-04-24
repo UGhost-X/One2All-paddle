@@ -217,6 +217,10 @@ def _get_gpu_memory_info() -> Dict[str, Any]:
 
 
 def chunked_cdist(x: torch.Tensor, y: torch.Tensor, chunk_size: int = 1024) -> torch.Tensor:
+    """分块计算欧氏距离，使用 FP32 确保数值稳定性"""
+    # 转为 FP32 以确保数值稳定性
+    x = x.float()
+    y = y.float()
     n = x.shape[0]
     if n * y.shape[0] < chunk_size * chunk_size * 4:
         return torch.cdist(x, y)
@@ -289,19 +293,20 @@ class AnomalibPatchCoreWrapper:
             layers=layers, backbone=backbone, pre_trained=False, num_neighbors=num_neighbors,
         ).to(self.device)
         self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.model = self.model.half()  # 转为 FP16
         self.model.eval()
 
-        # 将 memory bank 保存在 CPU，减少 GPU 显存占用
+        # 将 memory bank 保存在 CPU，减少 GPU 显存占用，并转为 FP16
         self.memory_bank_cpu = checkpoint.get("memory_bank")
         if self.memory_bank_cpu is not None:
-            # 保持在 CPU，不移动到 GPU
+            # 保持在 CPU，不移动到 GPU，转为 FP16
             if isinstance(self.memory_bank_cpu, torch.Tensor):
-                self.memory_bank_cpu = self.memory_bank_cpu.cpu()
+                self.memory_bank_cpu = self.memory_bank_cpu.cpu().half()
             # 只在推理时临时移动到 GPU
             self.memory_bank = None
             self.model.memory_bank = None
             logger.info(f"Memory bank loaded to CPU (size: {self.memory_bank_cpu.shape}, "
-                       f"memory: {self.memory_bank_cpu.element_size() * self.memory_bank_cpu.nelement() / 1024**2:.1f}MB)")
+                       f"memory: {self.memory_bank_cpu.element_size() * self.memory_bank_cpu.nelement() / 1024**2:.1f}MB, dtype={self.memory_bank_cpu.dtype})")
 
     def load_config(self, config_path: str):
         if os.path.exists(config_path):
@@ -389,7 +394,8 @@ class AnomalibPatchCoreWrapper:
         roi_normalized = roi_resized.astype(np.float32) / 255.0
         tensor = torch.from_numpy(roi_normalized).permute(2, 0, 1)
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        return normalize(tensor)
+        tensor = normalize(tensor)
+        return tensor.half()  # 转为 FP16
 
     def infer_single(self, roi: np.ndarray, target_size: Tuple[int, int] = None,
                      normalize_brightness: bool = None, normalize_contrast: bool = None) -> Dict[str, Any]:
@@ -404,7 +410,7 @@ class AnomalibPatchCoreWrapper:
         try:
             tensor = self.preprocess_roi(roi, target_size, normalize_brightness, normalize_contrast) \
                 .unsqueeze(0).to(self.device)
-            with torch.no_grad():
+            with torch.no_grad(), torch.cuda.amp.autocast():
                 features = self.model.feature_extractor(tensor)
                 features = {layer: self.model.feature_pooler(feat) for layer, feat in features.items()}
                 embedding = self.model.generate_embedding(features)
@@ -470,7 +476,7 @@ class AnomalibPatchCoreWrapper:
                 batch_tensors.append(tensor)
             batch = torch.stack(batch_tensors, dim=0).to(self.device)  # [B, 3, 224, 224]
 
-            with torch.no_grad():
+            with torch.no_grad(), torch.cuda.amp.autocast():
                 # 一次 forward 得到所有 ROI 的特征图（多尺度）
                 features_batch = self.model.feature_extractor(batch)  # dict of layers -> [B, C, H, W]
 
@@ -502,8 +508,8 @@ class AnomalibPatchCoreWrapper:
                     for i in range(0, sample_embedding.shape[1], chunk_size):
                         end_i = min(i + chunk_size, sample_embedding.shape[1])
                         chunk = sample_embedding[:, i:end_i, :]  # [1, chunk_size, C]
-                        # 计算距离: [1, chunk_size, M]
-                        dist_chunk = torch.cdist(chunk, memory_bank.unsqueeze(0))
+                        # 计算距离: [1, chunk_size, M]，转为 FP32 确保数值稳定性
+                        dist_chunk = torch.cdist(chunk.float(), memory_bank.unsqueeze(0).float())
                         # 只保留 top-k，立即释放大矩阵
                         topk_vals_chunk, _ = torch.topk(dist_chunk, k=k, largest=False, dim=2)  # [1, chunk_size, k]
                         sample_topk_list.append(topk_vals_chunk)
@@ -565,7 +571,7 @@ class AnomalibPatchCoreWrapper:
             return torch.empty(0)
 
         try:
-            with torch.no_grad():
+            with torch.no_grad(), torch.cuda.amp.autocast():
                 features = self.model.feature_extractor(batch)
                 features = {layer: self.model.feature_pooler(feat) for layer, feat in features.items()}
                 embedding = self.model.generate_embedding(features)
@@ -600,8 +606,8 @@ class AnomalibPatchCoreWrapper:
             for i in range(0, N_patches, chunk_size):
                 end_i = min(i + chunk_size, N_patches)
                 chunk = embeddings_flat[:, i:end_i, :]  # [B, chunk_size, C]
-                # 计算距离: [B, chunk_size, M]
-                dist_chunk = torch.cdist(chunk, memory_bank.unsqueeze(0))
+                # 计算距离: [B, chunk_size, M]，转为 FP32 确保数值稳定性
+                dist_chunk = torch.cdist(chunk.float(), memory_bank.unsqueeze(0).float())
                 # 只保留 top-k
                 topk_vals_chunk, _ = torch.topk(dist_chunk, k=num_neighbors + 1, largest=False, dim=2)
                 all_topk_vals.append(topk_vals_chunk)
@@ -1044,7 +1050,7 @@ class MultiPatchCoreDetector:
                 batch_tensors.append(tensor)
             batch = torch.stack(batch_tensors, dim=0).to(self._shared_wrapper.device)
 
-            with torch.no_grad():
+            with torch.no_grad(), torch.cuda.amp.autocast():
                 features_batch = self._shared_backbone(batch)
                 features_pooled = {
                     layer: self._shared_feature_pooler(feat)
@@ -1077,7 +1083,7 @@ class MultiPatchCoreDetector:
 
                 def make_result(error: float, infer_failed: bool = False) -> Dict[str, Any]:
                     return {
-                        "is_anomaly": (not infer_failed) and (error > threshold*1.1),
+                        "is_anomaly": (not infer_failed) and (error > threshold*1.05),
                         "anomaly_score": min(error / threshold, 1.0) if threshold > 0 else error,
                         "error": error,
                         "threshold": threshold,

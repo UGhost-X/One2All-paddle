@@ -90,6 +90,8 @@ class PatchCoreDataset(Dataset):
         save_images: bool = False,
         save_dir: str = None,
         train_mode: str = "by_pos_id",  # "by_pos_id" | "by_category"
+        normalize_brightness: bool = False,
+        normalize_contrast: bool = False,
     ):
         self.image_dir = Path(image_dir)
         # 读取所有png和jpg图片
@@ -100,7 +102,9 @@ class PatchCoreDataset(Dataset):
         self.save_images = save_images
         self.save_dir = Path(save_dir) if save_dir else None
         self.train_mode = train_mode
-
+        self.normalize_brightness = normalize_brightness
+        self.normalize_contrast = normalize_contrast
+        print("num_augmentations:::", num_augmentations)
         # 根据训练模式计算数据增强策略
         num_original = len(self.image_paths)
 
@@ -128,11 +132,15 @@ class PatchCoreDataset(Dataset):
         # 预构建增强变换 pipeline
         self._augment_transform = self._build_augment_transform()
 
-        # 如果启用保存图片，创建目录
-        if self.save_images and self.save_dir:
+        # 如果启用保存图片且有内容需要保存，创建目录
+        has_normalization = self.normalize_brightness or self.normalize_contrast
+        has_augmentation = self.augment
+        if self.save_images and self.save_dir and (has_normalization or has_augmentation):
             self.save_dir.mkdir(parents=True, exist_ok=True)
-            (self.save_dir / "original").mkdir(exist_ok=True)
-            (self.save_dir / "augmented").mkdir(exist_ok=True)
+            if has_normalization:
+                (self.save_dir / "original").mkdir(exist_ok=True)
+            if has_augmentation:
+                (self.save_dir / "augmented").mkdir(exist_ok=True)
             logger.info(f"图片将保存到: {self.save_dir}")
             if train_mode == "by_category":
                 logger.info(f"数据增强策略(by_category): 原始={num_original}, 增强={self.augment}, "
@@ -190,8 +198,9 @@ class PatchCoreDataset(Dataset):
         img_path = self.image_paths[img_idx]
         image = Image.open(img_path).convert('RGB')
 
-        # 仅在需要保存图片时才复制原始图片
-        if self.save_images and self.save_dir and not is_augmented:
+        # 仅在需要保存图片且有归一化操作时才复制原始图片
+        has_normalization = self.normalize_brightness or self.normalize_contrast
+        if self.save_images and self.save_dir and not is_augmented and has_normalization:
             original_image = image.copy()
             save_path = self.save_dir / "original" / f"{img_path.stem}_normalized.png"
             original_image.save(save_path)
@@ -212,9 +221,9 @@ class PatchCoreDataset(Dataset):
     def _build_augment_transform(self):
         """构建增强变换 pipeline - 使用 Compose 减少 Python 函数调用开销"""
         return transforms.Compose([
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomVerticalFlip(p=0.5),
-            transforms.RandomRotation(degrees=20, fill=0),
+            # transforms.RandomHorizontalFlip(p=0.5),
+            # transforms.RandomVerticalFlip(p=0.5),
+            # transforms.RandomRotation(degrees=20, fill=0),
             transforms.ColorJitter(brightness=0.2, contrast=0.2),
         ])
 
@@ -671,6 +680,12 @@ class PatchCoreTrainer:
                 augment = False
                 num_augmentations = 1
 
+        # 如果按分类训练(by_category)，关闭数据增强
+        if train_mode == "by_category":
+            if augment:
+                augment = False
+                num_augmentations = 1
+
         num_samples = len(group_annotations)
         self._update_task_status(task_id, num_samples=num_samples)
         self._add_log(task_id, f"Training with {num_samples} annotations for group '{group_id}'")
@@ -733,6 +748,8 @@ class PatchCoreTrainer:
             save_images=save_images,
             save_dir=str(training_images_dir) if training_images_dir else None,
             train_mode=train_mode,
+            normalize_brightness=normalize_brightness,
+            normalize_contrast=normalize_contrast,
         )
 
         dataloader = DataLoader(

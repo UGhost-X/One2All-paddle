@@ -74,16 +74,22 @@ def normalize_contrast(image: Image.Image, target_std: float = 65.0, threshold: 
 
 
 class PatchCoreDataset(Dataset):
-    """PatchCore数据集 - 从目录读取图片"""
+    """PatchCore数据集 - 从目录读取图片
+
+    数据增强策略：
+    - by_pos_id 模式：每个 ROI 增强 num_augmentations 次（原逻辑）
+    - by_category 模式：如果 ROI 数量 < num_augmentations，则均匀增强到 num_augmentations 总数
+    """
 
     def __init__(
         self,
         image_dir: str,
         transform=None,
         augment: bool = False,
-        num_augmentations: int = 100,  # 只增强一张图
+        num_augmentations: int = 1,
         save_images: bool = False,
         save_dir: str = None,
+        train_mode: str = "by_pos_id",  # "by_pos_id" | "by_category"
     ):
         self.image_dir = Path(image_dir)
         # 读取所有png和jpg图片
@@ -91,10 +97,33 @@ class PatchCoreDataset(Dataset):
             list(self.image_dir.glob("*.png")) + list(self.image_dir.glob("*.jpg"))
         )
         self.transform = transform or self._default_transform()
-        self.augment = augment
-        self.num_augmentations = num_augmentations if augment else 1
         self.save_images = save_images
         self.save_dir = Path(save_dir) if save_dir else None
+        self.train_mode = train_mode
+        print("num_augmentations:::", num_augmentations)
+        # 根据训练模式计算数据增强策略
+        num_original = len(self.image_paths)
+
+        if train_mode == "by_category" and augment and num_original > 0:
+            # by_category 模式：增强到 num_augmentations 总数
+            if num_original >= num_augmentations:
+                # 原始数量已足够，不增强
+                self.augment = False
+                self.augmentations_per_image = 0
+                self.extra_augmentations = 0
+                self.total_samples = num_original
+            else:
+                # 需要增强到目标数量
+                self.augment = True
+                num_needed = num_augmentations - num_original
+                self.augmentations_per_image = num_needed // num_original
+                self.extra_augmentations = num_needed % num_original
+                self.total_samples = num_augmentations
+        else:
+            # by_pos_id 模式或其他：每个 ROI 增强 num_augmentations 次
+            self.augment = augment
+            self.num_augmentations = num_augmentations if augment else 1
+            self.total_samples = num_original * self.num_augmentations
 
         # 预构建增强变换 pipeline
         self._augment_transform = self._build_augment_transform()
@@ -105,6 +134,12 @@ class PatchCoreDataset(Dataset):
             (self.save_dir / "original").mkdir(exist_ok=True)
             (self.save_dir / "augmented").mkdir(exist_ok=True)
             logger.info(f"图片将保存到: {self.save_dir}")
+            if train_mode == "by_category":
+                logger.info(f"数据增强策略(by_category): 原始={num_original}, 增强={self.augment}, "
+                           f"目标总数={self.total_samples}")
+            else:
+                logger.info(f"数据增强策略(by_pos_id): 原始={num_original}, 增强={self.augment}, "
+                           f"每图增强={getattr(self, 'num_augmentations', 1)}, 总数={self.total_samples}")
 
     def _default_transform(self):
         return transforms.Compose([
@@ -117,25 +152,52 @@ class PatchCoreDataset(Dataset):
         ])
 
     def __len__(self):
-        # 如果启用增强，数据集长度 = 原始数量 * 增强倍数
-        return len(self.image_paths) * self.num_augmentations
+        return self.total_samples
 
     def __getitem__(self, idx):
-        # 计算原始图片索引和增强版本索引
-        img_idx = idx // self.num_augmentations
-        aug_idx = idx % self.num_augmentations
+        num_original = len(self.image_paths)
+
+        if self.train_mode == "by_category":
+            # by_category 模式：均匀增强逻辑
+            if idx < num_original:
+                # 原始图片
+                img_idx = idx
+                is_augmented = False
+                aug_idx = 0
+            else:
+                # 增强图片
+                is_augmented = True
+                aug_idx = idx - num_original  # 增强图片的索引 (0-based)
+                # 计算使用哪个原始图片进行增强
+                # 前extra_augmentations个图片有augmentations_per_image + 1次增强
+                # 其余图片有augmentations_per_image次增强
+                if self.augmentations_per_image == 0:
+                    img_idx = 0
+                else:
+                    threshold = self.extra_augmentations * (self.augmentations_per_image + 1)
+                    if aug_idx < threshold:
+                        img_idx = aug_idx // (self.augmentations_per_image + 1)
+                    else:
+                        remaining = aug_idx - threshold
+                        img_idx = self.extra_augmentations + (remaining // self.augmentations_per_image)
+        else:
+            # by_pos_id 模式：原逻辑，每个 ROI 增强 num_augmentations 次
+            num_augmentations = getattr(self, 'num_augmentations', 1)
+            img_idx = idx // num_augmentations
+            aug_idx = idx % num_augmentations
+            is_augmented = self.augment and aug_idx > 0
 
         img_path = self.image_paths[img_idx]
         image = Image.open(img_path).convert('RGB')
 
         # 仅在需要保存图片时才复制原始图片
-        if self.save_images and self.save_dir and aug_idx == 0:
+        if self.save_images and self.save_dir and not is_augmented:
             original_image = image.copy()
             save_path = self.save_dir / "original" / f"{img_path.stem}_normalized.png"
             original_image.save(save_path)
 
         # 数据增强 - 使用预构建的 transform pipeline
-        if self.augment:
+        if is_augmented and self.augment:
             image = self._augment_transform(image)
             # 保存增强后的图片
             if self.save_images and self.save_dir:
@@ -150,9 +212,9 @@ class PatchCoreDataset(Dataset):
     def _build_augment_transform(self):
         """构建增强变换 pipeline - 使用 Compose 减少 Python 函数调用开销"""
         return transforms.Compose([
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomVerticalFlip(p=0.5),
-            transforms.RandomRotation(degrees=20, fill=0),
+            # transforms.RandomHorizontalFlip(p=0.5),
+            # transforms.RandomVerticalFlip(p=0.5),
+            # transforms.RandomRotation(degrees=20, fill=0),
             transforms.ColorJitter(brightness=0.2, contrast=0.2),
         ])
 
@@ -534,6 +596,7 @@ class PatchCoreTrainer:
             str(config.get("project_id", "")),
             str(config.get("task_uuid", "")),
             str(config.get("model_name", "")),
+            str(config.get("train_mode", "by_pos_id")),
         ]
         if roi_id is not None:
             parts.append(f"roi_{roi_id}")
@@ -597,8 +660,9 @@ class PatchCoreTrainer:
         normalize_brightness = config.get("normalize_brightness", False)
         normalize_contrast = config.get("normalize_contrast", False)
         augment = config.get("augment", True)
-        num_augmentations = config.get("num_augmentations", 100)  # 只增强一张图
+        num_augmentations = config.get("num_augmentations", 1)
         save_images = config.get("save_images", True)
+        train_mode = config.get("train_mode", "by_pos_id")
 
         # 如果 category 是 "工件主体"，跳过数据增强
         category = config.get("category", "unknown")
@@ -614,10 +678,11 @@ class PatchCoreTrainer:
             task_id,
             f"Backbone: {backbone_name}, Layers: {layers}, Num neighbors: {num_neighbors}"
         )
+
         self._add_log(
             task_id,
             f"Brightness norm: {normalize_brightness}, Contrast norm: {normalize_contrast}, "
-            f"Augment: {augment}, Num augmentations: {num_augmentations}"
+            f"Augment: {augment}, Num augmentations: {num_augmentations}, Train mode: {train_mode}"
         )
 
         # 检测设备：优先尝试 CUDA，如果失败则回退到 CPU
@@ -667,6 +732,7 @@ class PatchCoreTrainer:
             num_augmentations=num_augmentations,
             save_images=save_images,
             save_dir=str(training_images_dir) if training_images_dir else None,
+            train_mode=train_mode,
         )
 
         dataloader = DataLoader(
@@ -796,6 +862,7 @@ class PatchCoreTrainer:
             'augment': augment,
             'num_augmentations': num_augmentations,
             'target_size': target_size,
+            'train_mode': config.get("train_mode", "by_pos_id"),
             'roi_size_stats': {
                 'avg_width': avg_width,
                 'avg_height': avg_height,
