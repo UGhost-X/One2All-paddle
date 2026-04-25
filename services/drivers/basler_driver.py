@@ -125,7 +125,7 @@ class BaslerDriver(ICameraDriver):
 
             # 创建图像转换器
             self._converter = self._pylon.ImageFormatConverter()
-            self._converter.OutputPixelFormat = self._pylon.PixelType_BGR8packed
+            self._converter.OutputPixelFormat = self._pylon.PixelType_Mono8
             self._converter.OutputBitAlignment = self._pylon.OutputBitAlignment_MsbAligned
 
             logger.info(f"Basler camera connected: {ip_address}")

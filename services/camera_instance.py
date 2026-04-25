@@ -112,7 +112,9 @@ class CameraInstance:
 
     def connect(self) -> Tuple[bool, str]:
         """连接相机"""
+        
         if not self.is_available:
+            logger.error(f"[connect] Driver for {self.config.vendor} not available")
             return False, f"Driver for {self.config.vendor} not available"
 
         with self._lock:
@@ -127,10 +129,12 @@ class CameraInstance:
                     # 因为 _apply_config() 中没有设置它的入口
                     "frame_retention": self.config.frame_retention,
                 }
-
+                
                 success, message = self._driver.connect(connection_params)
+                
                 if not success:
                     self._status.last_error = message
+                    logger.error(f"[connect] Driver connect failed: {message}")
                     return False, message
 
                 # 应用配置
@@ -141,13 +145,14 @@ class CameraInstance:
                 self._status.connected = True
                 self._status.last_error = None
 
-                logger.info(f"Camera {self.config.camera_id} connected: {self._status.width}x{self._status.height}")
                 return True, f"Connected at {self._status.width}x{self._status.height}"
 
             except Exception as e:
                 error_msg = str(e)
                 self._status.last_error = error_msg
                 logger.error(f"Failed to connect camera {self.config.camera_id}: {error_msg}")
+                import traceback
+                logger.error(traceback.format_exc())
                 return False, error_msg
 
     def _apply_config(self):
@@ -223,7 +228,6 @@ class CameraInstance:
             if self._driver:
                 success, message = self._driver.disconnect()
                 self._status.connected = False
-                logger.info(f"Camera {self.config.camera_id} disconnected")
                 return success, message
             return True, "Camera not connected"
 
@@ -241,11 +245,13 @@ class CameraInstance:
         if not self.is_available:
             return False, f"Driver for {self.config.vendor} not available"
 
+        
         with self._lock:
             # 自动连接
             if not self._driver.is_connected():
                 success, msg = self.connect()
                 if not success:
+                    logger.error(f"[capture] Auto-connect failed: {msg}")
                     return False, msg
 
             for attempt in range(self.config.max_retry):
@@ -263,7 +269,6 @@ class CameraInstance:
                     # 保存文件
                     if save_path:
                         cv2.imwrite(save_path, img)
-                        logger.info(f"Image saved to {save_path}")
 
                     # 返回结果
                     if return_base64:
@@ -344,7 +349,6 @@ class CameraInstance:
             for key, value in kwargs.items():
                 if hasattr(self.config, key):
                     setattr(self.config, key, value)
-                    logger.info(f"Camera {self.config.camera_id} config updated: {key} = {value}")
 
             # 如果品牌改变，重新初始化驱动
             if 'vendor' in kwargs:
@@ -411,7 +415,6 @@ class CameraInstance:
             self._update_status()
 
             if updated:
-                logger.info(f"Camera {self.config.camera_id} parameters updated: {', '.join(updated)}")
                 return True, f"Parameters updated: {', '.join(updated)}"
             else:
                 return True, "No parameters to update"

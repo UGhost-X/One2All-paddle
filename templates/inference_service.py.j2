@@ -969,12 +969,12 @@ class MultiPatchCoreDetector:
             model = self.models[pos_id]
             config = self.configs[pos_id]
             raw_threshold = config.get("threshold", 0.5)
-            threshold_buffer = config.get("threshold_buffer", 1.3)
+            threshold_buffer = config.get("threshold_buffer", 1.4)
             threshold = raw_threshold * threshold_buffer
 
             def make_result(error: float, infer_failed: bool = False) -> Dict[str, Any]:
                 return {
-                    "is_anomaly": (not infer_failed) and (error > threshold*1.05),
+                    "is_anomaly": (not infer_failed) and (error > threshold),
                     "anomaly_score": min(error / threshold, 1.0) if threshold > 0 else error,
                     "error": error,
                     "threshold": threshold,
@@ -1286,7 +1286,7 @@ def _get_lightglue_models(use_fp16: bool = True):
                 os.environ["LIGHTGLUE_CACHE"] = str(SUPERPOINT_MODEL_PATH.parent)
                 
                 # 加载SuperPoint（使用本地权重）
-                ext = SuperPoint(max_num_keypoints=4096).eval().to(device)
+                ext = SuperPoint(max_num_keypoints=8192).eval().to(device)
                 
                 # 加载本地权重
                 if SUPERPOINT_MODEL_PATH.exists():
@@ -1295,7 +1295,7 @@ def _get_lightglue_models(use_fp16: bool = True):
                     logger.info(f"[LightGlue] 已加载本地SuperPoint权重")
             else:
                 logger.warning(f"[LightGlue] 本地模型不存在: {SUPERPOINT_MODEL_PATH}，将尝试自动下载")
-                ext = SuperPoint(max_num_keypoints=4096).eval().to(device)
+                ext = SuperPoint(max_num_keypoints=8192).eval().to(device)
             
             # 加载LightGlue匹配器（SuperPoint专用）
             mat = LightGlue(
