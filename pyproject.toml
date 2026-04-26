@@ -28,12 +28,17 @@ dependencies = [
     "pyturbojpeg>=1.7.0",
     "pypylon>=2.0.0",
     "dotenv>=0.9.9",
+    "albumentations>=1.4.0",
+    "lightglue",
 ]
 
 [[tool.uv.index]]
 name = "tsinghua"
 url = "https://pypi.tuna.tsinghua.edu.cn/simple"
 default = true
+
+[tool.uv.sources]
+lightglue = { git = "https://github.com/cvg/LightGlue.git" }
 
 [tool.uv]
 index-strategy = "unsafe-best-match"

@@ -968,14 +968,14 @@ class MultiPatchCoreDetector:
 
             model = self.models[pos_id]
             config = self.configs[pos_id]
-            raw_threshold = config.get("threshold", 0.5)
-            threshold_buffer = config.get("threshold_buffer", 1.4)
-            threshold = raw_threshold * threshold_buffer
+            threshold = config.get("threshold", 0.5)
+            {# threshold_buffer = config.get("threshold_buffer", 1.4)
+            threshold = raw_threshold * threshold_buffer #}
 
             def make_result(error: float, infer_failed: bool = False) -> Dict[str, Any]:
                 return {
                     "is_anomaly": (not infer_failed) and (error > threshold),
-                    "anomaly_score": min(error / threshold, 1.0) if threshold > 0 else error,
+                    "anomaly_score": error / threshold if threshold > 0 else error,
                     "error": error,
                     "threshold": threshold,
                     "infer_failed": infer_failed,
@@ -1225,32 +1225,51 @@ def _extract_roi_from_bbox(img: np.ndarray, bbox: List[float]) -> np.ndarray:
 
 
 def _extract_roi_from_segmentation(img: np.ndarray, segmentation: List[List[float]],
-                                   pad_ratio: float = 0.0) -> Optional[np.ndarray]:
+                                   target_size: Tuple[int, int] = (224, 224)) -> Optional[np.ndarray]:
+    """从 segmentation 提取 ROI 并缩放到固定大小
+
+    Args:
+        img: 原始图片 (numpy array)
+        segmentation: 多边形坐标列表
+        target_size: 目标尺寸 (width, height)，默认 (224, 224)
+
+    Returns:
+        裁剪并缩放后的 ROI 图片
+    """
     if not segmentation:
         return None
-    all_pts = []
-    for seg in segmentation:
-        pts = np.array(seg).reshape(-1, 2).astype(np.int32)
-        all_pts.append(pts)
-    if not all_pts:
+
+    # 获取第一个 segmentation
+    coords = segmentation[0]
+    xs = coords[0::2]
+    ys = coords[1::2]
+
+    # 计算 tight bounding box
+    x_min, x_max = int(min(xs)), int(max(xs))
+    y_min, y_max = int(min(ys)), int(max(ys))
+
+    # 确保不超出图片边界
+    x_min = max(0, x_min)
+    y_min = max(0, y_min)
+    x_max = min(img.shape[1], x_max)
+    y_max = min(img.shape[0], y_max)
+
+    bbox_width = x_max - x_min
+    bbox_height = y_max - y_min
+
+    if bbox_width <= 0 or bbox_height <= 0:
         return None
-    all_points = np.vstack(all_pts)
-    x_min, y_min = np.min(all_points, axis=0)
-    x_max, y_max = np.max(all_points, axis=0)
-    w, h = x_max - x_min, y_max - y_min
-    pad_x = int(w * pad_ratio)
-    pad_y = int(h * pad_ratio)
-    x_min = max(0, x_min - pad_x)
-    y_min = max(0, y_min - pad_y)
-    x_max = min(img.shape[1], x_max + pad_x)
-    y_max = min(img.shape[0], y_max + pad_y)
+
+    # 裁剪出 tight bounding box
     roi = img[y_min:y_max, x_min:x_max].copy()
+
     if roi.size == 0:
         return None
-    mask = np.zeros((y_max - y_min, x_max - x_min), dtype=np.uint8)
-    for pts in all_pts:
-        cv2.fillPoly(mask, [pts - [x_min, y_min]], 255)
-    return cv2.bitwise_and(roi, roi, mask=mask)
+
+    # 缩放到目标大小
+    roi_resized = cv2.resize(roi, target_size, interpolation=cv2.INTER_LANCZOS4)
+
+    return roi_resized
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2059,7 +2078,7 @@ async def process_single_workpiece_roi(
         # FIX: 用透视变换后的 segmentation 提取 ROI（替换原来的 pts + padding）
         if segmentation and len(segmentation) > 0:
             seg_roi_transformed = _transform_segmentation_to_roi(segmentation)
-            roi_sub = _extract_roi_from_segmentation(roi_image, seg_roi_transformed, pad_ratio=0.0)
+            roi_sub = _extract_roi_from_segmentation(roi_image, seg_roi_transformed)
 
         # FIX: fallback 用透视变换后的 bbox 提取 ROI（替换原来的 x += padding）
         if roi_sub is None or roi_sub.size == 0:
@@ -2172,7 +2191,7 @@ async def process_single_workpiece_roi(
             segmentation = ann.get("segmentation", [])
             t_roi = None
             if segmentation and len(segmentation) > 0:
-                t_roi = _extract_roi_from_segmentation(template_image, segmentation, pad_ratio=0.1)
+                t_roi = _extract_roi_from_segmentation(template_image, segmentation)
             if t_roi is None or t_roi.size == 0:
                 if bbox and len(bbox) >= 4:
                     t_roi = _extract_roi_from_bbox(template_image, bbox)

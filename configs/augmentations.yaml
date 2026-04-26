@@ -1,0 +1,70 @@
+# Albumentations 数据增强配置
+# 用于 PatchCore 训练时的数据增强
+
+__version__: 1.4.0
+transform:
+  __class_fullname__: Compose
+  additional_targets: {}
+  bbox_params: null
+  keypoint_params: null
+  p: 1.0
+  transforms:
+    # 水平翻转
+    # - __class_fullname__: HorizontalFlip
+    #   always_apply: false
+    #   p: 0.5
+
+    # 垂直翻转（根据业务需求可选）
+    # - __class_fullname__: VerticalFlip
+    #   always_apply: false
+    #   p: 0.5
+
+    # 旋转（与原代码的 RandomRotation 对应）
+    # - __class_fullname__: Rotate
+    #   limit: [-20, 20]
+    #   interpolation: 1
+    #   border_mode: 0  # BORDER_CONSTANT，对应 fill=0
+    #   value: 0
+    #   mask_value: null
+    #   rotate_method: largest_box
+    #   crop_border: false
+    #   always_apply: false
+    #   p: 0.5
+
+    # 亮度和对比度调整（与原代码的 ColorJitter 对应）
+    - __class_fullname__: RandomBrightnessContrast
+      brightness_limit: [-0.3, 0.3]
+      contrast_limit: [-0.3, 0.3]
+      brightness_by_max: true
+      always_apply: false
+      p: 0.5
+    
+    # 随机平移（轻微移动，不裁切）
+    # - __class_fullname__: ShiftScaleRotate
+    #   shift_limit: [-0.1, 0.1]
+    #   scale_limit: 0
+    #   rotate_limit: 0
+    #   p: 0.5
+
+    # 可选：色调/饱和度调整（更丰富的颜色变换）
+    # - __class_fullname__: HueSaturationValue
+    #   hue_shift_limit: [-20, 20]
+    #   sat_shift_limit: [-30, 30]
+    #   val_shift_limit: [-20, 20]
+    #   always_apply: false
+    #   p: 0.5
+
+    # 可选：高斯噪声
+    # - __class_fullname__: GaussNoise
+    #   var_limit: [10.0, 50.0]
+    #   mean: 0
+    #   per_channel: true
+    #   always_apply: false
+    #   p: 0.3
+
+    # 可选：高斯模糊
+    - __class_fullname__: GaussianBlur
+      blur_limit: [3, 7]
+      sigma_limit: [0.1, 2.0]
+      always_apply: false
+      p: 0.3

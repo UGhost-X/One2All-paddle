@@ -18,6 +18,7 @@ from typing import List, Dict, Any, Optional, Tuple
 import numpy as np
 from PIL import Image, ImageDraw
 import torch
+import yaml
 
 from utils.config import get_output_dir
 import torch.nn.functional as F
@@ -25,6 +26,15 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from tqdm import tqdm
 from collections import defaultdict
+
+# Albumentations 导入
+try:
+    import albumentations as A
+    from albumentations.pytorch import ToTensorV2
+    ALBUMENTATIONS_AVAILABLE = True
+except ImportError:
+    ALBUMENTATIONS_AVAILABLE = False
+    logging.warning("albumentations not installed, will use torchvision transforms for augmentation")
 
 # 设置 timm 模型缓存目录为本地路径（必须在导入 timm/anomalib 之前设置）
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -79,7 +89,11 @@ class PatchCoreDataset(Dataset):
     数据增强策略：
     - by_pos_id 模式：每个 ROI 增强 num_augmentations 次（原逻辑）
     - by_category 模式：如果 ROI 数量 < num_augmentations，则均匀增强到 num_augmentations 总数
+    - 使用 albumentations 进行数据增强（通过配置文件）
     """
+
+    # 默认配置文件路径
+    DEFAULT_AUGMENTATION_CONFIG = Path(__file__).parent.parent / "configs" / "augmentations.yaml"
 
     def __init__(
         self,
@@ -92,6 +106,7 @@ class PatchCoreDataset(Dataset):
         train_mode: str = "by_pos_id",  # "by_pos_id" | "by_category"
         normalize_brightness: bool = False,
         normalize_contrast: bool = False,
+        augmentation_config: Optional[str] = None,  # albumentations 配置文件路径
     ):
         self.image_dir = Path(image_dir)
         # 读取所有png和jpg图片
@@ -129,8 +144,8 @@ class PatchCoreDataset(Dataset):
             self.num_augmentations = num_augmentations if augment else 1
             self.total_samples = num_original * self.num_augmentations
 
-        # 预构建增强变换 pipeline
-        self._augment_transform = self._build_augment_transform()
+        # 加载 albumentations 数据增强配置
+        self._augment_transform = self._load_augmentation_transform(augmentation_config)
 
         # 如果启用保存图片且有内容需要保存，创建目录
         has_normalization = self.normalize_brightness or self.normalize_contrast
@@ -166,28 +181,17 @@ class PatchCoreDataset(Dataset):
         num_original = len(self.image_paths)
 
         if self.train_mode == "by_category":
-            # by_category 模式：均匀增强逻辑
+            # by_category 模式：随机挑选图片进行增强
             if idx < num_original:
                 # 原始图片
                 img_idx = idx
                 is_augmented = False
                 aug_idx = 0
             else:
-                # 增强图片
+                # 增强图片 - 随机挑选一张原始图片
                 is_augmented = True
                 aug_idx = idx - num_original  # 增强图片的索引 (0-based)
-                # 计算使用哪个原始图片进行增强
-                # 前extra_augmentations个图片有augmentations_per_image + 1次增强
-                # 其余图片有augmentations_per_image次增强
-                if self.augmentations_per_image == 0:
-                    img_idx = 0
-                else:
-                    threshold = self.extra_augmentations * (self.augmentations_per_image + 1)
-                    if aug_idx < threshold:
-                        img_idx = aug_idx // (self.augmentations_per_image + 1)
-                    else:
-                        remaining = aug_idx - threshold
-                        img_idx = self.extra_augmentations + (remaining // self.augmentations_per_image)
+                img_idx = random.randint(0, num_original - 1)
         else:
             # by_pos_id 模式：原逻辑，每个 ROI 增强 num_augmentations 次
             num_augmentations = getattr(self, 'num_augmentations', 1)
@@ -207,7 +211,7 @@ class PatchCoreDataset(Dataset):
 
         # 数据增强 - 使用预构建的 transform pipeline
         if is_augmented and self.augment:
-            image = self._augment_transform(image)
+            image = self._apply_augmentation(image)
             # 保存增强后的图片
             if self.save_images and self.save_dir:
                 save_path = self.save_dir / "augmented" / f"{img_path.stem}_aug{aug_idx}.png"
@@ -218,34 +222,80 @@ class PatchCoreDataset(Dataset):
 
         return image, str(img_path)
 
-    def _build_augment_transform(self):
-        """构建增强变换 pipeline - 使用 Compose 减少 Python 函数调用开销"""
+    def _load_augmentation_transform(self, config_path: Optional[str] = None):
+        """加载 albumentations 数据增强配置
+
+        Args:
+            config_path: 配置文件路径，如果为 None 则使用默认配置
+
+        Returns:
+            albumentations.Compose 或 torchvision.transforms.Compose
+        """
+        if not self.augment:
+            return None
+
+        # 确定配置文件路径
+        if config_path is None:
+            config_path = self.DEFAULT_AUGMENTATION_CONFIG
+        else:
+            config_path = Path(config_path)
+
+        # 如果 albumentations 可用且配置文件存在，则使用 albumentations
+        if ALBUMENTATIONS_AVAILABLE and config_path.exists():
+            try:
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    config = yaml.safe_load(f)
+
+                # 从配置构建 albumentations transform
+                transform = A.from_dict(config)
+                logger.info(f"Loaded albumentations config from {config_path}")
+                return transform
+            except Exception as e:
+                logger.warning(f"Failed to load albumentations config: {e}, falling back to torchvision")
+
+        # 回退到 torchvision transforms
+        logger.info("Using torchvision transforms for augmentation")
         return transforms.Compose([
-            # transforms.RandomHorizontalFlip(p=0.5),
-            # transforms.RandomVerticalFlip(p=0.5),
             transforms.RandomRotation(degrees=20, fill=0),
             transforms.ColorJitter(brightness=0.2, contrast=0.2),
         ])
 
-    def _apply_augmentation(self, image: Image.Image, original_size: tuple = None) -> Image.Image:
-        """应用数据增强（保留此方法用于兼容性，但内部使用 _augment_transform）
-        
+    def _apply_augmentation(self, image: Image.Image) -> Image.Image:
+        """应用数据增强
+
         Args:
-            image: 输入图片
-            original_size: 原始图片尺寸 (width, height)，用于判断是否需要跳过某些增强
+            image: 输入图片 (PIL.Image)
+
+        Returns:
+            增强后的图片 (PIL.Image)
         """
-        return self._augment_transform(image)
+        if self._augment_transform is None:
+            return image
 
-    def _add_gaussian_noise(self, image: Image.Image, mean: float = 0, std: float = 5) -> Image.Image:
-        """添加高斯噪声（保留用于兼容性）"""
-        arr = np.array(image).astype(np.float32)
-        noise = np.random.normal(mean, std, arr.shape)
-        arr = np.clip(arr + noise, 0, 255)
-        return Image.fromarray(arr.astype(np.uint8))
+        # 判断是 albumentations 还是 torchvision
+        if ALBUMENTATIONS_AVAILABLE and hasattr(self._augment_transform, 'transforms'):
+            # albumentations 需要 numpy array 格式
+            image_np = np.array(image)
+            augmented = self._augment_transform(image=image_np)
+            image = Image.fromarray(augmented['image'])
+        else:
+            # torchvision transforms 直接处理 PIL Image
+            image = self._augment_transform(image)
+
+        return image
 
 
-def extract_polygon_region(image_path: Path, segmentation: List, padding: int = 10) -> Image.Image:
-    """使用多边形segmentation从图片中提取区域"""
+def extract_polygon_region(image_path: Path, segmentation: List, target_size: Tuple[int, int] = (224, 224)) -> Image.Image:
+    """使用多边形segmentation从图片中提取区域，并缩放到固定大小
+
+    Args:
+        image_path: 原始图片路径
+        segmentation: 多边形坐标列表
+        target_size: 目标尺寸 (width, height)，默认 (224, 224)
+
+    Returns:
+        裁剪并缩放后的 ROI 图片
+    """
     coords = segmentation[0]  # 取第一个segmentation
 
     # 计算边界框
@@ -255,41 +305,30 @@ def extract_polygon_region(image_path: Path, segmentation: List, padding: int = 
     y_min, y_max = int(min(ys)), int(max(ys))
 
     with Image.open(image_path) as img:
-        img = img.convert('RGBA')
+        img = img.convert('RGB')
         width, height = img.size
 
-        # 添加padding并确保不超出边界
-        x_min_pad = max(0, x_min - padding)
-        y_min_pad = max(0, y_min - padding)
-        x_max_pad = min(width, x_max + padding)
-        y_max_pad = min(height, y_max + padding)
+        # 确保边界框不超出图片边界
+        x_min = max(0, x_min)
+        y_min = max(0, y_min)
+        x_max = min(width, x_max)
+        y_max = min(height, y_max)
 
-        # 先裁剪边界框区域（含padding）
-        cropped = img.crop((x_min_pad, y_min_pad, x_max_pad, y_max_pad))
+        # 裁剪出边界框区域
+        bbox_width = x_max - x_min
+        bbox_height = y_max - y_min
 
-        # 创建mask，多边形内为255，外为0
-        mask = Image.new('L', cropped.size, 0)
-        draw = ImageDraw.Draw(mask)
+        if bbox_width <= 0 or bbox_height <= 0:
+            # 如果边界框无效，返回空白图片
+            return Image.new('RGB', target_size, (0, 0, 0))
 
-        # 将多边形坐标转换为相对于裁剪区域的坐标
-        polygon_points = []
-        for i in range(0, len(coords), 2):
-            px = int(coords[i]) - x_min_pad
-            py = int(coords[i+1]) - y_min_pad
-            polygon_points.append((px, py))
+        # 裁剪出 tight bounding box
+        cropped = img.crop((x_min, y_min, x_max, y_max))
 
-        # 绘制多边形
-        draw.polygon(polygon_points, fill=255)
+        # 缩放到目标大小
+        cropped_resized = cropped.resize(target_size, Image.Resampling.LANCZOS)
 
-        # 应用mask
-        result = Image.new('RGBA', cropped.size, (0, 0, 0, 0))
-        result.paste(cropped, (0, 0), mask)
-
-        # 转换为RGB
-        result_rgb = Image.new('RGB', result.size, (0, 0, 0))
-        result_rgb.paste(result, mask=result.split()[3])
-
-        return result_rgb
+        return cropped_resized
 
 
 def extract_roi_images(
@@ -676,12 +715,6 @@ class PatchCoreTrainer:
         # 如果 category 是 "工件主体"，跳过数据增强
         category = config.get("category", "unknown")
         if category == "工件主体":
-            if augment:
-                augment = False
-                num_augmentations = 1
-
-        # 如果按分类训练(by_category)，关闭数据增强
-        if train_mode == "by_category":
             if augment:
                 augment = False
                 num_augmentations = 1
