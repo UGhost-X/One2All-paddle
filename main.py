@@ -9,8 +9,11 @@ os.environ["TIMM_HOME"] = str(PRETRAINED_DIR)
 os.environ["HF_HOME"] = str(PRETRAINED_DIR)
 os.environ["TRANSFORMERS_CACHE"] = str(PRETRAINED_DIR / "transformers")
 os.environ["HUGGINGFACE_HUB_CACHE"] = str(HUB_DIR)  # 指向 hub 子目录
-os.environ["HF_HUB_OFFLINE"] = "1"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
+# 使用 Hugging Face 镜像站
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+# 允许联网下载
+os.environ["HF_HUB_OFFLINE"] = "0"
+os.environ["TRANSFORMERS_OFFLINE"] = "0"
 
 from fastapi import FastAPI, Header, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
@@ -135,7 +138,7 @@ class TrainRequest(BaseModel):
     parallel_train: bool = False
     train_mode: str = "by_pos_id"  # "by_pos_id" | "by_category"
 
-    backbone: str = "resnet18"
+    backbone: str = "wide_resnet50_2"
     layers: List[str] = ["layer2", "layer3"]
     num_neighbors: int = 9
     augment: bool = True

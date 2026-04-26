@@ -44,7 +44,9 @@ os.environ["TIMM_HOME"] = str(PRETRAINED_DIR)
 os.environ["HF_HOME"] = str(PRETRAINED_DIR)
 os.environ["TRANSFORMERS_CACHE"] = str(PRETRAINED_DIR / "transformers")
 os.environ["HUGGINGFACE_HUB_CACHE"] = str(HUB_DIR)
-# 强制离线模式，避免联网下载
+# 使用 Hugging Face 镜像站
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+# 允许联网下载
 os.environ["HF_HUB_OFFLINE"] = "0"
 os.environ["TRANSFORMERS_OFFLINE"] = "0"
 
@@ -119,7 +121,6 @@ class PatchCoreDataset(Dataset):
         self.train_mode = train_mode
         self.normalize_brightness = normalize_brightness
         self.normalize_contrast = normalize_contrast
-        print("num_augmentations:::", num_augmentations)
         # 根据训练模式计算数据增强策略
         num_original = len(self.image_paths)
 
@@ -702,7 +703,7 @@ class PatchCoreTrainer:
         os.makedirs(save_dir, exist_ok=True)
 
         # 配置参数
-        backbone_name = config.get("backbone", "resnet18")
+        backbone_name = config.get("backbone", "wide_resnet50_2")
         layers = config.get("layers", ["layer2", "layer3"])
         num_neighbors = int(config.get("num_neighbors", 9))
         normalize_brightness = config.get("normalize_brightness", False)
