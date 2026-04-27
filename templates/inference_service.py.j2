@@ -720,9 +720,8 @@ class MultiPatchCoreDetector:
             category: 类别名称
             template_roi: 正常的 ROI 图像
         """
-        # 简化后的预检测器不需要注册模板
-        # 只进行简单的对比度/方差检测
-        pass
+        if self._pre_checker is not None:
+            self._pre_checker.register_template_roi(category, template_roi)
 
     def _pre_check_roi(self, roi: np.ndarray, category: str) -> Optional[Dict[str, Any]]:
         """
@@ -2233,6 +2232,18 @@ async def process_single_workpiece_roi(
             rois_for_inference.append(roi_sub)
             anns_for_inference.append(ann)
             categories.append(category)
+
+            # 注册模板 ROI 用于预检测（幂等，已注册则跳过）
+            if template_image is not None and detector._pre_checker is not None:
+                if not detector._pre_checker.has_template(category):
+                    tmpl_roi = None
+                    if segmentation and len(segmentation) > 0:
+                        tmpl_roi = _extract_roi_from_segmentation(template_image, segmentation)
+                    if tmpl_roi is None or tmpl_roi.size == 0:
+                        if bbox and len(bbox) >= 4:
+                            tmpl_roi = _extract_roi_from_bbox(template_image, bbox)
+                    if tmpl_roi is not None and tmpl_roi.size > 0:
+                        detector._pre_checker.register_template_roi(category, tmpl_roi)
 
     if not rois_for_inference:
         return {
