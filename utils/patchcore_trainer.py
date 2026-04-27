@@ -201,7 +201,12 @@ class PatchCoreDataset(Dataset):
             is_augmented = self.augment and aug_idx > 0
 
         img_path = self.image_paths[img_idx]
-        image = Image.open(img_path).convert('RGB')
+        image = Image.open(img_path)
+        # 处理 MONO8/灰度图像：转换为 RGB
+        if image.mode == 'L':
+            image = image.convert('RGB')
+        elif image.mode != 'RGB':
+            image = image.convert('RGB')
 
         # 仅在需要保存图片且有归一化操作时才复制原始图片
         has_normalization = self.normalize_brightness or self.normalize_contrast
@@ -306,7 +311,7 @@ def extract_polygon_region(image_path: Path, segmentation: List, target_size: Tu
     y_min, y_max = int(min(ys)), int(max(ys))
 
     with Image.open(image_path) as img:
-        img = img.convert('RGB')
+        # img = img.convert('RGB')
         width, height = img.size
 
         # 确保边界框不超出图片边界
@@ -321,13 +326,19 @@ def extract_polygon_region(image_path: Path, segmentation: List, target_size: Tu
 
         if bbox_width <= 0 or bbox_height <= 0:
             # 如果边界框无效，返回空白图片
-            return Image.new('RGB', target_size, (0, 0, 0))
+            return Image.new('L', target_size, 0)
 
         # 裁剪出 tight bounding box
         cropped = img.crop((x_min, y_min, x_max, y_max))
 
         # 缩放到目标大小
         cropped_resized = cropped.resize(target_size, Image.Resampling.LANCZOS)
+
+        # 转换为 RGB（处理 MONO8/灰度图像）
+        if cropped_resized.mode == 'L':
+            cropped_resized = cropped_resized.convert('RGB')
+        elif cropped_resized.mode != 'RGB':
+            cropped_resized = cropped_resized.convert('RGB')
 
         return cropped_resized
 
@@ -935,6 +946,9 @@ class PatchCoreTrainer:
         self._add_log(task_id, f"Model saved to: {model_path}")
         self._add_log(task_id, f"Config saved to: {config_path}")
 
+        # 清理显存和内存
+        self._cleanup_training_resources(model, device)
+
         # 更新状态
         self._update_task_status(
             task_id,
@@ -946,6 +960,32 @@ class PatchCoreTrainer:
         self._persist_state_if_due(force=True)
 
         self._add_log(task_id, f"Training completed successfully for group '{group_id}'")
+
+    def _cleanup_training_resources(self, model: PatchcoreModel, device: torch.device):
+        """清理训练资源，释放显存和内存"""
+        try:
+            # 将模型移回CPU，释放GPU显存
+            if hasattr(model, 'memory_bank'):
+                del model.memory_bank
+            if hasattr(model, 'feature_extractor'):
+                del model.feature_extractor
+            if hasattr(model, 'feature_pooler'):
+                del model.feature_pooler
+            del model
+
+            # 清理PyTorch缓存
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+
+            # 强制垃圾回收
+            import gc
+            gc.collect()
+
+            if device.type == "cuda":
+                logger.info(f"GPU memory after cleanup: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+        except Exception as e:
+            logger.warning(f"Error during cleanup: {e}")
 
     def _compute_threshold(
         self,
@@ -971,9 +1011,9 @@ class PatchCoreTrainer:
                 features = {layer: model.feature_pooler(feature) for layer, feature in features.items()}
                 embedding = model.generate_embedding(features)
 
-                # reshape embedding
+                # reshape embedding - 使用模型的 reshape_embedding 方法保持一致性
                 batch_size, channels, height, width = embedding.shape
-                embedding_reshaped = embedding.permute(0, 2, 3, 1).reshape(-1, channels)
+                embedding_reshaped = model.reshape_embedding(embedding)
 
                 # 计算与memory bank的距离
                 distances = torch.cdist(embedding_reshaped, model.memory_bank)

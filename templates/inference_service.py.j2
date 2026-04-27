@@ -19,6 +19,7 @@ from contextlib import contextmanager
 # 导入 TurboJPEG 解码工具
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from utils.image_decoder import decode_image, is_turbo_jpeg_available
+from utils.roi_pre_checker import ROIPreChecker, PreCheckResult, get_pre_checker
 
 INFERENCE_TIMEOUT_SEC = 60
 
@@ -415,7 +416,7 @@ class AnomalibPatchCoreWrapper:
                 features = {layer: self.model.feature_pooler(feat) for layer, feat in features.items()}
                 embedding = self.model.generate_embedding(features)
                 batch_size, channels, height, width = embedding.shape
-                embedding_reshaped = embedding.permute(0, 2, 3, 1).reshape(-1, channels)
+                embedding_reshaped = self.model.reshape_embedding(embedding)
 
                 # 临时加载 memory bank 到 GPU
                 memory_bank = self._get_memory_bank_for_inference()
@@ -488,7 +489,9 @@ class AnomalibPatchCoreWrapper:
                 B, C, H, W = embeddings.shape
 
                 # 将每个样本的 embedding 展平为 [B, H*W, C]
-                embeddings_flat = embeddings.permute(0, 2, 3, 1).reshape(B, -1, C)  # [B, N_patches, C]
+                # 使用模型的 reshape_embedding 方法保持一致性
+                embeddings_reshaped = self.model.reshape_embedding(embeddings)  # [B*H*W, C]
+                embeddings_flat = embeddings_reshaped.reshape(B, -1, C)  # [B, H*W, C]
 
                 # 批量计算所有样本与 memory_bank 的距离
                 memory_bank = self._get_memory_bank_for_inference()  # [M, C]
@@ -681,7 +684,7 @@ def _load_single_model(pos_id_dir: Path) -> Optional[Tuple[str, AnomalibPatchCor
 
 
 class MultiPatchCoreDetector:
-    def __init__(self, models_dir: Path, lazy_load: bool = True, max_workers: int = 4):
+    def __init__(self, models_dir: Path, lazy_load: bool = True, max_workers: int = 4, enable_pre_check: bool = True):
         self.models_dir = models_dir
         self.models: Dict[str, AnomalibPatchCoreWrapper] = {}
         self.configs: Dict[str, Dict[str, Any]] = {}
@@ -694,6 +697,13 @@ class MultiPatchCoreDetector:
         self._max_workers = max_workers
         self._load_lock = asyncio.Lock() if lazy_load else None
 
+        # ROI 预检测器
+        self._enable_pre_check = enable_pre_check
+        self._pre_checker: Optional[ROIPreChecker] = None
+        if enable_pre_check:
+            self._pre_checker = get_pre_checker()
+            logger.info("[MultiPatchCoreDetector] ROI 预检测已启用")
+
         logger.info(f"[MultiPatchCoreDetector] 初始化 - TRAIN_MODE: {TRAIN_MODE}, models_dir: {models_dir}")
 
         if lazy_load:
@@ -701,6 +711,56 @@ class MultiPatchCoreDetector:
         else:
             self._load_models_parallel()
         self._find_and_create_shared_backbone()
+
+    def register_template_roi(self, category: str, template_roi: np.ndarray):
+        """
+        注册正常模板 ROI 用于预检测
+
+        Args:
+            category: 类别名称
+            template_roi: 正常的 ROI 图像
+        """
+        # 简化后的预检测器不需要注册模板
+        # 只进行简单的对比度/方差检测
+        pass
+
+    def _pre_check_roi(self, roi: np.ndarray, category: str) -> Optional[Dict[str, Any]]:
+        """
+        对 ROI 进行预检测
+
+        Returns:
+            如果预检测到异常，返回结果字典；否则返回 None（进入 PatchCore 检测）
+        """
+        if not self._enable_pre_check or self._pre_checker is None:
+            return None
+
+        try:
+            report = self._pre_checker.check(roi, category)
+
+            if report.is_anomaly:
+                logger.info(f"[PreCheck] {category} 预检测到异常: {report.message}, "
+                           f"score={report.anomaly_score:.3f}")
+                return {
+                    "is_anomaly": True,
+                    "anomaly_score": report.anomaly_score,
+                    "error": report.anomaly_score,
+                    "threshold": 0.5,
+                    "infer_failed": False,
+                    "pre_check_result": report.result.value,
+                    "pre_check_message": report.message,
+                    "pre_check_details": report.details,
+                }
+
+            # 预检测通过，记录调试信息
+            logger.info(f"[PreCheck] {category} 预检测通过: {report.message}, "
+                        f"details={report.details}")
+
+            # 预检测通过，返回 None 表示需要进入 PatchCore 检测
+            return None
+
+        except Exception as e:
+            logger.warning(f"[PreCheck] 预检测失败 {category}: {e}")
+            return None
 
     def _scan_model_metadata(self):
         """懒加载模式：仅扫描模型元数据，不实际加载模型权重。"""
@@ -972,41 +1032,85 @@ class MultiPatchCoreDetector:
             {# threshold_buffer = config.get("threshold_buffer", 1.4)
             threshold = raw_threshold * threshold_buffer #}
 
-            def make_result(error: float, infer_failed: bool = False) -> Dict[str, Any]:
-                return {
+            def make_result(error: float, infer_failed: bool = False, pre_check_info: Dict = None) -> Dict[str, Any]:
+                result = {
                     "is_anomaly": (not infer_failed) and (error > threshold),
                     "anomaly_score": error / threshold if threshold > 0 else error,
                     "error": error,
                     "threshold": threshold,
                     "infer_failed": infer_failed,
                 }
+                if pre_check_info:
+                    result["pre_check"] = pre_check_info
+                return result
 
             group_rois_all = [roi for _, roi, _ in group]
             group_indices_all = [idx for idx, _, _ in group]
             group_anns_all = [ann for _, _, ann in group]
 
+            # 预检测：筛选出需要通过 PatchCore 检测的 ROI
+            rois_for_patchcore = []
+            indices_for_patchcore = []
+            pre_check_results = {}  # idx -> pre_check_result
+
+            for idx, roi, ann in group:
+                # 执行预检测
+                pre_check_result = self._pre_check_roi(roi, category)
+
+                if pre_check_result is not None:
+                    # 预检测到异常，直接记录结果
+                    # 预检测的异常分数已经是归一化的（0-1），直接使用
+                    pre_check_error = pre_check_result["error"]
+                    # 构造预检测结果，强制标记为异常
+                    pre_check_res = {
+                        "is_anomaly": True,
+                        "anomaly_score": pre_check_error,
+                        "error": pre_check_error,
+                        "threshold": 0.5,  # 预检测使用固定阈值 0.5
+                        "infer_failed": False,
+                        "pre_check": {
+                            "result": pre_check_result["pre_check_result"],
+                            "message": pre_check_result["pre_check_message"],
+                            "details": pre_check_result["pre_check_details"],
+                        }
+                    }
+                    result_pairs[idx] = (pre_check_res, False)
+                    logger.info(
+                        f"[{request_id}] [{category}] ROI {idx+1}/{total_rois} "
+                        f"pos_id={pos_id} [PRE_CHECK] "
+                        f"score={pre_check_result['error']:.4f} - {pre_check_result['pre_check_message']}"
+                    )
+                else:
+                    # 预检测通过，进入 PatchCore 检测
+                    rois_for_patchcore.append(roi)
+                    indices_for_patchcore.append(idx)
+
+            # 如果没有需要通过 PatchCore 检测的 ROI，直接返回
+            if not rois_for_patchcore:
+                continue
+
             # 分批处理，避免显存溢出
             try:
-                for start in range(0, len(group), INFERENCE_BATCH_SIZE):
+                for start in range(0, len(rois_for_patchcore), INFERENCE_BATCH_SIZE):
                     end = start + INFERENCE_BATCH_SIZE
-                    group_rois = group_rois_all[start:end]
-                    group_indices = group_indices_all[start:end]
-                    group_slice = group[start:end]
+                    batch_rois = rois_for_patchcore[start:end]
+                    batch_indices = indices_for_patchcore[start:end]
 
-                    batch_results = model.infer_batch(group_rois)
+                    batch_results = model.infer_batch(batch_rois)
 
-                    for (idx, roi, _), result in zip(group_slice, batch_results):
+                    for idx, result in zip(batch_indices, batch_results):
                         score = result["error"]
                         logger.info(
                             f"[{request_id}] [{category}] ROI {idx+1}/{total_rois} "
-                            f"pos_id={pos_id} roi_size={roi.shape[1]}x{roi.shape[0]} "
+                            f"pos_id={pos_id} roi_size={rois_for_patchcore[start].shape[1]}x{rois_for_patchcore[start].shape[0]} "
                             f"score={score:.4f} threshold={threshold:.4f} (batch)"
                         )
                         result_pairs[idx] = (make_result(score, result["infer_failed"]), False)
 
             except Exception as e:
                 logger.error(f"[{request_id}] [{category}] Batch inference error pos_id={pos_id}: {e}")
-                for idx, roi, _ in group:
+                # 回退到单张推理
+                for roi, idx in zip(rois_for_patchcore, indices_for_patchcore):
                     try:
                         result = model.infer_single(roi)
                         score = result["error"]
@@ -1031,15 +1135,47 @@ class MultiPatchCoreDetector:
     ) -> List[Optional[tuple]]:
         result_pairs: List[Optional[tuple]] = [None] * total_rois
 
+        # 预检测阶段
         all_rois = []
         idx_to_pos_id = []
         idx_to_roi = []
-        for pos_id, group in pos_id_groups.items():
-            for idx, roi, _ in group:
-                all_rois.append(roi)
-                idx_to_pos_id.append(pos_id)
-                idx_to_roi.append((idx, roi))
+        pre_checked_indices = set()
 
+        for pos_id, group in pos_id_groups.items():
+            for idx, roi, ann in group:
+                # 执行预检测
+                pre_check_result = self._pre_check_roi(roi, category)
+
+                if pre_check_result is not None:
+                    # 预检测到异常，直接记录结果
+                    def make_pre_result():
+                        return {
+                            "is_anomaly": True,
+                            "anomaly_score": pre_check_result["anomaly_score"],
+                            "error": pre_check_result["error"],
+                            "threshold": pre_check_result["threshold"],
+                            "infer_failed": False,
+                            "pre_check": {
+                                "result": pre_check_result["pre_check_result"],
+                                "message": pre_check_result["pre_check_message"],
+                                "details": pre_check_result["pre_check_details"],
+                            }
+                        }
+
+                    result_pairs[idx] = (make_pre_result(), False)
+                    pre_checked_indices.add(idx)
+                    logger.info(
+                        f"[{request_id}] [{category}] ROI {idx+1}/{total_rois} "
+                        f"pos_id={pos_id} [PRE_CHECK] "
+                        f"score={pre_check_result['error']:.4f} - {pre_check_result['pre_check_message']}"
+                    )
+                else:
+                    # 预检测通过，进入后续处理
+                    all_rois.append(roi)
+                    idx_to_pos_id.append(pos_id)
+                    idx_to_roi.append((idx, roi))
+
+        # 如果所有 ROI 都通过预检测处理完毕，直接返回
         if not all_rois:
             return result_pairs
 
@@ -2166,7 +2302,8 @@ async def process_single_workpiece_roi(
             segm_in_pred = [float(v) for v in tp.flatten()]
             poly_in_pred = segm_in_pred
 
-        final_results.append({
+        # 构建结果
+        result_item = {
             "category": ann.get("category_name", ann.get("category", "unknown")),
             "pos_id": ann.get("pos_id"),
             "bbox": bbox,
@@ -2180,7 +2317,14 @@ async def process_single_workpiece_roi(
             "threshold": det_res.get("threshold", 0.0),
             "infer_failed": det_res.get("infer_failed", False),
             "anomaly_type": "real_defect" if det_res.get("is_anomaly", False) else "normal",
-        })
+        }
+
+        # 添加预检测信息（如果有）
+        if "pre_check" in det_res:
+            result_item["pre_check"] = det_res["pre_check"]
+            result_item["anomaly_type"] = "pre_check_anomaly" if det_res.get("is_anomaly", False) else "normal"
+
+        final_results.append(result_item)
 
     anomaly_count = sum(1 for r in final_results if r.get("is_anomaly", False))
 
@@ -2861,7 +3005,7 @@ def load_models():
 
     base_dir = Path(list(model_dirs)[0]).parent
     logger.info(f"[base_dir] {base_dir}")
-    PATCHCORE_DETECTOR = MultiPatchCoreDetector(base_dir)
+    PATCHCORE_DETECTOR = MultiPatchCoreDetector(base_dir, enable_pre_check=True)
     if PATCHCORE_DETECTOR.get_loaded_categories():
         MODELS = {
             cat: {'loaded': True, 'detector_type': 'patchcore'}

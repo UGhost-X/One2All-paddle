@@ -127,7 +127,7 @@ class COCOData(BaseModel):
 
 
 
-
+#backbone: str = "wide_resnet50_2"
 class TrainRequest(BaseModel):
     images: List[str]
     coco_data: COCOData
@@ -138,7 +138,7 @@ class TrainRequest(BaseModel):
     parallel_train: bool = False
     train_mode: str = "by_pos_id"  # "by_pos_id" | "by_category"
 
-    backbone: str = "wide_resnet50_2"
+    backbone: str = "resnet18"
     layers: List[str] = ["layer2", "layer3"]
     num_neighbors: int = 9
     augment: bool = True
