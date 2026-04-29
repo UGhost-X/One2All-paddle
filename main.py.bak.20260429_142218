@@ -42,15 +42,15 @@ warnings.filterwarnings("ignore", category=UserWarning, message=".*ccache.*")
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 
-from utils.trainer import ModelTrainer
+from utils.patchcore_trainer import PatchCoreTrainer
 from utils.deployer import ModelDeployer
 from utils.config import path_config, get_output_dir, get_product_dir
 from dataclasses import asdict
 
 logger = logging.getLogger(__name__)
 
-# 初始化模型训练器（使用环境变量配置的output路径）
-trainer = ModelTrainer(output_dir=str(get_output_dir()), max_concurrent=3)
+# 初始化 PatchCore 训练器（使用环境变量配置的output路径）
+trainer = PatchCoreTrainer(output_dir=str(get_output_dir()), max_concurrent=3)
 
 app = FastAPI(title="One2All Paddle API")
 
@@ -127,27 +127,22 @@ class COCOData(BaseModel):
 
 
 
+#backbone: str = "wide_resnet50_2"
 class TrainRequest(BaseModel):
     images: List[str]
     coco_data: COCOData
     base_path: str
     project_id: str
+    model_name: str = "PatchCore"
     label_names: Optional[List[str]] = None
     parallel_train: bool = False
     train_mode: str = "by_pos_id"  # "by_pos_id" | "by_category"
 
-    # Dinomaly 参数
-    encoder_name: str = "dinov2_vit_base_14"
-    decoder_depth: int = 8
-    bottleneck_dropout: float = 0.2
-    epochs: int = 10
-    batch_size: int = 8
-    freeze_encoder: bool = True
-
-    # 通用参数
+    backbone: str = "resnet18"
+    layers: List[str] = ["layer2", "layer3"]
+    num_neighbors: int = 9
     augment: bool = True
     num_augmentations: int = 1
-    augmentation_config: Optional[str] = None  # 数据增强配置文件路径
     normalize_brightness: bool = False
     normalize_contrast: bool = False
     threshold_buffer: float = 1.0
@@ -344,28 +339,23 @@ def train_anomaly(request: TrainRequest):
                 key = ann.get("label", "unknown")
             groups_for_trainer[key].append(ann)
 
-        # 构建训练配置（仅支持 Dinomaly）
         base_train_config = {
-            "model_name": "Dinomaly",
+            "model_name": request.model_name,
             "use_pos_id": use_pos_id,
             "project_id": request.project_id,
             "task_uuid": task_uuid,
             "parallel_train": request.parallel_train,
             "train_mode": train_mode,
+            "backbone": request.backbone,
+            "layers": request.layers,
+            "num_neighbors": request.num_neighbors,
             "augment": request.augment,
             "num_augmentations": request.num_augmentations,
-            "augmentation_config": request.augmentation_config,
             "normalize_brightness": request.normalize_brightness,
             "normalize_contrast": request.normalize_contrast,
             "threshold_buffer": request.threshold_buffer,
             "save_images": request.save_images,
             "max_concurrent": request.max_concurrent,
-            "encoder_name": request.encoder_name,
-            "decoder_depth": request.decoder_depth,
-            "bottleneck_dropout": request.bottleneck_dropout,
-            "epochs": request.epochs,
-            "batch_size": request.batch_size,
-            "freeze_encoder": request.freeze_encoder,
         }
 
         t0 = time.time()
@@ -697,39 +687,8 @@ def _scan_model_files(label_path: str, rel_label_path: str) -> tuple:
     memory_bank_path = os.path.join(label_path, "memory_bank.npz")
     has_memory_bank = os.path.exists(memory_bank_path)
 
-    # 检查 Dinomaly 模型格式
-    dinomaly_model_path = os.path.join(label_path, "model.ckpt")
-    has_dinomaly_model = os.path.exists(dinomaly_model_path)
-
     config_path = os.path.join(label_path, "config.json")
     has_config = os.path.exists(config_path)
-
-    # 检查 Dinomaly 模型
-    if has_dinomaly_model and has_config:
-        model_type = "dinomaly"
-        try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                config = json.load(f)
-            model_files.append({
-                "name": "config.json",
-                "url": f"/static/{rel_label_path}/config.json",
-                "type": "config",
-            })
-            model_files.append({
-                "name": "model.ckpt",
-                "url": f"/static/{rel_label_path}/model.ckpt",
-                "type": "model",
-            })
-            threshold_path = os.path.join(label_path, "threshold.json")
-            if os.path.exists(threshold_path):
-                model_files.append({
-                    "name": "threshold.json",
-                    "url": f"/static/{rel_label_path}/threshold.json",
-                    "type": "threshold",
-                })
-        except Exception as e:
-            logger.error(f"Error scanning Dinomaly model files: {e}")
-        return model_files, True, None, -1, model_type
 
     if (has_patchcore_model or has_memory_bank) and has_config:
         model_type = "patchcore"

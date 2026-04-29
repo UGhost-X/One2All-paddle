@@ -133,7 +133,6 @@ class ModelDeployer:
         """
         查找模型路径
         支持 PatchCore 模型 (memory_bank.npz 或 patchcore_model.pt)
-        支持 Dinomaly 模型 (model.ckpt)
         """
         models = {}
         base_path = Path(self.output_dir) / str(project_id) / task_uuid
@@ -145,9 +144,6 @@ class ModelDeployer:
         is_unified = labels_file.exists()
 
         if is_unified:
-            # 检查 Dinomaly 模型格式
-            dinomaly_model_path = base_path / "model.ckpt"
-            has_dinomaly_model = dinomaly_model_path.exists()
             # 检查新的 anomalib PatchCore 模型格式
             patchcore_model_path = base_path / "patchcore_model.pt"
             has_patchcore_model = patchcore_model_path.exists()
@@ -157,18 +153,7 @@ class ModelDeployer:
             config_path = base_path / "config.json"
             has_config = config_path.exists()
 
-            if has_dinomaly_model and has_config:
-                labels = []
-                try:
-                    with open(labels_file, "r") as f:
-                        labels = [line.strip() for line in f if line.strip()]
-                except:
-                    pass
-
-                models["multi_position"] = str(base_path)
-                models["_labels"] = labels
-                models["_model_type"] = "dinomaly"
-            elif (has_patchcore_model or has_memory_bank) and has_config:
+            if (has_patchcore_model or has_memory_bank) and has_config:
                 labels = []
                 try:
                     with open(labels_file, "r") as f:
@@ -185,27 +170,13 @@ class ModelDeployer:
                 if not label_dir.is_dir():
                     continue
 
-                # 检查 Dinomaly 模型格式
-                has_dinomaly_model = (label_dir / "model.ckpt").exists()
                 # 检查新的 anomalib PatchCore 模型格式
                 has_patchcore_model = (label_dir / "patchcore_model.pt").exists()
                 # 检查旧的 memory_bank 格式
                 has_memory_bank = (label_dir / "memory_bank.npz").exists()
                 has_config = (label_dir / "config.json").exists()
 
-                if has_dinomaly_model and has_config:
-                    models[label_dir.name] = str(label_dir)
-                    models[f"{label_dir.name}_type"] = "dinomaly"
-
-                    # 从 config.json 读取 train_mode（读第一个即可）
-                    if train_mode == "by_pos_id":
-                        try:
-                            with open(label_dir / "config.json", "r", encoding="utf-8") as f:
-                                cfg = json.load(f)
-                                train_mode = cfg.get("train_mode", "by_pos_id")
-                        except Exception:
-                            pass
-                elif (has_patchcore_model or has_memory_bank) and has_config:
+                if (has_patchcore_model or has_memory_bank) and has_config:
                     models[label_dir.name] = str(label_dir)
                     models[f"{label_dir.name}_type"] = "patchcore"
 
