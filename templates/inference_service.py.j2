@@ -9,17 +9,18 @@ import base64
 import time
 import asyncio
 import psutil
+import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from typing import Dict, Any, List, Optional, Union, Tuple
 from pathlib import Path
 from datetime import datetime
 from contextlib import contextmanager
+from PIL import Image
 
 # 导入 TurboJPEG 解码工具
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from utils.image_decoder import decode_image, is_turbo_jpeg_available
-from utils.roi_pre_checker import ROIPreChecker, PreCheckResult, get_pre_checker
 
 INFERENCE_TIMEOUT_SEC = 60
 
@@ -31,6 +32,39 @@ REFERENCE_WORKPIECE_SIZE = (1988, 683)
 REFERENCE_IMAGE_SIZE = (3200, 2100)
 
 TRAIN_MODE = "{{ train_mode }}"  # "by_pos_id" | "by_category"
+
+
+def letterbox_resize(
+    img: Image.Image,
+    target_size: Tuple[int, int],
+    fill_color: Tuple[int, int, int] = (0, 0, 0),
+) -> Tuple[Image.Image, np.ndarray]:
+    """
+    保持宽高比地将图片 padding 到 target_size，并返回有效区域的 binary mask。
+
+    Returns:
+        img_padded: PIL Image，尺寸为 target_size (H×W)
+        mask:       np.ndarray bool (H, W)，True 表示原始像素，False 表示填充像素
+    """
+    th, tw = target_size
+    ow, oh = img.size
+
+    scale = min(tw / ow, th / oh)
+    new_w = int(ow * scale)
+    new_h = int(oh * scale)
+
+    img_resized = img.resize((new_w, new_h), Image.BILINEAR)
+
+    pad_left = (tw - new_w) // 2
+    pad_top = (th - new_h) // 2
+
+    img_padded = Image.new("RGB", (tw, th), fill_color)
+    img_padded.paste(img_resized, (pad_left, pad_top))
+
+    mask = np.zeros((th, tw), dtype=bool)
+    mask[pad_top: pad_top + new_h, pad_left: pad_left + new_w] = True
+
+    return img_padded, mask
 
 
 def get_workpiece_area_ratio_range(
@@ -110,15 +144,7 @@ uvicorn_logger.addHandler(console_handler)
 # 环境变量 & 路径
 # ─────────────────────────────────────────────────────────────────────────────
 
-os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
 os.environ["FLAGS_allocator_strategy"] = "auto_growth"
-
-PADDLESEG_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "PaddleX", "paddlex", "repo_manager", "repos", "PaddleSeg"
-)
-if PADDLESEG_PATH not in sys.path:
-    sys.path.insert(0, PADDLESEG_PATH)
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from pydantic import BaseModel
@@ -128,9 +154,6 @@ import cv2
 import torch
 import torch.nn.functional as F_torch
 from torchvision import transforms
-
-ROI_SAVE_DIR = Path("roi_screenshots")
-ROI_SAVE_DIR.mkdir(exist_ok=True)
 
 app = FastAPI(
     title="Inference Service",
@@ -284,11 +307,19 @@ class DinomalyWrapper:
             self.load_config(config_path)
 
         # 加载模型
+        # ✅ 修复 PyTorch 2.6 weights_only 默认值为 True 的问题
         try:
-            self.model = Dinomaly.load_from_checkpoint(model_path, map_location=self.device)
+            # 尝试使用 weights_only=False 加载（PyTorch 2.6+）
+            import torch
+            checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
+            self.model = Dinomaly.load_from_checkpoint(model_path, map_location=self.device, weights_only=False)
         except TypeError:
-            # 旧版本 PyTorch 不支持某些参数
-            self.model = Dinomaly.load_from_checkpoint(model_path)
+            # 旧版本 PyTorch 不支持 weights_only 参数
+            try:
+                self.model = Dinomaly.load_from_checkpoint(model_path, map_location=self.device)
+            except TypeError:
+                # 更旧版本不支持 map_location
+                self.model = Dinomaly.load_from_checkpoint(model_path)
 
         self.model = self.model.to(self.device)
         self.model.eval()
@@ -355,25 +386,51 @@ class DinomalyWrapper:
         return arr.astype(np.uint8)
 
     @staticmethod
-    def _pad_to_size(roi: np.ndarray, target_size: Tuple[int, int]) -> np.ndarray:
+    def _pad_to_size(roi: np.ndarray, target_size: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        将 ROI padding 到 target_size，保持居中，并返回 mask。
+        
+        Returns:
+            padded: padding 后的图像
+            mask: np.ndarray bool (H, W)，True 表示有效像素区域
+        """
         current_height, current_width = roi.shape[:2]
         target_width, target_height = target_size
         if current_width >= target_width and current_height >= target_height:
-            return roi
+            # 如果 ROI 已经大于目标尺寸，直接 resize
+            if len(roi.shape) == 3:
+                resized = cv2.resize(roi, target_size, interpolation=cv2.INTER_LINEAR)
+            else:
+                resized = cv2.resize(roi, target_size, interpolation=cv2.INTER_LINEAR)
+            mask = np.ones((target_height, target_width), dtype=bool)
+            return resized, mask
+        
         pad_left = (target_width - current_width) // 2
         pad_right = target_width - current_width - pad_left
         pad_top = (target_height - current_height) // 2
         pad_bottom = target_height - current_height - pad_top
+        
         if len(roi.shape) == 3:
             padded = np.zeros((target_height, target_width, roi.shape[2]), dtype=roi.dtype)
         else:
             padded = np.zeros((target_height, target_width), dtype=roi.dtype)
         padded[pad_top:pad_top + current_height, pad_left:pad_left + current_width] = roi
-        return padded
+        
+        # 创建 mask
+        mask = np.zeros((target_height, target_width), dtype=bool)
+        mask[pad_top:pad_top + current_height, pad_left:pad_left + current_width] = True
+        
+        return padded, mask
 
     def preprocess_roi(self, roi: np.ndarray, target_size: Tuple[int, int] = None,
-                       normalize_brightness: bool = False, normalize_contrast: bool = False) -> torch.Tensor:
-        """预处理 ROI"""
+                       normalize_brightness: bool = False, normalize_contrast: bool = False) -> Tuple[torch.Tensor, np.ndarray]:
+        """
+        预处理 ROI
+        
+        Returns:
+            tensor: 预处理后的张量
+            mask: 有效区域 mask (H, W) bool
+        """
         if len(roi.shape) == 2:
             roi = cv2.cvtColor(roi, cv2.COLOR_GRAY2RGB)
         elif roi.shape[2] == 4:
@@ -381,8 +438,9 @@ class DinomalyWrapper:
         elif roi.shape[2] == 3:
             roi = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
 
+        mask = None
         if target_size is not None:
-            roi = self._pad_to_size(roi, target_size)
+            roi, mask = self._pad_to_size(roi, target_size)
         if normalize_brightness:
             roi = self._normalize_brightness(roi)
         if normalize_contrast:
@@ -393,7 +451,15 @@ class DinomalyWrapper:
         tensor = torch.from_numpy(roi_normalized).permute(2, 0, 1)
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         tensor = normalize(tensor)
-        return tensor.half()
+        
+        # resize mask 到 input_size
+        if mask is not None:
+            mask_resized = cv2.resize(mask.astype(np.uint8), self.input_size, interpolation=cv2.INTER_NEAREST)
+            mask = mask_resized.astype(bool)
+        else:
+            mask = np.ones(self.input_size, dtype=bool)
+        
+        return tensor.half(), mask
 
     def infer_single(self, roi: np.ndarray, target_size: Tuple[int, int] = None,
                      normalize_brightness: bool = None, normalize_contrast: bool = None) -> Dict[str, Any]:
@@ -409,24 +475,27 @@ class DinomalyWrapper:
             target_size = getattr(self, 'target_size', None)
 
         try:
-            tensor = self.preprocess_roi(roi, target_size, normalize_brightness, normalize_contrast)
-            batch = tensor.unsqueeze(0).to(self.device)
-
-            # 使用 Anomalib Engine 进行推理
             from anomalib.data import Folder
             import tempfile
+            from skimage.transform import resize as sk_resize
 
             # 创建临时 datamodule
             with tempfile.TemporaryDirectory() as tmpdir:
                 tmpdir_path = Path(tmpdir)
                 normal_dir = tmpdir_path / "normal"
+                mask_dir = tmpdir_path / "masks"
                 normal_dir.mkdir(parents=True, exist_ok=True)
+                mask_dir.mkdir(parents=True, exist_ok=True)
 
-                # 保存临时图片
+                # 保存临时图片 - 使用与 infer_batch 一致的预处理
                 temp_img_path = normal_dir / "temp_0000.png"
-                cv2.imwrite(str(temp_img_path), roi)
+                processed_roi, mask = self._preprocess_for_save(roi, target_size, normalize_brightness, normalize_contrast)
+                cv2.imwrite(str(temp_img_path), processed_roi)
+                # 保存 mask
+                np.save(mask_dir / "temp_0000.npy", mask)
 
                 # 创建临时 datamodule
+                from anomalib.data.utils import TestSplitMode, ValSplitMode
                 temp_dm = Folder(
                     name="infer_temp",
                     root=tmpdir_path,
@@ -435,14 +504,17 @@ class DinomalyWrapper:
                     train_batch_size=1,
                     eval_batch_size=1,
                     num_workers=0,
+                    test_split_mode=TestSplitMode.FROM_DIR,
+                    val_split_mode=ValSplitMode.SAME_AS_TEST,
+                    val_split_ratio=0.0,
                 )
                 temp_dm.setup()
 
                 # 使用 engine.predict 进行推理
                 predictions = self.engine.predict(model=self.model, dataloaders=temp_dm.test_dataloader())
 
-                # 提取分数
-                score = self._extract_score(predictions)
+                # 提取分数（使用 mask 处理 anomaly_map）
+                score = self._extract_score_with_mask(predictions, mask)
 
             return {"error": float(score), "infer_failed": False}
 
@@ -471,21 +543,29 @@ class DinomalyWrapper:
         try:
             from anomalib.data import Folder
             import tempfile
+            from skimage.transform import resize as sk_resize
 
             # 创建临时目录
             with tempfile.TemporaryDirectory() as tmpdir:
                 tmpdir_path = Path(tmpdir)
                 normal_dir = tmpdir_path / "normal"
+                mask_dir = tmpdir_path / "masks"
                 normal_dir.mkdir(parents=True, exist_ok=True)
+                mask_dir.mkdir(parents=True, exist_ok=True)
 
-                # 保存所有 ROI 为临时图片
+                # 保存所有 ROI 为临时图片，同时保存 mask
+                masks = []
                 for i, roi in enumerate(rois):
                     temp_img_path = normal_dir / f"temp_{i:04d}.png"
                     # 预处理并保存
-                    processed_roi = self._preprocess_for_save(roi, target_size, normalize_brightness, normalize_contrast)
+                    processed_roi, mask = self._preprocess_for_save(roi, target_size, normalize_brightness, normalize_contrast)
                     cv2.imwrite(str(temp_img_path), processed_roi)
+                    # 保存 mask
+                    np.save(mask_dir / f"temp_{i:04d}.npy", mask)
+                    masks.append(mask)
 
                 # 创建临时 datamodule
+                from anomalib.data.utils import TestSplitMode, ValSplitMode
                 temp_dm = Folder(
                     name="infer_temp",
                     root=tmpdir_path,
@@ -494,14 +574,17 @@ class DinomalyWrapper:
                     train_batch_size=min(len(rois), 8),
                     eval_batch_size=min(len(rois), 8),
                     num_workers=0,
+                    test_split_mode=TestSplitMode.FROM_DIR,
+                    val_split_mode=ValSplitMode.SAME_AS_TEST,
+                    val_split_ratio=0.0,
                 )
                 temp_dm.setup()
 
                 # 使用 engine.predict 进行批量推理
                 predictions = self.engine.predict(model=self.model, dataloaders=temp_dm.test_dataloader())
 
-                # 提取分数
-                scores = self._extract_scores(predictions)
+                # 提取分数（使用 mask 处理 anomaly_map）
+                scores = self._extract_scores_with_masks(predictions, masks)
 
             # 构造返回结果
             results = []
@@ -518,23 +601,128 @@ class DinomalyWrapper:
             logger.error(f"[DinomalyWrapper] batch inference failed: {e}")
             return [{"error": 0.0, "infer_failed": True}] * len(rois)
 
+    def infer_batch_direct(self, rois: List[np.ndarray],
+                           target_size: Tuple[int, int] = None,
+                           normalize_brightness: bool = None,
+                           normalize_contrast: bool = None) -> List[Dict[str, Any]]:
+        """直接 tensor 推理，不走磁盘 I/O"""
+        if self.model is None:
+            return [{"error": 0.0, "infer_failed": True}] * len(rois)
+        if len(rois) == 0:
+            return []
+
+        if normalize_brightness is None:
+            normalize_brightness = self.normalize_brightness_config
+        if normalize_contrast is None:
+            normalize_contrast = self.normalize_contrast_config
+        if target_size is None:
+            target_size = getattr(self, 'target_size', None)
+
+        try:
+            tensors, masks = [], []
+            for roi in rois:
+                tensor, mask = self.preprocess_roi(
+                    roi, target_size, normalize_brightness, normalize_contrast
+                )
+                tensors.append(tensor)
+                masks.append(mask)
+
+            # 与模型 dtype 对齐，避免 FP16/FP32 不匹配
+            model_dtype = next(self.model.parameters()).dtype
+            batch = torch.stack(tensors).to(device=self.device, dtype=model_dtype)
+
+            # 创建 anomalib ImageBatch dataclass
+            from anomalib.data import ImageBatch
+            batch_obj = ImageBatch(
+                image=batch,
+                image_path=[f"direct_{i}" for i in range(len(rois))],
+                gt_label=torch.zeros(len(rois), dtype=torch.long, device=self.device),
+            )
+
+            self.model.eval()
+            with torch.no_grad():
+                # 用 predict_step，包含完整的异常图计算和分数归一化
+                output = self.model.predict_step(batch_obj, 0)
+
+            # 提取 anomaly_map（output 可能是 dataclass 或 dict）
+            anomaly_map = None
+            for key in ('anomaly_map', 'anomaly_maps'):
+                val = getattr(output, key, None)
+                if val is None and isinstance(output, dict):
+                    val = output.get(key)
+                if val is not None and isinstance(val, torch.Tensor):
+                    anomaly_map = val
+                    break
+
+            results = []
+            if anomaly_map is not None:
+                for i, mask in enumerate(masks):
+                    amap = anomaly_map[i].squeeze().detach().cpu().float().numpy()
+                    mask_r = cv2.resize(
+                        mask.astype(np.uint8),
+                        (amap.shape[1], amap.shape[0]),
+                        interpolation=cv2.INTER_NEAREST
+                    ).astype(bool)
+                    valid = amap[mask_r]
+                    score = float(np.percentile(valid, 99)) if len(valid) > 0 else 0.0
+                    results.append({"error": score, "infer_failed": False})
+            else:
+                # anomaly_map 不存在时，尝试用 pred_score
+                logger.warning("[DinomalyWrapper] anomaly_map not found, falling back to pred_score")
+                for i in range(len(rois)):
+                    score = 0.0
+                    for key in ('pred_score', 'anomaly_score', 'pred_scores', 'anomaly_scores'):
+                        val = getattr(output, key, None)
+                        if val is None and isinstance(output, dict):
+                            val = output.get(key)
+                        if val is not None:
+                            arr = val.detach().cpu().float().numpy().flatten() \
+                                  if isinstance(val, torch.Tensor) else [float(val)]
+                            score = float(arr[i]) if i < len(arr) else 0.0
+                            break
+                    results.append({"error": score, "infer_failed": False})
+
+            return results
+
+        except Exception as e:
+            import traceback
+            logger.error(f"[DinomalyWrapper] direct batch inference failed: {e}\n{traceback.format_exc()}")
+            return [{"error": 0.0, "infer_failed": True}] * len(rois)
+
     def _preprocess_for_save(self, roi: np.ndarray, target_size: Tuple[int, int] = None,
-                             normalize_brightness: bool = False, normalize_contrast: bool = False) -> np.ndarray:
-        """预处理 ROI 用于保存"""
+                             normalize_brightness: bool = False, normalize_contrast: bool = False) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        预处理 ROI 用于保存，返回处理后的图像和 mask。
+        
+        Returns:
+            processed_roi: 预处理后的图像
+            mask: 有效区域 mask (H, W) bool
+        """
         if len(roi.shape) == 2:
             roi = cv2.cvtColor(roi, cv2.COLOR_GRAY2RGB)
         elif roi.shape[2] == 4:
             roi = cv2.cvtColor(roi, cv2.COLOR_RGBA2RGB)
+        elif roi.shape[2] == 3:
+            roi = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
 
+        mask = None
         if target_size is not None:
-            roi = self._pad_to_size(roi, target_size)
+            roi, mask = self._pad_to_size(roi, target_size)
         if normalize_brightness:
             roi = self._normalize_brightness(roi)
         if normalize_contrast:
             roi = self._normalize_contrast(roi)
 
         roi_resized = cv2.resize(roi, self.input_size, interpolation=cv2.INTER_LINEAR)
-        return roi_resized
+        
+        # resize mask 到 input_size
+        if mask is not None:
+            mask_resized = cv2.resize(mask.astype(np.uint8), self.input_size, interpolation=cv2.INTER_NEAREST)
+            mask = mask_resized.astype(bool)
+        else:
+            mask = np.ones(self.input_size, dtype=bool)
+        
+        return roi_resized, mask
 
     def _extract_score(self, predictions) -> float:
         """从预测结果中提取单个分数"""
@@ -569,6 +757,110 @@ class DinomalyWrapper:
                         scores.append(float(val))
                     break
 
+        return scores
+
+    def _extract_score_with_mask(self, predictions, mask: np.ndarray) -> float:
+        """
+        从预测结果中提取单个分数，使用 mask 处理 anomaly_map。
+        参考 anomalib_benchmark.py 中的实现，将 mask 区域外的 anomaly_map 清零。
+        """
+        score_keys = ['pred_score', 'anomaly_score', 'pred_scores', 'anomaly_scores']
+        anomaly_map_keys = ['anomaly_map', 'anomaly_maps']
+
+        for batch in predictions:
+            # 尝试获取 anomaly_map
+            anomaly_map = None
+            for key in anomaly_map_keys:
+                val = getattr(batch, key, None)
+                if val is None and isinstance(batch, dict):
+                    val = batch.get(key)
+                if val is not None and isinstance(val, torch.Tensor):
+                    # 取第一个样本的 anomaly_map
+                    amap = val[0].squeeze().detach().cpu().numpy()
+                    mask_resized = cv2.resize(
+                        mask.astype(np.float32),
+                        (amap.shape[1], amap.shape[0]),
+                        interpolation=cv2.INTER_LINEAR
+                    ) > 0.5
+                    # 将 mask 外的区域清零
+                    amap_masked = np.where(mask_resized, amap, 0.0)
+                    # 使用有效区域的 top-1% 均值作为分数
+                    valid_values = amap_masked[mask_resized]
+                    if len(valid_values) > 0:
+                        return float(np.percentile(valid_values, 99))
+                    else:
+                        return float(amap_masked.max())
+            
+            # 如果没有 anomaly_map，使用 pred_score
+            for key in score_keys:
+                val = getattr(batch, key, None)
+                if val is None and isinstance(batch, dict):
+                    val = batch.get(key)
+                if val is not None:
+                    if isinstance(val, torch.Tensor):
+                        return float(val.detach().cpu().item())
+                    else:
+                        return float(val)
+        
+        return 0.0
+
+    def _extract_scores_with_masks(self, predictions, masks: List[np.ndarray]) -> List[float]:
+        """
+        从预测结果中提取批量分数，使用 mask 处理 anomaly_map。
+        """
+        scores = []
+        score_keys = ['pred_score', 'anomaly_score', 'pred_scores', 'anomaly_scores']
+        anomaly_map_keys = ['anomaly_map', 'anomaly_maps']
+
+        mask_idx = 0
+        for batch in predictions:
+            # 尝试获取 anomaly_map
+            anomaly_maps = None
+            for key in anomaly_map_keys:
+                val = getattr(batch, key, None)
+                if val is None and isinstance(batch, dict):
+                    val = batch.get(key)
+                if val is not None and isinstance(val, torch.Tensor):
+                    anomaly_maps = val
+                    break
+            
+            if anomaly_maps is not None:
+                # 处理 batch 中的每个样本
+                batch_size = anomaly_maps.shape[0]
+                for i in range(batch_size):
+                    if mask_idx >= len(masks):
+                        break
+                    mask = masks[mask_idx]
+                    amap = anomaly_maps[i].squeeze().detach().cpu().numpy()
+                    mask_resized = cv2.resize(
+                        mask.astype(np.float32),
+                        (amap.shape[1], amap.shape[0]),
+                        interpolation=cv2.INTER_LINEAR
+                    ) > 0.5
+                    # 将 mask 外的区域清零
+                    amap_masked = np.where(mask_resized, amap, 0.0)
+                    # 使用有效区域的 top-1% 均值作为分数
+                    valid_values = amap_masked[mask_resized]
+                    if len(valid_values) > 0:
+                        score = float(np.percentile(valid_values, 99))
+                    else:
+                        score = float(amap_masked.max())
+                    scores.append(score)
+                    mask_idx += 1
+            else:
+                # 如果没有 anomaly_map，使用 pred_score
+                for key in score_keys:
+                    val = getattr(batch, key, None)
+                    if val is None and isinstance(batch, dict):
+                        val = batch.get(key)
+                    if val is not None:
+                        if isinstance(val, torch.Tensor):
+                            batch_scores = val.detach().cpu().numpy().flatten().tolist()
+                            scores.extend(batch_scores)
+                        else:
+                            scores.append(float(val))
+                        break
+        
         return scores
 
 
@@ -632,7 +924,7 @@ def _load_single_model(pos_id_dir: Path) -> Optional[Tuple[str, Any, Dict[str, A
 
 
 class MultiModelDetector:
-    def __init__(self, models_dir: Path, lazy_load: bool = True, max_workers: int = 4, enable_pre_check: bool = True):
+    def __init__(self, models_dir: Path, lazy_load: bool = True, max_workers: int = 4):
         self.models_dir = models_dir
         self.models: Dict[str, Any] = {}  # 仅支持 Dinomaly 模型
         self.configs: Dict[str, Dict[str, Any]] = {}
@@ -641,68 +933,12 @@ class MultiModelDetector:
         self._max_workers = max_workers
         self._load_lock = asyncio.Lock() if lazy_load else None
 
-        # ROI 预检测器
-        self._enable_pre_check = enable_pre_check
-        self._pre_checker: Optional[ROIPreChecker] = None
-        if enable_pre_check:
-            self._pre_checker = get_pre_checker()
-            logger.info("[MultiModelDetector] ROI 预检测已启用")
-
         logger.info(f"[MultiModelDetector] 初始化 - TRAIN_MODE: {TRAIN_MODE}, models_dir: {models_dir}")
 
         if lazy_load:
             self._scan_model_metadata()
         else:
             self._load_models_parallel()
-
-    def register_template_roi(self, category: str, template_roi: np.ndarray):
-        """
-        注册正常模板 ROI 用于预检测
-
-        Args:
-            category: 类别名称
-            template_roi: 正常的 ROI 图像
-        """
-        if self._pre_checker is not None:
-            self._pre_checker.register_template_roi(category, template_roi)
-
-    def _pre_check_roi(self, roi: np.ndarray, category: str) -> Optional[Dict[str, Any]]:
-        """
-        对 ROI 进行预检测
-
-        Returns:
-            如果预检测到异常，返回结果字典；否则返回 None（进入模型检测）
-        """
-        if not self._enable_pre_check or self._pre_checker is None:
-            return None
-
-        try:
-            report = self._pre_checker.check(roi, category)
-
-            if report.is_anomaly:
-                logger.info(f"[PreCheck] {category} 预检测到异常: {report.message}, "
-                           f"score={report.anomaly_score:.3f}")
-                return {
-                    "is_anomaly": True,
-                    "anomaly_score": report.anomaly_score,
-                    "error": report.anomaly_score,
-                    "threshold": 0.5,
-                    "infer_failed": False,
-                    "pre_check_result": report.result.value,
-                    "pre_check_message": report.message,
-                    "pre_check_details": report.details,
-                }
-
-            # 预检测通过，记录调试信息
-            logger.info(f"[PreCheck] {category} 预检测通过: {report.message}, "
-                        f"details={report.details}")
-
-            # 预检测通过，返回 None 表示需要进入模型检测
-            return None
-
-        except Exception as e:
-            logger.warning(f"[PreCheck] 预检测失败 {category}: {e}")
-            return None
 
     def _scan_model_metadata(self):
         """懒加载模式：仅扫描模型元数据，不实际加载模型权重。"""
@@ -838,7 +1074,8 @@ class MultiModelDetector:
                 ann = annotations[idx] if annotations and idx < len(annotations) else {}
 
                 if TRAIN_MODE == "by_category":
-                    lookup_key = str(ann.get('category_name') or ann.get('label', 'default'))
+                    # by_category 模式下，所有 ROI 使用同一个 category 作为 lookup_key
+                    lookup_key = str(category)
                 else:
                     lookup_key = str(ann.get('pos_id', 'default'))
 
@@ -894,62 +1131,17 @@ class MultiModelDetector:
             # 获取阈值：Dinomaly 模型从 wrapper 获取
             threshold = model.threshold
 
-            def make_result(error: float, infer_failed: bool = False, pre_check_info: Dict = None) -> Dict[str, Any]:
-                result = {
+            def make_result(error: float, infer_failed: bool = False) -> Dict[str, Any]:
+                return {
                     "is_anomaly": (not infer_failed) and (error > threshold),
-                    "anomaly_score": error / threshold if threshold > 0 else error,
+                    "anomaly_score": error,
                     "error": error,
                     "threshold": threshold,
                     "infer_failed": infer_failed,
                 }
-                if pre_check_info:
-                    result["pre_check"] = pre_check_info
-                return result
 
-            group_rois_all = [roi for _, roi, _ in group]
-            group_indices_all = [idx for idx, _, _ in group]
-            group_anns_all = [ann for _, _, ann in group]
-
-            # 预检测：筛选出需要通过模型检测的 ROI
-            rois_for_model = []
-            indices_for_model = []
-            pre_check_results = {}  # idx -> pre_check_result
-
-            for idx, roi, ann in group:
-                # 执行预检测
-                pre_check_result = self._pre_check_roi(roi, category)
-
-                if pre_check_result is not None:
-                    # 预检测到异常，直接记录结果
-                    # 预检测的异常分数已经是归一化的（0-1），直接使用
-                    pre_check_error = pre_check_result["error"]
-                    # 构造预检测结果，强制标记为异常
-                    pre_check_res = {
-                        "is_anomaly": True,
-                        "anomaly_score": pre_check_error,
-                        "error": pre_check_error,
-                        "threshold": 0.5,  # 预检测使用固定阈值 0.5
-                        "infer_failed": False,
-                        "pre_check": {
-                            "result": pre_check_result["pre_check_result"],
-                            "message": pre_check_result["pre_check_message"],
-                            "details": pre_check_result["pre_check_details"],
-                        }
-                    }
-                    result_pairs[idx] = (pre_check_res, False)
-                    logger.info(
-                        f"[{request_id}] [{category}] ROI {idx+1}/{total_rois} "
-                        f"pos_id={pos_id} [PRE_CHECK] "
-                        f"score={pre_check_result['error']:.4f} - {pre_check_result['pre_check_message']}"
-                    )
-                else:
-                    # 预检测通过，进入模型检测
-                    rois_for_model.append(roi)
-                    indices_for_model.append(idx)
-
-            # 如果没有需要通过模型检测的 ROI，直接返回
-            if not rois_for_model:
-                continue
+            rois_for_model = [roi for _, roi, _ in group]
+            indices_for_model = [idx for idx, _, _ in group]
 
             # 分批处理，避免显存溢出
             try:
@@ -958,7 +1150,11 @@ class MultiModelDetector:
                     batch_rois = rois_for_model[start:end]
                     batch_indices = indices_for_model[start:end]
 
-                    batch_results = model.infer_batch(batch_rois)
+                    batch_results = model.infer_batch_direct(batch_rois)
+
+                    # 如果全部失败，抛出异常触发 fallback
+                    if all(r.get("infer_failed", False) for r in batch_results):
+                        raise RuntimeError("infer_batch_direct all failed, falling back to infer_single")
 
                     for idx, result in zip(batch_indices, batch_results):
                         score = result["error"]
@@ -1969,18 +2165,6 @@ async def process_single_workpiece_roi(
             anns_for_inference.append(ann)
             categories.append(category_str)  # 使用字符串版本
 
-            # 注册模板 ROI 用于预检测（幂等，已注册则跳过）
-            if template_image is not None and detector._pre_checker is not None:
-                if not detector._pre_checker.has_template(category_str):
-                    tmpl_roi = None
-                    if segmentation and len(segmentation) > 0:
-                        tmpl_roi = _extract_roi_from_segmentation(template_image, segmentation)
-                    if tmpl_roi is None or tmpl_roi.size == 0:
-                        if bbox and len(bbox) >= 4:
-                            tmpl_roi = _extract_roi_from_bbox(template_image, bbox)
-                    if tmpl_roi is not None and tmpl_roi.size > 0:
-                        detector._pre_checker.register_template_roi(category_str, tmpl_roi)
-
     if not rois_for_inference:
         return {
             "workpiece_id": wp_idx,
@@ -2065,11 +2249,6 @@ async def process_single_workpiece_roi(
             "infer_failed": det_res.get("infer_failed", False),
             "anomaly_type": "real_defect" if det_res.get("is_anomaly", False) else "normal",
         }
-
-        # 添加预检测信息（如果有）
-        if "pre_check" in det_res:
-            result_item["pre_check"] = det_res["pre_check"]
-            result_item["anomaly_type"] = "pre_check_anomaly" if det_res.get("is_anomaly", False) else "normal"
 
         final_results.append(result_item)
 
@@ -2754,7 +2933,7 @@ def load_models():
 
     base_dir = Path(list(model_dirs)[0]).parent
     logger.info(f"[base_dir] {base_dir}")
-    DINORMALY_DETECTOR = MultiModelDetector(base_dir, enable_pre_check=True)
+    DINORMALY_DETECTOR = MultiModelDetector(base_dir)
     if DINORMALY_DETECTOR.get_loaded_categories():
         MODELS = {
             cat: {'loaded': True, 'detector_type': 'dinomaly'}
@@ -2802,6 +2981,16 @@ def load_models():
         precompute_template_variant_features(subject_img, default_rotations)
     else:
         logger.warning("[LightGlue] 未找到工件主体标注，跳过预提取模板变体特征")
+
+    if DINORMALY_DETECTOR and torch.cuda.is_available():
+        dummy = np.zeros((224, 224, 3), dtype=np.uint8)
+        for model_wrapper in DINORMALY_DETECTOR.models.values():
+            try:
+                model_wrapper.infer_batch_direct([dummy])
+                logger.info(f"[warmup] {type(model_wrapper).__name__} GPU 预热完成")
+            except Exception as e:
+                logger.warning(f"[warmup] {type(model_wrapper).__name__} 预热失败: {e}")
+        logger.info("[warmup] GPU 预热完成")
 
 
 @app.on_event("startup")

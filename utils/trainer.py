@@ -46,6 +46,9 @@ from anomalib.data import Folder
 from anomalib.data.utils import TestSplitMode, ValSplitMode
 from anomalib.engine import Engine
 
+# PyTorch Lightning Callback
+from pytorch_lightning.callbacks import Callback
+
 try:
     from anomalib.models import Dinomaly
     DINORMALY_AVAILABLE = True
@@ -97,8 +100,47 @@ def normalize_contrast(image: Image.Image, target_std: float = 65.0, threshold: 
     return Image.fromarray(arr.astype(np.uint8))
 
 
-def extract_polygon_region(image_path: Path, segmentation: List, target_size: Tuple[int, int] = (224, 224)) -> Image.Image:
-    """使用多边形segmentation从图片中提取区域，并缩放到固定大小"""
+def letterbox_resize(
+    img: Image.Image,
+    target_size: Tuple[int, int],
+    fill_color: Tuple[int, int, int] = (0, 0, 0),
+) -> Tuple[Image.Image, np.ndarray]:
+    """
+    保持宽高比地将图片 padding 到 target_size，并返回有效区域的 binary mask。
+
+    Returns:
+        img_padded: PIL Image，尺寸为 target_size (H×W)
+        mask:       np.ndarray bool (H, W)，True 表示原始像素，False 表示填充像素
+    """
+    th, tw = target_size
+    ow, oh = img.size
+
+    scale = min(tw / ow, th / oh)
+    new_w = int(ow * scale)
+    new_h = int(oh * scale)
+
+    img_resized = img.resize((new_w, new_h), Image.BILINEAR)
+
+    pad_left = (tw - new_w) // 2
+    pad_top = (th - new_h) // 2
+
+    img_padded = Image.new("RGB", (tw, th), fill_color)
+    img_padded.paste(img_resized, (pad_left, pad_top))
+
+    mask = np.zeros((th, tw), dtype=bool)
+    mask[pad_top: pad_top + new_h, pad_left: pad_left + new_w] = True
+
+    return img_padded, mask
+
+
+def extract_polygon_region(image_path: Path, segmentation: List, target_size: Tuple[int, int] = (224, 224)) -> Tuple[Image.Image, np.ndarray]:
+    """
+    使用多边形segmentation从图片中提取区域，并使用 letterbox_resize 保持宽高比。
+    
+    Returns:
+        roi_image: PIL Image，尺寸为 target_size (H×W)
+        mask:      np.ndarray bool (H, W)，True 表示原始像素，False 表示填充像素
+    """
     coords = segmentation[0]
     xs = coords[0::2]
     ys = coords[1::2]
@@ -116,17 +158,15 @@ def extract_polygon_region(image_path: Path, segmentation: List, target_size: Tu
         bbox_height = y_max - y_min
 
         if bbox_width <= 0 or bbox_height <= 0:
-            return Image.new('L', target_size, 0)
+            # 返回空白图像和全 False mask
+            return Image.new('RGB', target_size, (0, 0, 0)), np.zeros(target_size, dtype=bool)
 
         cropped = img.crop((x_min, y_min, x_max, y_max))
-        cropped_resized = cropped.resize(target_size, Image.Resampling.LANCZOS)
+        
+        # 使用 letterbox_resize 保持宽高比
+        roi_image, mask = letterbox_resize(cropped.convert("RGB"), target_size)
 
-        if cropped_resized.mode == 'L':
-            cropped_resized = cropped_resized.convert('RGB')
-        elif cropped_resized.mode != 'RGB':
-            cropped_resized = cropped_resized.convert('RGB')
-
-        return cropped_resized
+        return roi_image, mask
 
 
 def load_augmentation_transform(config_path: Optional[str] = None):
@@ -183,6 +223,7 @@ def apply_augmentation(image: Image.Image, transform) -> Image.Image:
 def extract_roi_images(
     dataset_dir: str,
     output_dir: str,
+    mask_output_dir: str,
     group_annotations: List[Dict],
     normalize_brightness: bool = False,
     normalize_contrast: bool = False,
@@ -192,13 +233,15 @@ def extract_roi_images(
     augmentation_config: Optional[str] = None,
 ) -> List[Path]:
     """
-    从annotations中提取ROI图片并保存到output_dir
+    从annotations中提取ROI图片并保存到output_dir，同时保存mask到mask_output_dir
     支持数据增强，根据训练模式决定增强策略
     返回提取的ROI图片路径列表
     """
     dataset_dir = Path(dataset_dir)
     output_dir = Path(output_dir)
+    mask_output_dir = Path(mask_output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    mask_output_dir.mkdir(parents=True, exist_ok=True)
 
     raw_images_dir = dataset_dir / "raw_images"
 
@@ -243,14 +286,14 @@ def extract_roi_images(
             continue
 
         try:
-            roi_image = extract_polygon_region(image_path, segmentation)
+            roi_image, roi_mask = extract_polygon_region(image_path, segmentation)
 
             if normalize_brightness:
                 roi_image = normalize_brightness(roi_image)
             if normalize_contrast:
                 roi_image = normalize_contrast(roi_image)
 
-            original_rois.append((roi_image, Path(file_name).stem, ann_id))
+            original_rois.append((roi_image, roi_mask, Path(file_name).stem, ann_id))
 
         except Exception as e:
             logger.error(f"处理annotation {ann_id}时出错: {e}")
@@ -260,12 +303,17 @@ def extract_roi_images(
         logger.warning("No ROI images extracted")
         return extracted_paths
 
-    # 保存原始图片
-    for roi_image, file_stem, ann_id in original_rois:
+    # 保存原始图片和mask
+    for roi_image, roi_mask, file_stem, ann_id in original_rois:
         output_filename = f"{file_stem}_ann{ann_id}.png"
         output_path = output_dir / output_filename
         roi_image.save(output_path)
         extracted_paths.append(output_path)
+        
+        # 保存mask
+        mask_filename = f"{file_stem}_ann{ann_id}.npy"
+        mask_path = mask_output_dir / mask_filename
+        np.save(mask_path, roi_mask)
 
     # 数据增强策略
     if augment and num_augmentations > num_original:
@@ -276,7 +324,7 @@ def extract_roi_images(
             
             for i in range(num_needed):
                 # 随机选择一张原始图片进行增强
-                roi_image, file_stem, ann_id = random.choice(original_rois)
+                roi_image, roi_mask, file_stem, ann_id = random.choice(original_rois)
                 if augment_transform:
                     aug_image = apply_augmentation(roi_image, augment_transform)
                 else:
@@ -286,11 +334,16 @@ def extract_roi_images(
                 aug_path = output_dir / aug_filename
                 aug_image.save(aug_path)
                 extracted_paths.append(aug_path)
+                
+                # 保存增强后的mask（与原mask相同）
+                mask_filename = f"{file_stem}_ann{ann_id}_aug{i:04d}.npy"
+                mask_path = mask_output_dir / mask_filename
+                np.save(mask_path, roi_mask)
         else:
             # by_pos_id 模式：每个 ROI 增强 num_augmentations 次
             logger.info(f"by_pos_id augmentation: {num_original} original, {num_augmentations} per image")
             
-            for roi_image, file_stem, ann_id in original_rois:
+            for roi_image, roi_mask, file_stem, ann_id in original_rois:
                 for i in range(num_augmentations - 1):  # -1 because original is already saved
                     if augment_transform:
                         aug_image = apply_augmentation(roi_image, augment_transform)
@@ -301,6 +354,11 @@ def extract_roi_images(
                     aug_path = output_dir / aug_filename
                     aug_image.save(aug_path)
                     extracted_paths.append(aug_path)
+                    
+                    # 保存增强后的mask（与原mask相同）
+                    mask_filename = f"{file_stem}_ann{ann_id}_aug{i:04d}.npy"
+                    mask_path = mask_output_dir / mask_filename
+                    np.save(mask_path, roi_mask)
 
     logger.info(f"ROI extraction completed. Saved {len(extracted_paths)} images ({num_original} original + {len(extracted_paths) - num_original} augmented) to {output_dir}")
     return extracted_paths
@@ -472,6 +530,9 @@ class ModelTrainer:
                 path_id = str(first_ann.get("pos_id", safe_group_id))
         else:
             path_id = safe_group_id
+        
+        # 将 path_id 保存到 config，确保 _do_train_dinomaly 使用相同的值
+        config["path_id"] = path_id
 
         task_key = self._make_task_key(dataset_dir, config, safe_group_id)
 
@@ -605,8 +666,9 @@ class ModelTrainer:
         encoder_name = config.get("encoder_name", "dinov2_vit_base_14")
         decoder_depth = config.get("decoder_depth", 8)
         bottleneck_dropout = config.get("bottleneck_dropout", 0.2)
-        epochs = config.get("epochs", 10)
-        batch_size = config.get("batch_size", 8)
+        # epochs = config.get("epochs", 20)
+        epochs = 20
+        batch_size = config.get("batch_size", 1)
         num_workers = config.get("num_workers", 4)
         normalize_brightness = config.get("normalize_brightness", False)
         normalize_contrast = config.get("normalize_contrast", False)
@@ -635,25 +697,32 @@ class ModelTrainer:
         task_uuid = config.get("task_uuid", "unknown")
         project_id = config.get("project_id", "default")
 
-        # 获取用于路径的ID（category_id 或 pos_id）
-        if group_annotations:
-            first_ann = group_annotations[0]
-            if train_mode == "by_category":
-                path_id = str(first_ann.get("category_id", 0))
-            else:  # by_pos_id
-                path_id = str(first_ann.get("pos_id", group_id))
-        else:
-            path_id = str(group_id)
+        # 从 config 中获取 path_id（由 _create_group_training_task 设置），确保一致性
+        path_id = config.get("path_id")
+        if path_id is None:
+            # 兼容旧逻辑（如果 path_id 未设置）
+            if group_annotations:
+                first_ann = group_annotations[0]
+                if train_mode == "by_category":
+                    path_id = str(first_ann.get("category_id", 0))
+                else:  # by_pos_id
+                    path_id = str(first_ann.get("pos_id", group_id))
+            else:
+                path_id = str(group_id)
+            self._add_log(task_id, f"Warning: path_id not in config, fallback to {path_id}")
 
         # ROI 保存路径: dataset_dir 已经是 product/{project_id}/train/{task_uuid}/
         # 直接在 dataset_dir 下创建 roi 子目录
-        roi_save_dir = Path(dataset_dir) / "roi" / path_id
+        roi_save_dir = Path(dataset_dir) / "roi" / str(path_id)
+        mask_save_dir = Path(dataset_dir) / "masks" / str(path_id)
         roi_save_dir.mkdir(parents=True, exist_ok=True)
+        mask_save_dir.mkdir(parents=True, exist_ok=True)
 
-        # 提取ROI图片到保存目录（包含数据增强）
+        # 提取ROI图片到保存目录（包含数据增强），同时保存 mask
         image_paths = extract_roi_images(
             dataset_dir=dataset_dir,
             output_dir=str(roi_save_dir),
+            mask_output_dir=str(mask_save_dir),
             group_annotations=group_annotations,
             normalize_brightness=normalize_brightness,
             normalize_contrast=normalize_contrast,
@@ -701,19 +770,48 @@ class ModelTrainer:
                     param.requires_grad = False
                 self._add_log(task_id, "Encoder frozen for faster training")
 
+        # ✅ 自定义 Callback，每个 epoch 结束更新进度和日志
+        class EpochProgressCallback(Callback):
+            def __init__(self, trainer_ref, task_id, total_epochs):
+                self.trainer_ref = trainer_ref
+                self.task_id = task_id
+                self.total_epochs = total_epochs
+
+            def on_train_epoch_end(self, trainer, pl_module):
+                current = trainer.current_epoch + 1
+                # 进度从 50 到 80 之间分配给训练阶段
+                progress = 50 + int((current / self.total_epochs) * 30)
+                self.trainer_ref._update_task_status(self.task_id, progress=progress)
+                self.trainer_ref._add_log(
+                    self.task_id,
+                    f"[task:{self.task_id[-8:]}] Epoch {current}/{self.total_epochs} done"
+                )
+
+        epoch_cb = EpochProgressCallback(self, task_id, epochs)
+
+        # 使用临时目录作为 anomalib 日志目录，训练结束后自动清理
+        import tempfile
+        anomalib_temp_dir = tempfile.mkdtemp(prefix="anomalib_")
+        
         engine = Engine(
             max_epochs=epochs,
             accelerator=accelerator,
             devices=1,
-            enable_progress_bar=False,  # 禁用进度条，减少日志输出
+            enable_progress_bar=False,   # ✅ 关掉 tqdm，避免多线程输出混乱
             enable_model_summary=False,
             check_val_every_n_epoch=epochs,
+            callbacks=[epoch_cb],        # ✅ 加入 callback
+            default_root_dir=anomalib_temp_dir,  # ✅ 使用临时目录，不保留日志
         )
 
         # 创建 Folder datamodule - 直接使用 roi_save_dir
         # 创建一个临时根目录，roi_save_dir 作为 normal 子目录
         temp_root = Path(save_dir) / "temp_anomalib"
         temp_root.mkdir(parents=True, exist_ok=True)
+
+        # ✅ 修复：线程内强制 num_workers=0，避免 DataLoader fork 死锁
+        safe_num_workers = 0
+        self._add_log(task_id, f"DataLoader num_workers forced to 0 (threading mode)")
 
         # 创建符号链接或直接使用 - 这里使用 . 作为 root，roi_save_dir 作为 normal_dir 的绝对路径
         datamodule = Folder(
@@ -723,7 +821,7 @@ class ModelTrainer:
             normal_test_dir=str(roi_save_dir),
             train_batch_size=batch_size,
             eval_batch_size=batch_size,
-            num_workers=num_workers,
+            num_workers=safe_num_workers,  # ✅ 强制使用 0
             test_split_mode=TestSplitMode.FROM_DIR,
             val_split_mode=ValSplitMode.SAME_AS_TEST,
             val_split_ratio=0.0,
@@ -732,12 +830,34 @@ class ModelTrainer:
 
         # Stage 3: 训练模型
         self._update_task_status(task_id, progress=50, stage="3/3")
+        self._add_log(task_id, f"{'='*20} Task {task_id[-8:]} Stage3 fit() START {'='*20}")
         self._add_log(task_id, "Stage 3/3: Training model...")
 
         train_start = time.time()
-        engine.fit(model=model, datamodule=datamodule)
-        train_time = time.time() - train_start
 
+        # ✅ 加超时检测，防止永久卡死
+        fit_exception = [None]
+
+        def run_fit():
+            try:
+                engine.fit(model=model, datamodule=datamodule)
+            except Exception as e:
+                fit_exception[0] = e
+
+        fit_thread = threading.Thread(target=run_fit, daemon=True)
+        fit_thread.start()
+
+        # 每 epoch 最多 10 分钟，可按需调整
+        timeout_seconds = epochs * 600
+        fit_thread.join(timeout=timeout_seconds)
+
+        if fit_thread.is_alive():
+            raise RuntimeError(f"engine.fit() timed out after {timeout_seconds}s (stuck in stage 3)")
+        if fit_exception[0]:
+            raise fit_exception[0]
+
+        train_time = time.time() - train_start
+        self._add_log(task_id, f"{'='*20} Task {task_id[-8:]} Stage3 fit() END {'='*20}")
         self._add_log(task_id, f"Training completed in {train_time:.2f}s")
 
         # 计算阈值（在训练集上推理）
@@ -761,10 +881,13 @@ class ModelTrainer:
         # 清理临时目录
         if temp_root.exists():
             shutil.rmtree(temp_root)
+        
+        # 清理 anomalib 临时日志目录
+        if os.path.exists(anomalib_temp_dir):
+            shutil.rmtree(anomalib_temp_dir)
 
-        # 清理资源
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # 清理模型和显存
+        self._cleanup_training_resources(model, engine, datamodule)
 
         self._update_task_status(
             task_id,
@@ -805,7 +928,7 @@ class ModelTrainer:
                 val = getattr(obj, 'value', None)
                 if val is not None:
                     return float(val)
-        return 0.5
+        return 0.55
 
     def _save_dinomaly_model(
         self,
@@ -885,25 +1008,53 @@ class ModelTrainer:
 
         self._add_log(task_id, f"Config saved to: {config_path}")
 
-    def _cleanup_training_resources(self, model, device: torch.device):
-        """清理训练资源"""
+    def _cleanup_training_resources(self, model, engine: Engine = None, datamodule=None):
+        """清理训练资源 - 彻底释放显存"""
         try:
-            if hasattr(model, 'memory_bank'):
-                del model.memory_bank
-            if hasattr(model, 'feature_extractor'):
-                del model.feature_extractor
-            if hasattr(model, 'feature_pooler'):
-                del model.feature_pooler
-            del model
+            # 删除 datamodule
+            if datamodule is not None:
+                del datamodule
 
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
+            # 删除 engine 和 trainer
+            if engine is not None:
+                if hasattr(engine, 'trainer') and engine.trainer is not None:
+                    # 清理 trainer 中的模型引用
+                    if hasattr(engine.trainer, 'model'):
+                        engine.trainer.model = None
+                    if hasattr(engine.trainer, 'lightning_module'):
+                        engine.trainer.lightning_module = None
+                del engine
 
+            # 删除模型及其组件
+            if model is not None:
+                # 清理 Dinomaly 模型的各个组件
+                if hasattr(model, 'model'):
+                    inner_model = model.model
+                    if hasattr(inner_model, 'encoder'):
+                        del inner_model.encoder
+                    if hasattr(inner_model, 'decoder'):
+                        del inner_model.decoder
+                    if hasattr(inner_model, 'bottleneck'):
+                        del inner_model.bottleneck
+                    del inner_model
+                if hasattr(model, 'memory_bank'):
+                    del model.memory_bank
+                if hasattr(model, 'feature_extractor'):
+                    del model.feature_extractor
+                if hasattr(model, 'feature_pooler'):
+                    del model.feature_pooler
+                del model
+
+            # 强制垃圾回收
             import gc
             gc.collect()
 
-            if device.type == "cuda":
+            # 清理 CUDA 显存
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                # 重置峰值显存统计
+                torch.cuda.reset_peak_memory_stats()
                 logger.info(f"GPU memory after cleanup: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
         except Exception as e:
             logger.warning(f"Error during cleanup: {e}")
