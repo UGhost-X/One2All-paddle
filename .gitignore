@@ -163,3 +163,4 @@ templates/inference_services.py.j2-*
 debug_clahe/
 models/pretrained/hub/models--timm--wide_resnet50_2.racm_in1k/blobs/03b71d65fb2c73bb0de079a1781009f27a782ec481d2f64ab3bde9b1cdec3000.incomplete
 models/pretrained/hub/models--timm--wide_resnet50_2.racm_in1k/refs/main
+models/pretrained/dinov2/dinov2_vitb14_pretrain.pth

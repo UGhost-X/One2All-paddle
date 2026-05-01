@@ -33,6 +33,8 @@ os.environ["TIMM_HOME"] = str(PRETRAINED_DIR)
 os.environ["HF_HOME"] = str(PRETRAINED_DIR)
 os.environ["TRANSFORMERS_CACHE"] = str(PRETRAINED_DIR / "transformers")
 os.environ["HUGGINGFACE_HUB_CACHE"] = str(HUB_DIR)
+# 设置 anomalib 预训练模型缓存目录为本地路径
+os.environ["ANOMALIB_CACHE_DIR"] = str(PRETRAINED_DIR)
 # 使用 Hugging Face 镜像站
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 # 允许联网下载
@@ -45,6 +47,18 @@ sys.path.insert(0, '/home/software/One2All-paddle')
 from anomalib.data import Folder
 from anomalib.data.utils import TestSplitMode, ValSplitMode
 from anomalib.engine import Engine
+
+
+try:
+    from anomalib.models.components.dinov2.dinov2_loader import DinoV2Loader as _DinoV2Loader
+except ImportError:
+    from anomalib.models.image.dinomaly.components.dinov2_loader import DinoV2Loader as _DinoV2Loader
+_original_dinov2loader_init = _DinoV2Loader.__init__
+def _patched_dinov2loader_init(self, cache_dir=None, vit_factory=None):
+    if cache_dir is None:
+        cache_dir = str(PRETRAINED_DIR / "dinov2")
+    _original_dinov2loader_init(self, cache_dir, vit_factory)
+_DinoV2Loader.__init__ = _patched_dinov2loader_init
 
 # PyTorch Lightning Callback
 from pytorch_lightning.callbacks import Callback

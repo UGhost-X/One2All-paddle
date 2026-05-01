@@ -18,6 +18,11 @@ from datetime import datetime
 from contextlib import contextmanager
 from PIL import Image
 
+# 设置 anomalib 预训练模型缓存目录为本地路径（必须在导入 anomalib 之前设置）
+PROJECT_ROOT = Path(__file__).parent.parent
+PRETRAINED_DIR = PROJECT_ROOT / "models" / "pretrained"
+os.environ["ANOMALIB_CACHE_DIR"] = str(PRETRAINED_DIR)
+
 # 导入 TurboJPEG 解码工具
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from utils.image_decoder import decode_image, is_turbo_jpeg_available
@@ -283,6 +288,20 @@ def cv2_put_chinese_text(img, text, position, color, font_size=20):
 # ─────────────────────────────────────────────────────────────────────────────
 # Dinomaly 推理模型
 # ─────────────────────────────────────────────────────────────────────────────
+
+# 打补丁：修改 DinoV2Loader 的默认缓存目录为本地路径
+try:
+    # 尝试新版本的导入路径
+    from anomalib.models.components.dinov2.dinov2_loader import DinoV2Loader as _DinoV2Loader
+except ImportError:
+    # 回退到旧版本的导入路径
+    from anomalib.models.image.dinomaly.components.dinov2_loader import DinoV2Loader as _DinoV2Loader
+_original_dinov2loader_init = _DinoV2Loader.__init__
+def _patched_dinov2loader_init(self, cache_dir=None, vit_factory=None):
+    if cache_dir is None:
+        cache_dir = str(PRETRAINED_DIR / "dinov2")
+    _original_dinov2loader_init(self, cache_dir, vit_factory)
+_DinoV2Loader.__init__ = _patched_dinov2loader_init
 
 class DinomalyWrapper:
     """Dinomaly 推理包装器"""
