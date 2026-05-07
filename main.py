@@ -364,7 +364,7 @@ def train_anomaly(request: TrainRequest):
             "decoder_depth": request.decoder_depth,
             "bottleneck_dropout": request.bottleneck_dropout,
             "epochs": request.epochs,
-            "batch_size": request.batch_size,
+            "batch_size":  request.batch_size,
             "freeze_encoder": request.freeze_encoder,
         }
 

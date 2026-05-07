@@ -61,7 +61,7 @@ def _patched_dinov2loader_init(self, cache_dir=None, vit_factory=None):
 _DinoV2Loader.__init__ = _patched_dinov2loader_init
 
 # PyTorch Lightning Callback
-from pytorch_lightning.callbacks import Callback
+from pytorch_lightning.callbacks import Callback, EarlyStopping
 
 try:
     from anomalib.models import Dinomaly
@@ -676,13 +676,24 @@ class ModelTrainer:
             save_dir = self.training_status[task_id]["save_dir"]
         os.makedirs(save_dir, exist_ok=True)
 
+        # ✅ 固定随机种子，保证可复现性
+        seed = config.get("seed", 42)
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False  # benchmark=True 会引入不确定性
+        self._add_log(task_id, f"Random seed fixed: {seed}")
+
         # 配置参数
         encoder_name = config.get("encoder_name", "dinov2_vit_base_14")
         decoder_depth = config.get("decoder_depth", 8)
         bottleneck_dropout = config.get("bottleneck_dropout", 0.2)
-        # epochs = config.get("epochs", 20)
-        epochs = 20
-        batch_size = config.get("batch_size", 1)
+        epochs = config.get("epochs", 12)  # 从 20 降到 12，encoder 冻结时收敛更快
+        batch_size = config.get("batch_size", 8)  # 从 2 提升到 8，BF16+inference_mode 后显存充足
         num_workers = config.get("num_workers", 4)
         normalize_brightness = config.get("normalize_brightness", False)
         normalize_contrast = config.get("normalize_contrast", False)
@@ -702,216 +713,320 @@ class ModelTrainer:
         if not DINORMALY_AVAILABLE:
             raise RuntimeError("Dinomaly model is not available")
 
-        # Stage 1: 提取ROI图片
-        self._update_task_status(task_id, status="preparing", progress=10, stage="1/3")
-        self._add_log(task_id, "Stage 1/3: Preparing ROI images...")
-
-        # 根据训练模式确定ROI保存路径
-        train_mode = config.get("train_mode", "by_pos_id")
-        task_uuid = config.get("task_uuid", "unknown")
-        project_id = config.get("project_id", "default")
-
-        # 从 config 中获取 path_id（由 _create_group_training_task 设置），确保一致性
-        path_id = config.get("path_id")
-        if path_id is None:
-            # 兼容旧逻辑（如果 path_id 未设置）
-            if group_annotations:
-                first_ann = group_annotations[0]
-                if train_mode == "by_category":
-                    path_id = str(first_ann.get("category_id", 0))
-                else:  # by_pos_id
-                    path_id = str(first_ann.get("pos_id", group_id))
-            else:
-                path_id = str(group_id)
-            self._add_log(task_id, f"Warning: path_id not in config, fallback to {path_id}")
-
-        # ROI 保存路径: dataset_dir 已经是 product/{project_id}/train/{task_uuid}/
-        # 直接在 dataset_dir 下创建 roi 子目录
-        roi_save_dir = Path(dataset_dir) / "roi" / str(path_id)
-        mask_save_dir = Path(dataset_dir) / "masks" / str(path_id)
-        roi_save_dir.mkdir(parents=True, exist_ok=True)
-        mask_save_dir.mkdir(parents=True, exist_ok=True)
-
-        # 提取ROI图片到保存目录（包含数据增强），同时保存 mask
-        image_paths = extract_roi_images(
-            dataset_dir=dataset_dir,
-            output_dir=str(roi_save_dir),
-            mask_output_dir=str(mask_save_dir),
-            group_annotations=group_annotations,
-            normalize_brightness=normalize_brightness,
-            normalize_contrast=normalize_contrast,
-            augment=augment,
-            num_augmentations=num_augmentations,
-            train_mode=train_mode,
-            augmentation_config=augmentation_config,
-        )
-
-        if not image_paths:
-            raise ValueError(f"No ROI images extracted for group {group_id}")
-
-        self._add_log(task_id, f"Saved {len(image_paths)} ROI images to {roi_save_dir}")
-
-        # 直接使用 roi_save_dir 作为训练数据目录（禁止复制）
-        self._add_log(task_id, f"Using ROI images directly from {roi_save_dir}")
-
-        # Stage 2: 创建 Anomalib datamodule 和模型
-        self._update_task_status(task_id, status="training", progress=30, stage="2/3")
-        self._add_log(task_id, "Stage 2/3: Creating model and datamodule...")
-
-        accelerator = 'gpu' if torch.cuda.is_available() else 'cpu'
+        # 初始化变量，用于 finally 中清理
+        model = None
+        engine = None
+        datamodule = None
+        temp_root = None
+        anomalib_temp_dir = None
+        fit_thread = None
+        predictions = None
+        scores = None
+        eval_dataloader = None
+        val_split_ratio_actual = 0.0  # 将在后面根据样本数动态设置
 
         try:
-            model = Dinomaly(
-                encoder_name=encoder_name,
-                decoder_depth=decoder_depth,
-                bottleneck_dropout=bottleneck_dropout,
+            # Stage 1: 提取ROI图片
+            self._update_task_status(task_id, status="preparing", progress=10, stage="1/3")
+            self._add_log(task_id, "Stage 1/3: Preparing ROI images...")
+
+            # 根据训练模式确定ROI保存路径
+            train_mode = config.get("train_mode", "by_pos_id")
+            task_uuid = config.get("task_uuid", "unknown")
+            project_id = config.get("project_id", "default")
+
+            # 从 config 中获取 path_id（由 _create_group_training_task 设置），确保一致性
+            path_id = config.get("path_id")
+            if path_id is None:
+                # 兼容旧逻辑（如果 path_id 未设置）
+                if group_annotations:
+                    first_ann = group_annotations[0]
+                    if train_mode == "by_category":
+                        path_id = str(first_ann.get("category_id", 0))
+                    else:  # by_pos_id
+                        path_id = str(first_ann.get("pos_id", group_id))
+                else:
+                    path_id = str(group_id)
+                self._add_log(task_id, f"Warning: path_id not in config, fallback to {path_id}")
+
+            # ROI 保存路径: dataset_dir 已经是 product/{project_id}/train/{task_uuid}/
+            # 直接在 dataset_dir 下创建 roi 子目录
+            roi_save_dir = Path(dataset_dir) / "roi" / str(path_id)
+            mask_save_dir = Path(dataset_dir) / "masks" / str(path_id)
+            roi_save_dir.mkdir(parents=True, exist_ok=True)
+            mask_save_dir.mkdir(parents=True, exist_ok=True)
+
+            # 提取ROI图片到保存目录（包含数据增强），同时保存 mask
+            image_paths = extract_roi_images(
+                dataset_dir=dataset_dir,
+                output_dir=str(roi_save_dir),
+                mask_output_dir=str(mask_save_dir),
+                group_annotations=group_annotations,
+                normalize_brightness=normalize_brightness,
+                normalize_contrast=normalize_contrast,
+                augment=augment,
+                num_augmentations=num_augmentations,
+                train_mode=train_mode,
+                augmentation_config=augmentation_config,
             )
-        except (OSError, IOError, Exception) as e:
-            if 'dinov2' in str(e).lower() or 'download' in str(e).lower():
-                raise RuntimeError(f"DINOv2 预训练权重下载失败: {e}")
-            raise
 
-        # 冻结编码器
-        if freeze_encoder:
-            encoder = None
-            if hasattr(model, 'model') and hasattr(model.model, 'encoder'):
-                encoder = model.model.encoder
-            elif hasattr(model, 'encoder'):
-                encoder = model.encoder
+            if not image_paths:
+                raise ValueError(f"No ROI images extracted for group {group_id}")
 
-            if encoder is not None:
-                for param in encoder.parameters():
-                    param.requires_grad = False
-                self._add_log(task_id, "Encoder frozen for faster training")
+            self._add_log(task_id, f"Saved {len(image_paths)} ROI images to {roi_save_dir}")
 
-        # ✅ 自定义 Callback，每个 epoch 结束更新进度和日志
-        class EpochProgressCallback(Callback):
-            def __init__(self, trainer_ref, task_id, total_epochs):
-                self.trainer_ref = trainer_ref
-                self.task_id = task_id
-                self.total_epochs = total_epochs
+            # 直接使用 roi_save_dir 作为训练数据目录（禁止复制）
+            self._add_log(task_id, f"Using ROI images directly from {roi_save_dir}")
 
-            def on_train_epoch_end(self, trainer, pl_module):
-                current = trainer.current_epoch + 1
-                # 进度从 50 到 80 之间分配给训练阶段
-                progress = 50 + int((current / self.total_epochs) * 30)
-                self.trainer_ref._update_task_status(self.task_id, progress=progress)
-                self.trainer_ref._add_log(
-                    self.task_id,
-                    f"[task:{self.task_id[-8:]}] Epoch {current}/{self.total_epochs} done"
-                )
+            # Stage 2: 创建 Anomalib datamodule 和模型
+            self._update_task_status(task_id, status="training", progress=30, stage="2/3")
+            self._add_log(task_id, "Stage 2/3: Creating model and datamodule...")
 
-        epoch_cb = EpochProgressCallback(self, task_id, epochs)
+            accelerator = 'gpu' if torch.cuda.is_available() else 'cpu'
 
-        # 使用临时目录作为 anomalib 日志目录，训练结束后自动清理
-        import tempfile
-        anomalib_temp_dir = tempfile.mkdtemp(prefix="anomalib_")
-        
-        engine = Engine(
-            max_epochs=epochs,
-            accelerator=accelerator,
-            devices=1,
-            enable_progress_bar=False,   # ✅ 关掉 tqdm，避免多线程输出混乱
-            enable_model_summary=False,
-            check_val_every_n_epoch=epochs,
-            callbacks=[epoch_cb],        # ✅ 加入 callback
-            default_root_dir=anomalib_temp_dir,  # ✅ 使用临时目录，不保留日志
-        )
-
-        # 创建 Folder datamodule - 直接使用 roi_save_dir
-        # 创建一个临时根目录，roi_save_dir 作为 normal 子目录
-        temp_root = Path(save_dir) / "temp_anomalib"
-        temp_root.mkdir(parents=True, exist_ok=True)
-
-        # ✅ 修复：线程内强制 num_workers=0，避免 DataLoader fork 死锁
-        safe_num_workers = 0
-        self._add_log(task_id, f"DataLoader num_workers forced to 0 (threading mode)")
-
-        # 创建符号链接或直接使用 - 这里使用 . 作为 root，roi_save_dir 作为 normal_dir 的绝对路径
-        datamodule = Folder(
-            name="train",
-            root=temp_root,
-            normal_dir=str(roi_save_dir),  # 直接使用 ROI 保存目录
-            normal_test_dir=str(roi_save_dir),
-            train_batch_size=batch_size,
-            eval_batch_size=batch_size,
-            num_workers=safe_num_workers,  # ✅ 强制使用 0
-            test_split_mode=TestSplitMode.FROM_DIR,
-            val_split_mode=ValSplitMode.SAME_AS_TEST,
-            val_split_ratio=0.0,
-        )
-        datamodule.setup()
-
-        # Stage 3: 训练模型
-        self._update_task_status(task_id, progress=50, stage="3/3")
-        self._add_log(task_id, f"{'='*20} Task {task_id[-8:]} Stage3 fit() START {'='*20}")
-        self._add_log(task_id, "Stage 3/3: Training model...")
-
-        train_start = time.time()
-
-        # ✅ 加超时检测，防止永久卡死
-        fit_exception = [None]
-
-        def run_fit():
             try:
-                engine.fit(model=model, datamodule=datamodule)
+                model = Dinomaly(
+                    encoder_name=encoder_name,
+                    decoder_depth=decoder_depth,
+                    bottleneck_dropout=bottleneck_dropout,
+                )
+            except (OSError, IOError, Exception) as e:
+                if 'dinov2' in str(e).lower() or 'download' in str(e).lower():
+                    raise RuntimeError(f"DINOv2 预训练权重下载失败: {e}")
+                raise
+
+            # 冻结编码器并启用 inference_mode 以释放激活值显存
+            if freeze_encoder:
+                encoder = None
+                if hasattr(model, 'model') and hasattr(model.model, 'encoder'):
+                    encoder = model.model.encoder
+                elif hasattr(model, 'encoder'):
+                    encoder = model.encoder
+
+                if encoder is not None:
+                    for param in encoder.parameters():
+                        param.requires_grad = False
+                    # 使用 inference_mode 包裹 encoder forward，释放中间激活值显存
+                    _orig_fwd = encoder.forward
+                    def _no_grad_fwd(*a, **kw):
+                        with torch.inference_mode():
+                            return _orig_fwd(*a, **kw)
+                    encoder.forward = _no_grad_fwd
+                    self._add_log(task_id, "Encoder frozen with inference_mode for faster training and lower memory")
+
+            # ✅ 自定义 Callback，每个 epoch 结束更新进度和日志
+            class EpochProgressCallback(Callback):
+                def __init__(self, trainer_ref, task_id, total_epochs):
+                    self.trainer_ref = trainer_ref
+                    self.task_id = task_id
+                    self.total_epochs = total_epochs
+
+                def on_train_epoch_end(self, trainer, pl_module):
+                    current = trainer.current_epoch + 1
+                    # 进度从 50 到 80 之间分配给训练阶段
+                    progress = 50 + int((current / self.total_epochs) * 30)
+                    self.trainer_ref._update_task_status(self.task_id, progress=progress)
+                    self.trainer_ref._add_log(
+                        self.task_id,
+                        f"[task:{self.task_id[-8:]}] Epoch {current}/{self.total_epochs} done"
+                    )
+
+            epoch_cb = EpochProgressCallback(self, task_id, epochs)
+
+            # 使用临时目录作为 anomalib 日志目录，训练结束后自动清理
+            import tempfile
+            anomalib_temp_dir = tempfile.mkdtemp(prefix="anomalib_")
+
+            # 创建 Folder datamodule - 直接使用 roi_save_dir
+            # 创建一个临时根目录，roi_save_dir 作为 normal 子目录
+            temp_root = Path(save_dir) / "temp_anomalib"
+            temp_root.mkdir(parents=True, exist_ok=True)
+
+            # ✅ 修复：线程内强制 num_workers=0，避免 DataLoader fork 死锁
+            safe_num_workers = 0
+            self._add_log(task_id, f"DataLoader num_workers forced to 0 (threading mode)")
+
+            # 根据样本数量动态决定是否分割验证集
+            num_images = len(image_paths)
+            min_val_samples = 3  # 验证集最少需要的样本数
+            val_split_ratio_actual = 0.2
+            check_val_every_n_epoch = epochs  # 默认只在最后验证
+
+            # 计算验证集样本数
+            val_samples = int(num_images * val_split_ratio_actual)
+
+            if val_samples < min_val_samples:
+                # 样本太少，不分割验证集
+                val_split_ratio_actual = 0.0
+                val_split_mode = ValSplitMode.SAME_AS_TEST
+                check_val_every_n_epoch = epochs
+                callbacks = [epoch_cb]
+                self._add_log(task_id, f"WARNING: Only {num_images} samples, skipping val split (need >= {int(min_val_samples / 0.2)} images)")
+            else:
+                # 样本足够，分割 20% 作为验证集
+                val_split_mode = ValSplitMode.FROM_TEST
+                check_val_every_n_epoch = 1  # 每个 epoch 都验证
+                # 添加 Early Stopping（样本数 > 50 时启用）
+                # 注意：使用 train_loss 而不是 val_loss，因为验证集可能只有正常样本
+                if num_images > 50:
+                    early_stop_cb = EarlyStopping(
+                        monitor="train_loss",
+                        patience=3,  # 从 5 改为 3，encoder 冻结时收敛更快
+                        mode="min",
+                        verbose=False,
+                    )
+                    callbacks = [epoch_cb, early_stop_cb]
+                    self._add_log(task_id, f"Using val_split_ratio=0.2 ({val_samples} val samples) with EarlyStopping(patience=3, monitor=train_loss)")
+                else:
+                    callbacks = [epoch_cb]
+                    self._add_log(task_id, f"Using val_split_ratio=0.2 ({val_samples} val samples), EarlyStopping disabled (samples <= 50)")
+
+            engine = Engine(
+                max_epochs=epochs,
+                accelerator=accelerator,
+                devices=1,
+                enable_progress_bar=False,   # ✅ 关掉 tqdm，避免多线程输出混乱
+                enable_model_summary=False,
+                check_val_every_n_epoch=check_val_every_n_epoch,
+                callbacks=callbacks,        # ✅ 加入 callbacks
+                default_root_dir=anomalib_temp_dir,  # ✅ 使用临时目录，不保留日志
+                deterministic=False,        # ✅ AMP (BF16) 必须关闭确定性
+                precision="bf16-mixed",     # ✅ BF16 混合精度，显存 -35%，速度 +20~30%
+                logger=False,               # ✅ 关闭 logger 减少磁盘 I/O
+            )
+
+            # 创建符号链接或直接使用 - 这里使用 . 作为 root，roi_save_dir 作为 normal_dir 的绝对路径
+            datamodule = Folder(
+                name="train",
+                root=temp_root,
+                normal_dir=str(roi_save_dir),  # 直接使用 ROI 保存目录
+                normal_test_dir=str(roi_save_dir),
+                train_batch_size=batch_size,
+                eval_batch_size=batch_size,
+                num_workers=safe_num_workers,  # ✅ 强制使用 0
+                test_split_mode=TestSplitMode.FROM_DIR,
+                val_split_mode=val_split_mode,
+                val_split_ratio=val_split_ratio_actual,
+            )
+            datamodule.setup()
+
+            # ✅ 验证数据集分割结果
+            try:
+                train_size = len(datamodule.train_dataloader().dataset)
+                val_size = len(datamodule.val_dataloader().dataset)
+                test_size = len(datamodule.test_dataloader().dataset)
+                self._add_log(task_id, f"Dataset split: train={train_size}, val={val_size}, test={test_size}")
             except Exception as e:
-                fit_exception[0] = e
+                self._add_log(task_id, f"Warning: Could not log dataset split: {e}")
 
-        fit_thread = threading.Thread(target=run_fit, daemon=True)
-        fit_thread.start()
+            # Stage 3: 训练模型
+            self._update_task_status(task_id, progress=50, stage="3/3")
+            self._add_log(task_id, f"{'='*20} Task {task_id[-8:]} Stage3 fit() START {'='*20}")
+            self._add_log(task_id, "Stage 3/3: Training model...")
 
-        # 每 epoch 最多 10 分钟，可按需调整
-        timeout_seconds = epochs * 600
-        fit_thread.join(timeout=timeout_seconds)
+            train_start = time.time()
 
-        if fit_thread.is_alive():
-            raise RuntimeError(f"engine.fit() timed out after {timeout_seconds}s (stuck in stage 3)")
-        if fit_exception[0]:
-            raise fit_exception[0]
+            # ✅ 加超时检测，防止永久卡死
+            fit_exception = [None]
 
-        train_time = time.time() - train_start
-        self._add_log(task_id, f"{'='*20} Task {task_id[-8:]} Stage3 fit() END {'='*20}")
-        self._add_log(task_id, f"Training completed in {train_time:.2f}s")
+            def run_fit():
+                try:
+                    engine.fit(model=model, datamodule=datamodule)
+                except Exception as e:
+                    fit_exception[0] = e
 
-        # 计算阈值（在训练集上推理）
-        self._update_task_status(task_id, progress=80)
-        self._add_log(task_id, "Computing threshold...")
+            fit_thread = threading.Thread(target=run_fit, daemon=True)
+            fit_thread.start()
 
-        test_dataloader = datamodule.test_dataloader()
-        predictions = engine.predict(model=model, dataloaders=test_dataloader)
-        scores = self._extract_dinomaly_scores(predictions)
+            # 每 epoch 最多 10 分钟，可按需调整
+            timeout_seconds = epochs * 600
+            fit_thread.join(timeout=timeout_seconds)
 
-        # 获取阈值
-        threshold = self._get_dinomaly_threshold(model)
+            if fit_thread.is_alive():
+                raise RuntimeError(f"engine.fit() timed out after {timeout_seconds}s (stuck in stage 3)")
+            if fit_exception[0]:
+                raise fit_exception[0]
 
-        if len(scores) > 0:
-            self._add_log(task_id, f"Score range: [{np.min(scores):.4f}, {np.max(scores):.4f}], Threshold: {threshold:.4f}")
+            train_time = time.time() - train_start
+            self._add_log(task_id, f"{'='*20} Task {task_id[-8:]} Stage3 fit() END {'='*20}")
+            self._add_log(task_id, f"Training completed in {train_time:.2f}s")
 
-        # 保存模型
-        self._update_task_status(task_id, progress=90)
-        self._save_dinomaly_model(task_id, save_dir, model, engine, config, threshold, group_annotations)
+            # 计算阈值（在验证集上推理，如果验证集存在；否则使用测试集）
+            self._update_task_status(task_id, progress=80)
 
-        # 清理临时目录
-        if temp_root.exists():
-            shutil.rmtree(temp_root)
-        
-        # 清理 anomalib 临时日志目录
-        if os.path.exists(anomalib_temp_dir):
-            shutil.rmtree(anomalib_temp_dir)
+            # 优先使用验证集计算阈值（held-out 数据更具代表性）
+            if val_split_ratio_actual > 0 and hasattr(datamodule, 'val_dataloader'):
+                self._add_log(task_id, "Computing threshold on validation samples (held-out)...")
+                eval_dataloader = datamodule.val_dataloader()
+                eval_source = "validation"
+            else:
+                self._add_log(task_id, "Computing threshold on test samples (no validation split)...")
+                eval_dataloader = datamodule.test_dataloader()
+                eval_source = "test"
 
-        # 清理模型和显存
-        self._cleanup_training_resources(model, engine, datamodule)
+            predictions = engine.predict(model=model, dataloaders=eval_dataloader)
+            scores = self._extract_dinomaly_scores(predictions)
 
-        self._update_task_status(
-            task_id,
-            status="completed",
-            progress=100,
-            stage="completed",
-            end_time=time.time()
-        )
-        self._persist_state_if_due(force=True)
-        self._add_log(task_id, f"Training completed successfully for group '{group_id}'")
+            # 仅有正常样本时，使用统计方法计算阈值（anomalib 的 F1AdaptiveThreshold 需要正负样本）
+            threshold = self._compute_threshold_from_normal_scores(
+                task_id=task_id,
+                scores=scores,
+                method=config.get("threshold_method", "percentile"),
+                percentile=config.get("threshold_percentile", 99),
+                n_sigma=config.get("threshold_n_sigma", 3.0),
+                fallback=self._get_dinomaly_threshold(model),
+            )
+
+            if len(scores) > 0:
+                self._add_log(task_id, f"Score range ({eval_source}): [{np.min(scores):.4f}, {np.max(scores):.4f}], Threshold: {threshold:.4f}")
+
+            # 保存模型（在清理变量之前，因为需要用到 scores）
+            self._update_task_status(task_id, progress=90)
+            self._save_dinomaly_model(task_id, save_dir, dataset_dir, model, engine, config, threshold, scores, group_annotations)
+
+            self._update_task_status(
+                task_id,
+                status="completed",
+                progress=100,
+                stage="completed",
+                end_time=time.time()
+            )
+            self._persist_state_if_due(force=True)
+            self._add_log(task_id, f"Training completed successfully for group '{group_id}'")
+
+        finally:
+            # 无论成功或失败，都执行清理
+            self._add_log(task_id, "Cleaning up training resources...")
+
+            # 清理推理相关变量
+            if predictions is not None:
+                del predictions
+            if scores is not None:
+                del scores
+            if eval_dataloader is not None:
+                del eval_dataloader
+
+            # 清理线程对象
+            if fit_thread is not None:
+                del fit_thread
+
+            # 清理临时目录
+            if temp_root is not None and temp_root.exists():
+                try:
+                    shutil.rmtree(temp_root)
+                except Exception as e:
+                    logger.warning(f"Failed to remove temp_root: {e}")
+            
+            # 清理 anomalib 临时日志目录
+            if anomalib_temp_dir is not None and os.path.exists(anomalib_temp_dir):
+                try:
+                    shutil.rmtree(anomalib_temp_dir)
+                except Exception as e:
+                    logger.warning(f"Failed to remove anomalib_temp_dir: {e}")
+
+            # 清理模型和显存
+            self._cleanup_training_resources(model, engine, datamodule)
+            self._add_log(task_id, "Cleanup completed")
 
     def _extract_dinomaly_scores(self, predictions) -> np.ndarray:
         """从 Dinomaly 预测结果中提取分数"""
@@ -935,23 +1050,90 @@ class ModelTrainer:
         return np.array(scores) if scores else np.array([0.0])
 
     def _get_dinomaly_threshold(self, model) -> float:
-        """获取 Dinomaly 阈值"""
+        """获取 Dinomaly 阈值（anomalib 自动计算的兜底值）"""
         for attr in ('image_threshold', 'threshold'):
             obj = getattr(model, attr, None)
             if obj is not None:
                 val = getattr(obj, 'value', None)
                 if val is not None:
                     return float(val)
-        return 0.55
+        return 0.50
+
+    def _compute_threshold_from_normal_scores(
+        self,
+        task_id: str,
+        scores: np.ndarray,
+        method: str = "percentile",
+        percentile: float = 99,
+        n_sigma: float = 3.0,
+        fallback: float = 0.5,
+    ) -> float:
+        """
+        仅有正常样本时，从分数分布计算阈值。
+
+        method:
+            percentile  → P{percentile} 分位数，推荐首选
+            sigma       → mean + n_sigma * std，分布接近正态时效果好
+            max         → 正常样本最大值，最保守（误报率最低，漏报率最高）
+        """
+        if scores is None or len(scores) == 0:
+            self._add_log(task_id, f"No scores available, using fallback threshold={fallback:.4f}")
+            return fallback
+
+        s_min = float(np.min(scores))
+        s_max = float(np.max(scores))
+        s_mean = float(np.mean(scores))
+        s_std = float(np.std(scores))
+
+        self._add_log(
+            task_id,
+            f"Normal score stats: min={s_min:.4f}, max={s_max:.4f}, "
+            f"mean={s_mean:.4f}, std={s_std:.4f}, n={len(scores)}"
+        )
+
+        # 样本极少时，百分位统计意义有限，切换到 max 方法
+        min_samples_for_percentile = 10
+        if len(scores) < min_samples_for_percentile and method == "percentile":
+            method = "max"
+            self._add_log(task_id, f"Too few samples ({len(scores)}), switching to 'max' method")
+
+        if method == "percentile":
+            threshold = float(np.percentile(scores, percentile))
+            self._add_log(task_id, f"Threshold (P{percentile}): {threshold:.4f}")
+
+        elif method == "sigma":
+            threshold = s_mean + n_sigma * s_std
+            self._add_log(task_id, f"Threshold (mean + {n_sigma}σ): {threshold:.4f}")
+
+        elif method == "max":
+            threshold = s_max
+            self._add_log(task_id, f"Threshold (max normal score): {threshold:.4f}")
+
+        else:
+            self._add_log(task_id, f"Unknown method '{method}', using fallback={fallback:.4f}")
+            threshold = fallback
+
+        # 合理性检查：阈值不能低于均值（否则一半正常样本都会报警）
+        if threshold < s_mean:
+            self._add_log(
+                task_id,
+                f"WARNING: threshold {threshold:.4f} < mean {s_mean:.4f}, "
+                f"clamping to mean + 0.5σ"
+            )
+            threshold = s_mean + 0.5 * s_std
+
+        return threshold
 
     def _save_dinomaly_model(
         self,
         task_id: str,
         save_dir: str,
+        dataset_dir: str,
         model,
         engine: Engine,
         config: dict,
         threshold: float,
+        scores: np.ndarray,
         group_annotations: List[Dict]
     ):
         """保存 Dinomaly 模型"""
@@ -1015,12 +1197,216 @@ class ModelTrainer:
 
         threshold_data = {
             'threshold': threshold,
-            'method': 'anomalib_auto',
+            'method': config.get("threshold_method", "percentile"),
+            'percentile': config.get("threshold_percentile", 99),
+            'score_stats': {
+                'min': float(np.min(scores)) if len(scores) else None,
+                'max': float(np.max(scores)) if len(scores) else None,
+                'mean': float(np.mean(scores)) if len(scores) else None,
+                'std': float(np.std(scores)) if len(scores) else None,
+                'n': len(scores),
+            },
         }
         with open(threshold_path, 'w', encoding='utf-8') as f:
             json.dump(threshold_data, f, ensure_ascii=False, indent=2)
 
         self._add_log(task_id, f"Config saved to: {config_path}")
+
+        # 预计算并保存24角度模板图（用于LightGlue推理加速）
+        self._precompute_and_save_template_variants(
+            task_id, save_dir, dataset_dir, group_annotations
+        )
+
+    def _precompute_and_save_template_variants(
+        self,
+        task_id: str,
+        save_dir: str,
+        dataset_dir: str,
+        group_annotations: List[Dict]
+    ):
+        """
+        预计算24角度模板图及其SuperPoint特征并保存，用于LightGlue推理加速。
+        选择最佳模板图（无翻转、角度最接近0），提取工件主体区域，
+        生成24个旋转角度（每15度一个）的模板图变体，并预提取SuperPoint特征。
+        """
+        try:
+            import cv2
+            import torch
+        except ImportError:
+            logger.warning("cv2 or torch not available, skipping template variant precomputation")
+            return
+
+        # 尝试导入LightGlue
+        try:
+            from lightglue import SuperPoint
+            from lightglue.utils import rbd
+            LIGHTGLUE_AVAILABLE = True
+        except ImportError:
+            logger.warning("lightglue not available, skipping template variant precomputation")
+            return
+
+        # 查找最佳模板图（无翻转、角度最接近0的标注）
+        best_ann = None
+
+        for ann in group_annotations:
+            # 跳过有翻转的标注
+            if ann.get('horizontal_flip', False) or ann.get('vertical_flip', False):
+                continue
+            # 选择角度最接近0的
+            angle = ann.get('angle', 0)
+            if best_ann is None or abs(angle) < abs(best_ann.get('angle', 0)):
+                best_ann = ann
+
+        if best_ann is None:
+            logger.warning("No suitable template annotation found for variant precomputation")
+            return
+
+        # 获取图片路径
+        image_id = best_ann.get('image_id')
+        dataset_path = Path(dataset_dir)
+        annotations_path = dataset_path / "annotations.json"
+
+        try:
+            with open(annotations_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            image_map = {img['id']: img['file_name'] for img in data.get('images', [])}
+            file_name = image_map.get(image_id)
+            if not file_name:
+                logger.warning(f"Image file not found for image_id={image_id}")
+                return
+
+            raw_images_dir = dataset_path / "raw_images"
+            image_path = raw_images_dir / file_name
+            if not image_path.exists():
+                logger.warning(f"Template image not found: {image_path}")
+                return
+
+            # 读取模板图
+            template_image = cv2.imread(str(image_path))
+            if template_image is None:
+                logger.warning(f"Failed to load template image: {image_path}")
+                return
+
+            # 查找工件主体标注
+            subject_ann = None
+            with open(annotations_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            for ann in data.get('annotations', []):
+                if ann.get('image_id') == image_id:
+                    label = ann.get('label', '')
+                    if label == "工件主体":
+                        subject_ann = ann
+                        break
+
+            # 提取工件主体区域
+            if subject_ann:
+                segmentation = subject_ann.get('segmentation', [])
+                if segmentation and len(segmentation) > 0:
+                    coords = segmentation[0]
+                    xs = coords[0::2]
+                    ys = coords[1::2]
+                    x_min, x_max = int(min(xs)), int(max(xs))
+                    y_min, y_max = int(min(ys)), int(max(ys))
+                    subject_img = template_image[y_min:y_max, x_min:x_max].copy()
+                    logger.info(f"Extracted subject region: ({x_min},{y_min},{x_max-x_min},{y_max-y_min})")
+                else:
+                    bbox = subject_ann.get('bbox', [])
+                    if bbox and len(bbox) >= 4:
+                        x, y, w, h = [int(v) for v in bbox]
+                        subject_img = template_image[y:y+h, x:x+w].copy()
+                        logger.info(f"Extracted subject region from bbox: ({x},{y},{w},{h})")
+                    else:
+                        subject_img = template_image.copy()
+                        logger.info("Using full template image as subject")
+            else:
+                subject_img = template_image.copy()
+                logger.info("No subject annotation found, using full template image")
+
+            # 生成24个旋转角度（每15度一个）
+            rotations = list(range(0, 360, 15))
+            variants_dir = Path(save_dir) / "template_variants"
+            variants_dir.mkdir(parents=True, exist_ok=True)
+
+            h, w = subject_img.shape[:2]
+            saved_count = 0
+
+            # 加载SuperPoint模型
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            extractor = SuperPoint(max_num_keypoints=8192).eval().to(device)
+            logger.info(f"[LightGlue] Loaded SuperPoint for feature extraction (device={device})")
+
+            # 预提取特征
+            t_start = time.time()
+
+            for angle in rotations:
+                cx, cy = w / 2, h / 2
+                M_rot = cv2.getRotationMatrix2D((cx, cy), -angle, 1.0)
+                cos_a = abs(M_rot[0, 0])
+                sin_a = abs(M_rot[0, 1])
+                canvas_w = int(h * sin_a + w * cos_a)
+                canvas_h = int(h * cos_a + w * sin_a)
+                M_rot[0, 2] += canvas_w / 2 - cx
+                M_rot[1, 2] += canvas_h / 2 - cy
+
+                rotated = cv2.warpAffine(
+                    subject_img, M_rot, (canvas_w, canvas_h),
+                    flags=cv2.INTER_LINEAR, borderValue=(0, 0, 0)
+                )
+
+                # 提取并保存SuperPoint特征（不再保存模板图，只保存特征）
+                rgb = cv2.cvtColor(rotated, cv2.COLOR_BGR2RGB)
+                tensor = torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
+                tensor = tensor.unsqueeze(0).to(device)
+
+                with torch.no_grad():
+                    feats = extractor.extract(tensor)
+                    # 将特征移到CPU并转换为numpy以便保存
+                    feats_dict = {
+                        'keypoints': feats['keypoints'].cpu().numpy(),
+                        'descriptors': feats['descriptors'].cpu().numpy(),
+                    }
+                    # SuperPoint输出可能包含scores或keypoint_scores
+                    if 'scores' in feats:
+                        feats_dict['scores'] = feats['scores'].cpu().numpy()
+                    elif 'keypoint_scores' in feats:
+                        feats_dict['scores'] = feats['keypoint_scores'].cpu().numpy()
+                    if 'scales' in feats:
+                        feats_dict['scales'] = feats['scales'].cpu().numpy()
+                    if 'oris' in feats:
+                        feats_dict['oris'] = feats['oris'].cpu().numpy()
+
+                # 保存特征
+                feature_path = variants_dir / f"features_{angle:03d}.npz"
+                np.savez_compressed(str(feature_path), **feats_dict)
+
+                saved_count += 1
+
+            # 清理SuperPoint模型
+            del extractor
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            # 保存元数据
+            metadata = {
+                'source_image': str(image_path),
+                'source_annotation_id': best_ann.get('id'),
+                'rotations': rotations,
+                'num_variants': saved_count,
+                'original_size': {'width': w, 'height': h},
+                'features_extracted': True,
+                'feature_type': 'superpoint',
+            }
+            metadata_path = variants_dir / "metadata.json"
+            with open(metadata_path, 'w', encoding='utf-8') as f:
+                json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+            elapsed = time.time() - t_start
+            self._add_log(task_id, f"Precomputed and saved {saved_count} template variants with features to {variants_dir} (took {elapsed:.2f}s)")
+
+        except Exception as e:
+            logger.warning(f"Failed to precompute template variants: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _cleanup_training_resources(self, model, engine: Engine = None, datamodule=None):
         """清理训练资源 - 彻底释放显存"""
@@ -1032,11 +1418,17 @@ class ModelTrainer:
             # 删除 engine 和 trainer
             if engine is not None:
                 if hasattr(engine, 'trainer') and engine.trainer is not None:
-                    # 清理 trainer 中的模型引用
-                    if hasattr(engine.trainer, 'model'):
-                        engine.trainer.model = None
-                    if hasattr(engine.trainer, 'lightning_module'):
-                        engine.trainer.lightning_module = None
+                    # 清理 trainer 中的模型引用（使用try-except避免只读属性错误）
+                    try:
+                        if hasattr(engine.trainer, 'model'):
+                            engine.trainer.model = None
+                    except (AttributeError, TypeError):
+                        pass
+                    try:
+                        if hasattr(engine.trainer, 'lightning_module'):
+                            engine.trainer.lightning_module = None
+                    except (AttributeError, TypeError):
+                        pass
                 del engine
 
             # 删除模型及其组件

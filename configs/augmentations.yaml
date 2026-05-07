@@ -1,5 +1,4 @@
 # Albumentations 数据增强配置
-# 用于 PatchCore 训练时的数据增强
 
 __version__: 1.4.0
 transform:
@@ -26,20 +25,23 @@ transform:
       border_mode: 0  # BORDER_CONSTANT，对应 fill=0
       rotate_method: largest_box
       crop_border: false
-      p: 0.5
+      p: 0.3
 
     # 亮度和对比度调整（与原代码的 ColorJitter 对应）
-    # - __class_fullname__: RandomBrightnessContrast
-    #   brightness_limit: [-0.2, 0.2]
-    #   contrast_limit: [-0.2, 0.2]
-    #   brightness_by_max: true
-    #   p: 0.5
+    - __class_fullname__: RandomBrightnessContrast
+      brightness_limit: [-0.8, 0.8]
+      contrast_limit: [-0.8, 0.8]
+      brightness_by_max: true
+      p: 0.8
 
-    - __class_fullname__: CLAHE
-      clip_limit: [1.0, 4.0]
-      tile_grid_size: [8, 8]
+    - __class_fullname__: RandomGamma
+      gamma_limit: [60, 140]
       p: 0.5
 
+    - __class_fullname__: CLAHE
+      clip_limit: [1.0, 6.0]
+      tile_grid_size: [8, 8]
+      p: 0.5    
     # 随机平移（轻微移动，不裁切）
     # - __class_fullname__: ShiftScaleRotate
     #   shift_limit: [-0.1, 0.1]
@@ -47,10 +49,10 @@ transform:
     #   rotate_limit: 0
     #   p: 0.5
 
-    - __class_fullname__: Sharpen
-      alpha: [0.2, 0.5]
-      lightness: [0.5, 1.0]
-      p: 0.3
+    # - __class_fullname__: Sharpen
+    #   alpha: [0.2, 0.5]
+    #   lightness: [0.5, 1.0]
+    #   p: 0.3
 
     # 可选：色调/饱和度调整（更丰富的颜色变换）
     # - __class_fullname__: HueSaturationValue

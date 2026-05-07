@@ -444,41 +444,80 @@ class DinomalyWrapper:
     def preprocess_roi(self, roi: np.ndarray, target_size: Tuple[int, int] = None,
                        normalize_brightness: bool = False, normalize_contrast: bool = False) -> Tuple[torch.Tensor, np.ndarray]:
         """
-        预处理 ROI
+        预处理 ROI - 使用 letterbox_resize 保持宽高比，与训练时一致
         
         Returns:
             tensor: 预处理后的张量
             mask: 有效区域 mask (H, W) bool
         """
+        # 转换为 PIL Image 格式以使用 letterbox_resize
         if len(roi.shape) == 2:
-            roi = cv2.cvtColor(roi, cv2.COLOR_GRAY2RGB)
+            roi_rgb = cv2.cvtColor(roi, cv2.COLOR_GRAY2RGB)
         elif roi.shape[2] == 4:
-            roi = cv2.cvtColor(roi, cv2.COLOR_RGBA2RGB)
+            roi_rgb = cv2.cvtColor(roi, cv2.COLOR_RGBA2RGB)
         elif roi.shape[2] == 3:
-            roi = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
+            roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
+        else:
+            roi_rgb = roi
 
-        mask = None
-        if target_size is not None:
-            roi, mask = self._pad_to_size(roi, target_size)
+        pil_img = Image.fromarray(roi_rgb)
+
+        # 应用亮度和对比度归一化（在 letterbox_resize 之前）
         if normalize_brightness:
-            roi = self._normalize_brightness(roi)
+            pil_img = self._normalize_brightness_pil(pil_img)
         if normalize_contrast:
-            roi = self._normalize_contrast(roi)
+            pil_img = self._normalize_contrast_pil(pil_img)
 
-        roi_resized = cv2.resize(roi, self.input_size, interpolation=cv2.INTER_LINEAR)
+        # 使用 letterbox_resize 保持宽高比（与训练时一致）
+        if target_size is not None:
+            img_padded, mask = letterbox_resize(pil_img, target_size)
+        else:
+            img_padded, mask = letterbox_resize(pil_img, self.input_size)
+
+        # 转换为 numpy 数组
+        roi_np = np.array(img_padded)
+
+        # resize 到模型输入尺寸 (224, 224)
+        roi_resized = cv2.resize(roi_np, self.input_size, interpolation=cv2.INTER_LINEAR)
         roi_normalized = roi_resized.astype(np.float32) / 255.0
         tensor = torch.from_numpy(roi_normalized).permute(2, 0, 1)
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         tensor = normalize(tensor)
-        
+
         # resize mask 到 input_size
-        if mask is not None:
-            mask_resized = cv2.resize(mask.astype(np.uint8), self.input_size, interpolation=cv2.INTER_NEAREST)
-            mask = mask_resized.astype(bool)
-        else:
-            mask = np.ones(self.input_size, dtype=bool)
-        
+        mask_resized = cv2.resize(mask.astype(np.uint8), self.input_size, interpolation=cv2.INTER_NEAREST)
+        mask = mask_resized.astype(bool)
+
         return tensor.half(), mask
+
+    @staticmethod
+    def _normalize_brightness_pil(image: Image.Image, target_mean: float = 168.0, threshold: int = 10) -> Image.Image:
+        """对 PIL Image 进行亮度归一化"""
+        arr = np.array(image).astype(np.float32)
+        brightness = arr.mean(axis=2)
+        hole_mask = brightness > threshold
+        if np.sum(hole_mask) == 0:
+            return image
+        current_mean = arr[hole_mask].mean()
+        if current_mean > 0:
+            scale = target_mean / current_mean
+            arr[hole_mask] = np.clip(arr[hole_mask] * scale, 0, 255)
+        return Image.fromarray(arr.astype(np.uint8))
+
+    @staticmethod
+    def _normalize_contrast_pil(image: Image.Image, target_std: float = 65.0, threshold: int = 10) -> Image.Image:
+        """对 PIL Image 进行对比度归一化"""
+        arr = np.array(image).astype(np.float32)
+        brightness = arr.mean(axis=2)
+        hole_mask = brightness > threshold
+        if np.sum(hole_mask) == 0:
+            return image
+        current_mean = arr[hole_mask].mean()
+        current_std = arr[hole_mask].std()
+        if current_std > 0:
+            arr[hole_mask] = (arr[hole_mask] - current_mean) / current_std * target_std + current_mean
+            arr = np.clip(arr, 0, 255)
+        return Image.fromarray(arr.astype(np.uint8))
 
     def infer_single(self, roi: np.ndarray, target_size: Tuple[int, int] = None,
                      normalize_brightness: bool = None, normalize_contrast: bool = None) -> Dict[str, Any]:
@@ -624,123 +663,55 @@ class DinomalyWrapper:
                            target_size: Tuple[int, int] = None,
                            normalize_brightness: bool = None,
                            normalize_contrast: bool = None) -> List[Dict[str, Any]]:
-        """直接 tensor 推理，不走磁盘 I/O"""
-        if self.model is None:
-            return [{"error": 0.0, "infer_failed": True}] * len(rois)
-        if len(rois) == 0:
-            return []
-
-        if normalize_brightness is None:
-            normalize_brightness = self.normalize_brightness_config
-        if normalize_contrast is None:
-            normalize_contrast = self.normalize_contrast_config
-        if target_size is None:
-            target_size = getattr(self, 'target_size', None)
-
-        try:
-            tensors, masks = [], []
-            for roi in rois:
-                tensor, mask = self.preprocess_roi(
-                    roi, target_size, normalize_brightness, normalize_contrast
-                )
-                tensors.append(tensor)
-                masks.append(mask)
-
-            # 与模型 dtype 对齐，避免 FP16/FP32 不匹配
-            model_dtype = next(self.model.parameters()).dtype
-            batch = torch.stack(tensors).to(device=self.device, dtype=model_dtype)
-
-            # 创建 anomalib ImageBatch dataclass
-            from anomalib.data import ImageBatch
-            batch_obj = ImageBatch(
-                image=batch,
-                image_path=[f"direct_{i}" for i in range(len(rois))],
-                gt_label=torch.zeros(len(rois), dtype=torch.long, device=self.device),
-            )
-
-            self.model.eval()
-            with torch.no_grad():
-                # 用 predict_step，包含完整的异常图计算和分数归一化
-                output = self.model.predict_step(batch_obj, 0)
-
-            # 提取 anomaly_map（output 可能是 dataclass 或 dict）
-            anomaly_map = None
-            for key in ('anomaly_map', 'anomaly_maps'):
-                val = getattr(output, key, None)
-                if val is None and isinstance(output, dict):
-                    val = output.get(key)
-                if val is not None and isinstance(val, torch.Tensor):
-                    anomaly_map = val
-                    break
-
-            results = []
-            if anomaly_map is not None:
-                for i, mask in enumerate(masks):
-                    amap = anomaly_map[i].squeeze().detach().cpu().float().numpy()
-                    mask_r = cv2.resize(
-                        mask.astype(np.uint8),
-                        (amap.shape[1], amap.shape[0]),
-                        interpolation=cv2.INTER_NEAREST
-                    ).astype(bool)
-                    valid = amap[mask_r]
-                    score = float(np.percentile(valid, 99)) if len(valid) > 0 else 0.0
-                    results.append({"error": score, "infer_failed": False})
-            else:
-                # anomaly_map 不存在时，尝试用 pred_score
-                logger.warning("[DinomalyWrapper] anomaly_map not found, falling back to pred_score")
-                for i in range(len(rois)):
-                    score = 0.0
-                    for key in ('pred_score', 'anomaly_score', 'pred_scores', 'anomaly_scores'):
-                        val = getattr(output, key, None)
-                        if val is None and isinstance(output, dict):
-                            val = output.get(key)
-                        if val is not None:
-                            arr = val.detach().cpu().float().numpy().flatten() \
-                                  if isinstance(val, torch.Tensor) else [float(val)]
-                            score = float(arr[i]) if i < len(arr) else 0.0
-                            break
-                    results.append({"error": score, "infer_failed": False})
-
-            return results
-
-        except Exception as e:
-            import traceback
-            logger.error(f"[DinomalyWrapper] direct batch inference failed: {e}\n{traceback.format_exc()}")
-            return [{"error": 0.0, "infer_failed": True}] * len(rois)
+        """
+        批量推理 - 使用 engine.predict 确保分数经过归一化，与阈值在同一尺度。
+        虽然会走临时文件，但确保结果与训练时的统计一致。
+        """
+        # 直接复用 infer_batch 的实现，确保一致性
+        return self.infer_batch(rois, target_size, normalize_brightness, normalize_contrast)
 
     def _preprocess_for_save(self, roi: np.ndarray, target_size: Tuple[int, int] = None,
                              normalize_brightness: bool = False, normalize_contrast: bool = False) -> Tuple[np.ndarray, np.ndarray]:
         """
         预处理 ROI 用于保存，返回处理后的图像和 mask。
+        使用 letterbox_resize 保持宽高比，与训练时一致。
         
         Returns:
             processed_roi: 预处理后的图像
             mask: 有效区域 mask (H, W) bool
         """
+        # 转换为 PIL Image 格式以使用 letterbox_resize
         if len(roi.shape) == 2:
-            roi = cv2.cvtColor(roi, cv2.COLOR_GRAY2RGB)
+            roi_rgb = cv2.cvtColor(roi, cv2.COLOR_GRAY2RGB)
         elif roi.shape[2] == 4:
-            roi = cv2.cvtColor(roi, cv2.COLOR_RGBA2RGB)
+            roi_rgb = cv2.cvtColor(roi, cv2.COLOR_RGBA2RGB)
         elif roi.shape[2] == 3:
-            roi = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
-
-        mask = None
-        if target_size is not None:
-            roi, mask = self._pad_to_size(roi, target_size)
-        if normalize_brightness:
-            roi = self._normalize_brightness(roi)
-        if normalize_contrast:
-            roi = self._normalize_contrast(roi)
-
-        roi_resized = cv2.resize(roi, self.input_size, interpolation=cv2.INTER_LINEAR)
-        
-        # resize mask 到 input_size
-        if mask is not None:
-            mask_resized = cv2.resize(mask.astype(np.uint8), self.input_size, interpolation=cv2.INTER_NEAREST)
-            mask = mask_resized.astype(bool)
+            roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
         else:
-            mask = np.ones(self.input_size, dtype=bool)
-        
+            roi_rgb = roi
+
+        pil_img = Image.fromarray(roi_rgb)
+
+        # 应用亮度和对比度归一化（在 letterbox_resize 之前）
+        if normalize_brightness:
+            pil_img = self._normalize_brightness_pil(pil_img)
+        if normalize_contrast:
+            pil_img = self._normalize_contrast_pil(pil_img)
+
+        # 使用 letterbox_resize 保持宽高比（与训练时一致）
+        if target_size is not None:
+            img_padded, mask = letterbox_resize(pil_img, target_size)
+        else:
+            img_padded, mask = letterbox_resize(pil_img, self.input_size)
+
+        # 转换为 numpy 数组并 resize 到模型输入尺寸
+        roi_np = np.array(img_padded)
+        roi_resized = cv2.resize(roi_np, self.input_size, interpolation=cv2.INTER_LINEAR)
+
+        # resize mask 到 input_size
+        mask_resized = cv2.resize(mask.astype(np.uint8), self.input_size, interpolation=cv2.INTER_NEAREST)
+        mask = mask_resized.astype(bool)
+
         return roi_resized, mask
 
     def _extract_score(self, predictions) -> float:
@@ -1455,13 +1426,104 @@ def _project_corners(M: np.ndarray, tmpl_h: int, tmpl_w: int) -> np.ndarray:
     return cv2.transform(corners.reshape(1, -1, 2), M).reshape(-1, 2)
 
 
+def _load_precomputed_template_variants(
+    models_dir: Path,
+    rotations: List[float],
+    device: torch.device
+) -> Optional[List[Dict]]:
+    """
+    从模型目录加载预计算的SuperPoint特征。
+    检查 models_dir 下的所有子目录中的 template_variants 文件夹。
+    返回包含预提取特征的变体列表，如果未找到则返回 None。
+    """
+    if not models_dir.exists():
+        return None
+
+    for model_dir in models_dir.iterdir():
+        if not model_dir.is_dir():
+            continue
+
+        variants_dir = model_dir / "template_variants"
+        if not variants_dir.exists():
+            continue
+
+        metadata_path = variants_dir / "metadata.json"
+        if not metadata_path.exists():
+            continue
+
+        try:
+            with open(metadata_path, 'r', encoding='utf-8') as f:
+                metadata = json.load(f)
+
+            # 检查旋转角度是否匹配
+            saved_rotations = metadata.get('rotations', [])
+            if saved_rotations != rotations:
+                logger.debug(f"[LightGlue] Rotations mismatch in {variants_dir}: {saved_rotations} vs {rotations}")
+                continue
+
+            # 检查是否有预提取的特征
+            features_extracted = metadata.get('features_extracted', False)
+            if not features_extracted:
+                logger.debug(f"[LightGlue] No pre-extracted features in {variants_dir}")
+                continue
+
+            # 从metadata获取原始尺寸
+            original_size = metadata.get('original_size', {})
+            orig_h = original_size.get('height', 0)
+            orig_w = original_size.get('width', 0)
+
+            # 只加载预提取的特征（不再加载图像）
+            variants = []
+            for angle in rotations:
+                feature_path = variants_dir / f"features_{angle:03d}.npz"
+
+                if not feature_path.exists():
+                    logger.warning(f"[LightGlue] Missing feature file: {feature_path}")
+                    break
+
+                # 加载预提取的特征
+                try:
+                    feats_data = np.load(str(feature_path))
+                    feats = {
+                        'keypoints': torch.from_numpy(feats_data['keypoints']).to(device),
+                        'descriptors': torch.from_numpy(feats_data['descriptors']).to(device),
+                        'scores': torch.from_numpy(feats_data['scores']).to(device),
+                    }
+                    if 'scales' in feats_data:
+                        feats['scales'] = torch.from_numpy(feats_data['scales']).to(device)
+                    if 'oris' in feats_data:
+                        feats['oris'] = torch.from_numpy(feats_data['oris']).to(device)
+                except Exception as e:
+                    logger.warning(f"[LightGlue] Failed to load features from {feature_path}: {e}")
+                    break
+
+                variants.append({
+                    "angle": angle,
+                    "h": orig_h,
+                    "w": orig_w,
+                    "feats": feats  # 预提取的特征
+                })
+
+            if len(variants) == len(rotations):
+                logger.info(f"[LightGlue] 从 {variants_dir} 加载了 {len(variants)} 个预计算模板变体（含特征）")
+                return variants
+
+        except Exception as e:
+            logger.warning(f"[LightGlue] Failed to load precomputed variants from {variants_dir}: {e}")
+            continue
+
+    return None
+
+
 def precompute_template_variant_features(
     template_subject_bgr: np.ndarray,
-    rotations: List[float]
+    rotations: List[float],
+    models_dir: Optional[Path] = None
 ) -> List[Dict]:
     """
     预计算模板所有旋转变体的特征，并缓存到全局变量中（仅支持SuperPoint）。
     如果缓存已存在，直接返回缓存的特征。
+    如果提供了 models_dir，会首先尝试从模型目录加载预计算的模板变体图及其特征。
     """
     global _TEMPLATE_VARIANT_FEATURES, _TEMPLATE_SUBJECT_IMG
 
@@ -1472,19 +1534,37 @@ def precompute_template_variant_features(
         logger.info(f"[LightGlue] 使用缓存的模板变体特征 ({len(rotations)} 个变体)")
         return _TEMPLATE_VARIANT_FEATURES[rotations_tuple]
 
-    # 获取提取器
+    # 获取提取器和设备
     extractor, _, device = _get_lightglue_models()
     if extractor is None:
         logger.error("[LightGlue] 提取器不可用，无法预计算特征")
         return []
 
-    logger.info(f"[LightGlue] 预计算模板变体特征 ({len(rotations)} 个变体)...")
-    t_start = time.time()
+    # 首先尝试从模型目录加载预计算的模板变体（包含预提取的特征）
+    variants = None
+    if models_dir is not None:
+        variants = _load_precomputed_template_variants(models_dir, rotations, device)
 
-    # 生成变体图像
-    variants = _augment_template_variants(template_subject_bgr, rotations)
+    # 如果成功加载了包含预提取特征的变体
+    if variants is not None and len(variants) > 0 and "feats" in variants[0]:
+        logger.info(f"[LightGlue] 使用预计算的模板变体特征 ({len(variants)} 个)，跳过特征提取")
+        # 存入缓存
+        _TEMPLATE_VARIANT_FEATURES[rotations_tuple] = variants
+        _TEMPLATE_SUBJECT_IMG = template_subject_bgr.copy() if template_subject_bgr is not None else None
+        return variants
+
+    # 如果没有找到预计算的变体，则实时生成并提取特征
+    if variants is None:
+        logger.info(f"[LightGlue] 预计算模板变体特征 ({len(rotations)} 个变体)...")
+        t_start = time.time()
+        variants = _augment_template_variants(template_subject_bgr, rotations)
+        elapsed = time.time() - t_start
+        logger.info(f"[LightGlue] 实时生成模板变体完成，耗时 {elapsed:.3f}s")
+    else:
+        logger.info(f"[LightGlue] 使用预计算的模板变体 ({len(variants)} 个)，需要提取特征")
 
     # 提取所有变体的特征
+    t_start = time.time()
     with torch.no_grad():
         for v in variants:
             t_tensor = _aug_img_to_tensor(v["img"])
@@ -1495,10 +1575,10 @@ def precompute_template_variant_features(
 
     # 存入缓存
     _TEMPLATE_VARIANT_FEATURES[rotations_tuple] = variants
-    _TEMPLATE_SUBJECT_IMG = template_subject_bgr.copy()
+    _TEMPLATE_SUBJECT_IMG = template_subject_bgr.copy() if template_subject_bgr is not None else None
 
     elapsed = time.time() - t_start
-    logger.info(f"[LightGlue] 模板变体特征预计算完成，耗时 {elapsed:.3f}s，共 {len(variants)} 个变体")
+    logger.info(f"[LightGlue] 模板变体特征提取完成，耗时 {elapsed:.3f}s，共 {len(variants)} 个变体")
 
     return variants
 
@@ -2997,7 +3077,8 @@ def load_models():
     )
     if subject_img is not None:
         default_rotations = list(range(0, 360, 15))
-        precompute_template_variant_features(subject_img, default_rotations)
+        # 传入 models_dir 以支持加载预计算的模板变体
+        precompute_template_variant_features(subject_img, default_rotations, models_dir=base_dir)
     else:
         logger.warning("[LightGlue] 未找到工件主体标注，跳过预提取模板变体特征")
 
