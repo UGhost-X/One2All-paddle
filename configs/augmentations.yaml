@@ -27,11 +27,14 @@ transform:
       crop_border: false
       p: 0.3
 
-    # 亮度和对比度调整（与原代码的 ColorJitter 对应）
-    - __class_fullname__: RandomBrightnessContrast
-      brightness_limit: [-0.8, 0.8]
-      contrast_limit: [-0.8, 0.8]
-      brightness_by_max: true
+    # 亮度和对比度调整（自适应策略）
+    # 使用自定义 AdaptiveBrightnessContrast 实现（在 trainer.py 中）
+    # 根据图片当前亮度动态调整：
+    # - 暗图（平均亮度 < 80）：只允许增亮 [0, 0.4]
+    # - 亮图（平均亮度 > 180）：只允许调暗 [-0.4, 0]
+    # - 正常亮度：允许微调 [-0.2, 0.2]
+    - __class_fullname__: utils.trainer.AdaptiveBrightnessContrast
+      contrast_limit: [-0.5, 0.5]
       p: 0.8
 
     - __class_fullname__: RandomGamma

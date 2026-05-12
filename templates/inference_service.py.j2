@@ -286,8 +286,7 @@ def cv2_put_chinese_text(img, text, position, color, font_size=20):
 # ─────────────────────────────────────────────────────────────────────────────
 # Dinomaly 推理模型
 # ─────────────────────────────────────────────────────────────────────────────
-# Dinomaly 推理模型
-# ─────────────────────────────────────────────────────────────────────────────
+
 
 # 打补丁：修改 DinoV2Loader 的默认缓存目录为本地路径
 try:
@@ -303,6 +302,133 @@ def _patched_dinov2loader_init(self, cache_dir=None, vit_factory=None):
     _original_dinov2loader_init(self, cache_dir, vit_factory)
 _DinoV2Loader.__init__ = _patched_dinov2loader_init
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 异常原型库（内联，避免依赖外部文件）
+# ─────────────────────────────────────────────────────────────────────────────
+
+class PrototypeBank:
+    """原型库管理：保存和加载异常原型"""
+
+    def __init__(self, save_dir: str):
+        self.save_dir = Path(save_dir)
+        self.anomaly_prototypes: Optional[torch.Tensor] = None
+        self.metadata: Dict[str, Any] = {}
+
+    def load(self) -> bool:
+        anomaly_path = self.save_dir / "anomaly_prototypes.pt"
+        meta_path = self.save_dir / "prototype_meta.json"
+
+        if anomaly_path.exists():
+            self.anomaly_prototypes = torch.load(anomaly_path, map_location="cpu", weights_only=False)
+            logger.info(f"[PrototypeBank] Loaded {self.anomaly_prototypes.shape[0]} anomaly prototypes from {self.save_dir}")
+
+        if meta_path.exists():
+            with open(meta_path, "r", encoding="utf-8") as f:
+                self.metadata = json.load(f)
+
+        return self.anomaly_prototypes is not None
+
+    def has_anomaly_prototypes(self) -> bool:
+        return self.anomaly_prototypes is not None and len(self.anomaly_prototypes) > 0
+
+
+class AnomalyScoreRefiner:
+    """异常分数修正器：融合 Dinomaly 分数和异常原型对比分数"""
+
+    def __init__(self, prototype_bank: PrototypeBank, device: str = "cuda"):
+        self.prototype_bank = prototype_bank
+        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
+
+    def refine(self, dinomaly_score: float, image_feature: torch.Tensor, weight: float = 0.4) -> float:
+        if not self.prototype_bank.has_anomaly_prototypes():
+            return dinomaly_score
+
+        anomaly_protos = self.prototype_bank.anomaly_prototypes.to(self.device)
+        image_feature = image_feature.to(self.device)
+
+        anomaly_sim = torch.cosine_similarity(
+            image_feature.unsqueeze(0),
+            anomaly_protos,
+            dim=1,
+        ).max().item()
+
+        prototype_score = (anomaly_sim + 1) / 2
+        final_score = (1 - weight) * dinomaly_score + weight * prototype_score
+        return final_score
+
+    def refine_batch(self, dinomaly_scores: np.ndarray, image_features: torch.Tensor, weight: float = 0.4) -> np.ndarray:
+        if not self.prototype_bank.has_anomaly_prototypes():
+            return dinomaly_scores
+
+        anomaly_protos = self.prototype_bank.anomaly_prototypes.to(self.device)
+        image_features = image_features.to(self.device)
+
+        sim_matrix = torch.cosine_similarity(
+            image_features.unsqueeze(1),
+            anomaly_protos.unsqueeze(0),
+            dim=2,
+        )
+        anomaly_sim = sim_matrix.max(dim=1).values
+        prototype_scores = (anomaly_sim + 1) / 2
+
+        dinomaly_scores_t = torch.from_numpy(dinomaly_scores).to(self.device)
+        final_scores = (1 - weight) * dinomaly_scores_t + weight * prototype_scores
+        return final_scores.cpu().numpy()
+
+
+class DinomalyFeatureExtractor:
+    """从 Dinomaly 模型提取特征向量
+    
+    使用与正常推理相同的预处理流程：224x224，保持宽高比
+    """
+
+    def __init__(self, model, device: str = "cuda", input_size: Tuple[int, int] = (224, 224)):
+        self.model = model
+        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
+        self.input_size = input_size
+        self.model.eval()
+        # 与 preprocess_roi 一致的标准化
+        self.normalize = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406], 
+            std=[0.229, 0.224, 0.225]
+        )
+
+    def _preprocess_image(self, image: Image.Image) -> torch.Tensor:
+        """单张图片预处理：保持与 preprocess_roi 一致"""
+        # letterbox_resize 保持宽高比到 224x224
+        img_padded, _ = letterbox_resize(image, self.input_size)
+        # 转为 numpy -> tensor
+        roi_np = np.array(img_padded)
+        roi_resized = cv2.resize(roi_np, self.input_size, interpolation=cv2.INTER_LINEAR)
+        roi_normalized = roi_resized.astype(np.float32) / 255.0
+        tensor = torch.from_numpy(roi_normalized).permute(2, 0, 1)
+        tensor = self.normalize(tensor)
+        return tensor
+
+    @torch.no_grad()
+    def extract(self, image: Image.Image) -> torch.Tensor:
+        """提取单张图片的特征向量"""
+        tensor = self._preprocess_image(image).unsqueeze(0).to(self.device)
+        en, _ = self.model.model.get_encoder_decoder_outputs(tensor)
+        feat = (en[0] + en[1]) / 2
+        feat = F_torch.adaptive_avg_pool2d(feat, (1, 1)).squeeze(-1).squeeze(-1)
+        feat = F_torch.normalize(feat, p=2, dim=1)
+        return feat.squeeze(0)
+
+    @torch.no_grad()
+    def extract_batch(self, images: List[Image.Image]) -> torch.Tensor:
+        """批量提取特征向量"""
+        tensors = torch.stack([self._preprocess_image(img) for img in images]).to(self.device)
+        # 确保模型在正确的设备上
+        if hasattr(self.model, 'model'):
+            self.model.model = self.model.model.to(self.device)
+        en, _ = self.model.model.get_encoder_decoder_outputs(tensors)
+        feat = (en[0] + en[1]) / 2
+        feat = F_torch.adaptive_avg_pool2d(feat, (1, 1)).squeeze(-1).squeeze(-1)
+        feat = F_torch.normalize(feat, p=2, dim=1)
+        return feat
+
+
 class DinomalyWrapper:
     """Dinomaly 推理包装器"""
 
@@ -315,6 +441,10 @@ class DinomalyWrapper:
         self.normalize_brightness_config = False
         self.normalize_contrast_config = False
         self.threshold = 0.5
+        self.prototype_bank: Optional[PrototypeBank] = None
+        self.score_refiner: Optional[AnomalyScoreRefiner] = None
+        self.feature_extractor: Optional[DinomalyFeatureExtractor] = None
+        self.prototype_weight: float = 0.4
 
     def load_from_checkpoint(self, model_path: str, config_path: str = None):
         """从 checkpoint 加载模型"""
@@ -325,10 +455,7 @@ class DinomalyWrapper:
         if config_path and os.path.exists(config_path):
             self.load_config(config_path)
 
-        # 加载模型
-        # ✅ 修复 PyTorch 2.6 weights_only 默认值为 True 的问题
         try:
-            # 尝试使用 weights_only=False 加载（PyTorch 2.6+）
             import torch
             checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
             self.model = Dinomaly.load_from_checkpoint(model_path, map_location=self.device, weights_only=False)
@@ -351,7 +478,21 @@ class DinomalyWrapper:
 
         # 获取阈值
         self.threshold = self._get_threshold()
-        logger.info(f"Dinomaly model loaded. Threshold: {self.threshold:.4f}")
+
+        # 加载原型库
+        model_dir = Path(model_path).parent
+        self.prototype_bank = PrototypeBank(str(model_dir))
+        has_prototypes = self.prototype_bank.load()
+
+        if has_prototypes:
+            self.score_refiner = AnomalyScoreRefiner(self.prototype_bank, device=str(self.device))
+            self.feature_extractor = DinomalyFeatureExtractor(self.model, device=str(self.device))
+            logger.info(
+                f"Dinomaly model loaded. Threshold: {self.threshold:.4f}, "
+                f"Prototype bank: {self.prototype_bank.anomaly_prototypes.shape[0]} anomalies"
+            )
+        else:
+            logger.info(f"Dinomaly model loaded. Threshold: {self.threshold:.4f}, No prototype bank")
 
     def load_config(self, config_path: str):
         """加载配置文件"""
@@ -574,6 +715,22 @@ class DinomalyWrapper:
                 # 提取分数（使用 mask 处理 anomaly_map）
                 score = self._extract_score_with_mask(predictions, mask)
 
+                # 如果存在原型库，提取特征并修正分数
+                if self.score_refiner is not None and self.feature_extractor is not None:
+                    try:
+                        # 使用原始 ROI 转换后的 PIL Image，避免重复预处理
+                        if len(roi.shape) == 2:
+                            roi_rgb = cv2.cvtColor(roi, cv2.COLOR_GRAY2RGB)
+                        elif roi.shape[2] == 4:
+                            roi_rgb = cv2.cvtColor(roi, cv2.COLOR_RGBA2RGB)
+                        else:
+                            roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
+                        roi_pil = Image.fromarray(roi_rgb)
+                        feature = self.feature_extractor.extract(roi_pil)
+                        score = self.score_refiner.refine(score, feature, weight=self.prototype_weight)
+                    except Exception as e:
+                        logger.warning(f"[DinomalyWrapper] prototype refinement failed: {e}")
+
             return {"error": float(score), "infer_failed": False}
 
         except Exception as e:
@@ -643,6 +800,26 @@ class DinomalyWrapper:
 
                 # 提取分数（使用 mask 处理 anomaly_map）
                 scores = self._extract_scores_with_masks(predictions, masks)
+
+            # 如果存在原型库，批量提取特征并修正分数
+            if self.score_refiner is not None and self.feature_extractor is not None and len(scores) > 0:
+                try:
+                    # 直接将原始 ROI (numpy BGR) 转为 PIL RGB，由 extract_batch 内部做预处理
+                    roi_images = []
+                    for roi in rois[:len(scores)]:
+                        if len(roi.shape) == 2:
+                            roi_rgb = cv2.cvtColor(roi, cv2.COLOR_GRAY2RGB)
+                        elif roi.shape[2] == 4:
+                            roi_rgb = cv2.cvtColor(roi, cv2.COLOR_RGBA2RGB)
+                        else:
+                            roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
+                        roi_images.append(Image.fromarray(roi_rgb))
+                    features = self.feature_extractor.extract_batch(roi_images)
+                    scores = self.score_refiner.refine_batch(
+                        np.array(scores), features, weight=self.prototype_weight
+                    )
+                except Exception as e:
+                    logger.warning(f"[DinomalyWrapper] batch prototype refinement failed: {e}")
 
             # 构造返回结果
             results = []

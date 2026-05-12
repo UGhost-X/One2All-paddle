@@ -14,6 +14,8 @@ os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 # 允许联网下载
 os.environ["HF_HUB_OFFLINE"] = "0"
 os.environ["TRANSFORMERS_OFFLINE"] = "0"
+# PyTorch 2.6+ 兼容性：允许加载包含 numpy 的模型文件
+os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
 
 from fastapi import FastAPI, Header, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
@@ -456,10 +458,16 @@ async def resume_train_task(
 
 
 @app.get("/train/events/{task_id}")
-async def train_events(task_id: str):
-    """SSE 实时推送训练进度和日志"""
+async def train_events(task_id: str, include_history: bool = True):
+    """SSE 实时推送训练进度和日志
+    
+    Args:
+        task_id: 任务ID
+        include_history: 是否包含历史日志（首次连接时设为true）
+    """
     async def event_generator():
         last_log_idx = 0
+        first_send = True
         while True:
             status = trainer.get_training_status(task_id)
             if status is None:
@@ -478,7 +486,12 @@ async def train_events(task_id: str):
             }
 
             logs = status.get("logs", [])
-            if len(logs) > last_log_idx:
+            if first_send and include_history:
+                # 首次发送时返回所有日志
+                data["new_logs"] = logs
+                last_log_idx = len(logs)
+                first_send = False
+            elif len(logs) > last_log_idx:
                 data["new_logs"] = logs[last_log_idx:]
                 last_log_idx = len(logs)
 
@@ -569,6 +582,401 @@ async def get_train_data(task_id: str):
         "label": status.get("label"),
         "total": len(result),
         "images": result,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 增量训练接口（同时接收正常样本和异常 ROI）
+# ─────────────────────────────────────────────────────────────────────────────
+
+class FeedbackGroup(BaseModel):
+    """
+    单个 path_id 的反馈数据分组
+    
+    每个 path_id 对应一个位置/类别，包含该位置收集的 FP 和 FN 样本
+    """
+    path_id: str  # 位置/类别 ID
+    false_positive_images: List[str] = []  # base64 编码的正常样本（被误检为异常）
+    false_negative_images: List[str] = []  # base64 编码的异常样本 ROI（被漏检）
+
+
+class RetrainRequest(BaseModel):
+    """
+    增量训练请求
+    
+    前端在重新训练时发送：
+    - feedback_groups: 按 path_id 分组的反馈数据列表
+      每个分组包含该位置的 FP 样本（用于微调）和 FN 样本（用于原型库）
+    """
+    project_id: str
+    base_task_uuid: str  # 基础模型的 task_uuid
+    feedback_groups: List[FeedbackGroup]  # 按 path_id 分组的反馈数据
+    # Dinomaly 训练参数（可选，默认继承基础模型配置）
+    encoder_name: Optional[str] = None
+    decoder_depth: Optional[int] = None
+    epochs: Optional[int] = None
+    batch_size: Optional[int] = None
+    freeze_encoder: Optional[bool] = None
+
+
+@app.post("/train/anomaly/retrain")
+async def incremental_retrain(request: RetrainRequest):
+    """
+    增量训练：处理多个 path_id 的用户反馈数据
+    
+    保证新版本模型完整：
+    - 有反馈的 path_id：微调/更新原型库
+    - 无反馈的 path_id：直接复制原模型文件
+    """
+    from PIL import Image
+    import io
+    import shutil
+
+    if not request.feedback_groups:
+        raise HTTPException(status_code=400, detail="No feedback groups provided")
+
+    # 生成新的 task_uuid（所有 path_id 共享）
+    new_task_uuid = uuid_lib.uuid4().hex[:8]
+    
+    # 获取基础模型的所有 path_id
+    base_output_dir = path_config.get_project_output_path(request.project_id, request.base_task_uuid)
+    if not base_output_dir.exists():
+        raise HTTPException(status_code=404, detail=f"Base model directory not found: {base_output_dir}")
+    
+    all_base_path_ids = [d.name for d in base_output_dir.iterdir() if d.is_dir()]
+    logger.info(f"Found {len(all_base_path_ids)} path_ids in base model: {all_base_path_ids}")
+    
+    # 有反馈的 path_id 集合
+    feedback_path_ids = {g.path_id for g in request.feedback_groups}
+    
+    # 需要复制的 path_id（无反馈）
+    copy_path_ids = set(all_base_path_ids) - feedback_path_ids
+    logger.info(f"Path_ids to copy (no feedback): {copy_path_ids}")
+    
+    results = []
+    all_task_ids = []
+    total_fp = 0
+    total_fn = 0
+    total_prototypes = 0
+
+    # ========== 第一步：复制无反馈的 path_id ==========
+    for path_id in copy_path_ids:
+        try:
+            base_model_dir = base_output_dir / path_id
+            new_model_dir = path_config.get_project_output_path(request.project_id, new_task_uuid) / path_id
+            new_model_dir.mkdir(parents=True, exist_ok=True)
+            
+            # 复制所有模型相关文件
+            model_files = ["model.ckpt", "dinomaly_model.pt", "config.json", "prototype_bank.pt"]
+            copied_files = []
+            for file_name in model_files:
+                src_file = base_model_dir / file_name
+                if src_file.exists():
+                    shutil.copy2(str(src_file), str(new_model_dir / file_name))
+                    copied_files.append(file_name)
+            
+            # 复制 template_variants 目录（推理服务模板变体）
+            template_variants_src = base_model_dir / "template_variants"
+            if template_variants_src.exists() and template_variants_src.is_dir():
+                template_variants_dst = new_model_dir / "template_variants"
+                if template_variants_dst.exists():
+                    shutil.rmtree(str(template_variants_dst))
+                shutil.copytree(str(template_variants_src), str(template_variants_dst))
+                logger.info(f"path_id={path_id}: Copied template_variants directory")
+            
+            # 如果没有找到任何模型文件，记录警告
+            if not copied_files:
+                logger.warning(f"path_id={path_id}: No model files found in {base_model_dir}")
+            
+            results.append({
+                "path_id": path_id,
+                "status": "copied",
+                "message": f"Model copied from base version (files: {copied_files})"
+            })
+            logger.info(f"path_id={path_id}: Copied files {copied_files} from base version")
+            
+        except Exception as e:
+            logger.error(f"Failed to copy path_id={path_id}: {e}")
+            results.append({
+                "path_id": path_id,
+                "status": "error",
+                "message": f"Failed to copy: {str(e)}"
+            })
+
+    # ========== 第二步：处理有反馈的 path_id ==========
+    for group in request.feedback_groups:
+        path_id = group.path_id
+        logger.info(f"Processing feedback group for path_id={path_id}")
+
+        try:
+            # 定位该 path_id 的基础模型目录
+            base_model_dir = base_output_dir / path_id
+            if not base_model_dir.exists():
+                logger.error(f"Base model directory not found: {base_model_dir}")
+                results.append({
+                    "path_id": path_id,
+                    "status": "error",
+                    "message": f"Base model directory not found: {base_model_dir}"
+                })
+                continue
+
+            # 查找基础模型文件（支持多种格式）
+            base_model_path = base_model_dir / "model.ckpt"
+            if not base_model_path.exists():
+                base_model_path = base_model_dir / "dinomaly_model.pt"
+            base_config_path = base_model_dir / "config.json"
+            
+            if not base_model_path.exists():
+                logger.error(f"Base model checkpoint not found in {base_model_dir}")
+                results.append({
+                    "path_id": path_id,
+                    "status": "error",
+                    "message": f"Base model checkpoint not found in {base_model_dir}"
+                })
+                continue
+
+            # 读取基础模型配置
+            base_config = {}
+            if base_config_path.exists():
+                with open(base_config_path, "r", encoding="utf-8") as f:
+                    base_config = json.load(f)
+
+            # 创建统一的训练目录（所有 path_id 共享）
+            # 结构：train/{new_task_uuid}/raw_images/, train/{new_task_uuid}/roi/{path_id}/
+            train_base_dir = path_config.get_project_product_path(request.project_id, new_task_uuid)
+            train_base_dir.mkdir(parents=True, exist_ok=True)
+            new_model_dir = path_config.get_project_output_path(request.project_id, new_task_uuid) / str(path_id)
+            new_model_dir.mkdir(parents=True, exist_ok=True)
+
+            # 复制父模型的 raw_images 和 annotations.json 到新的训练目录（只在第一次处理时复制）
+            # 基础模型的文件在 product/{project_id}/train/{base_task_uuid}/ 下
+            base_product_train_dir = path_config.get_project_product_path(request.project_id, request.base_task_uuid)
+            base_raw_images_dir = base_product_train_dir / "raw_images"
+            base_annotations_path = base_product_train_dir / "annotations.json"
+            new_raw_images_dir = train_base_dir / "raw_images"
+            new_annotations_path = train_base_dir / "annotations.json"
+            
+            if base_raw_images_dir.exists() and base_raw_images_dir.is_dir() and not new_raw_images_dir.exists():
+                shutil.copytree(str(base_raw_images_dir), str(new_raw_images_dir))
+                logger.info(f"Copied {len(list(base_raw_images_dir.glob('*.jpg')))} raw images from base model to {new_raw_images_dir}")
+            elif not new_raw_images_dir.exists():
+                new_raw_images_dir.mkdir(parents=True, exist_ok=True)
+                logger.warning(f"No raw_images found in {base_raw_images_dir}, creating empty directory")
+            
+            # 复制 annotations.json
+            if base_annotations_path.exists() and not new_annotations_path.exists():
+                shutil.copy2(str(base_annotations_path), str(new_annotations_path))
+                logger.info(f"Copied annotations.json from base model to {new_annotations_path}")
+
+            # 解码 False Positive 图片
+            # FP 图片已经是 ROI，直接保存到 roi/{path_id}/ 目录
+            fp_images: List[np.ndarray] = []
+            if group.false_positive_images:
+                # ROI 目录：roi/{path_id}/
+                new_roi_dir = train_base_dir / "roi" / str(path_id)
+                new_roi_dir.mkdir(parents=True, exist_ok=True)
+
+                for idx, img_b64 in enumerate(group.false_positive_images):
+                    try:
+                        img_data = base64.b64decode(img_b64)
+                        nparr = np.frombuffer(img_data, np.uint8)
+                        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                        if img is not None:
+                            fp_images.append(img)
+                            cv2.imwrite(str(new_roi_dir / f"fp_{idx:04d}.jpg"), img)
+                            logger.info(f"Saved FP ROI to {new_roi_dir / f'fp_{idx:04d}.jpg'}")
+                    except Exception as e:
+                        logger.error(f"Failed to decode FP image[{idx}] for path_id={path_id}: {e}")
+
+            # 解码 False Negative 图片
+            fn_images: List[Image.Image] = []
+            for idx, img_b64 in enumerate(group.false_negative_images):
+                try:
+                    img_data = base64.b64decode(img_b64)
+                    img = Image.open(io.BytesIO(img_data)).convert("RGB")
+                    fn_images.append(img)
+                except Exception as e:
+                    logger.error(f"Failed to decode FN image[{idx}] for path_id={path_id}: {e}")
+
+            path_task_ids = []
+            path_anomaly_count = 0
+
+            # ========== 处理 False Positives：微调 Dinomaly ==========
+            if fp_images:
+                num_fp = len(fp_images)
+                
+                # FP 重训策略：基础 ROI 原样复制，FP 图做 30 张增强
+                # 从头训练（checkpoint_path 会在 trainer 中被清空）
+                num_fp_augmentations = 30
+                finetune_epochs = request.epochs or base_config.get("epochs", 12)
+                logger.info(f"path_id={path_id}: Processing {num_fp} FP for retraining ({num_fp_augmentations}x augmentation, {finetune_epochs} epochs)")
+
+                # 训练配置
+                # 基础模型的 ROI 目录
+                base_roi_dir = base_product_train_dir / "roi" / str(path_id)
+
+                train_config = {
+                    "model_name": "Dinomaly",
+                    "project_id": request.project_id,
+                    "task_uuid": new_task_uuid,
+                    "path_id": path_id,
+                    "train_mode": base_config.get("train_mode", "by_category"),
+                    "category": base_config.get("category", ""),
+                    "category_label": base_config.get("category_label", "unknown"),
+                    "encoder_name": request.encoder_name or base_config.get("encoder_name", "dinov2_vit_base_14"),
+                    "decoder_depth": request.decoder_depth or base_config.get("decoder_depth", 8),
+                    "bottleneck_dropout": base_config.get("bottleneck_dropout", 0.2),
+                    "epochs": request.epochs or base_config.get("epochs", 12),
+                    "finetune_epochs": finetune_epochs,
+                    "batch_size": request.batch_size or base_config.get("batch_size", 2),
+                    "freeze_encoder": request.freeze_encoder if request.freeze_encoder is not None else base_config.get("freeze_encoder", True),
+                    "normalize_brightness": base_config.get("normalize_brightness", False),
+                    "normalize_contrast": base_config.get("normalize_contrast", False),
+                    "checkpoint_path": str(base_model_path),
+                    "base_roi_dir": str(base_roi_dir),
+                    "num_fp_augmentations": num_fp_augmentations,
+                    "augmentation_config": str(PROJECT_ROOT / "configs" / "augmentations.yaml"),
+                }
+
+                # 重训练时不需要group_annotations，ROI图片已直接保存
+                path_group_id = f"retrain_{int(time.time())}_{path_id}"
+                # 使用 train_base_dir 作为数据集根目录，与基础模型结构一致
+                path_task_ids, _ = trainer.run_batch_training_async(
+                    str(train_base_dir),
+                    train_config,
+                    {path_id: []},  # 空列表，因为ROI已直接保存
+                    group_id=path_group_id,
+                )
+                all_task_ids.extend(path_task_ids)
+                total_fp += num_fp
+            else:
+                # 没有 FP 数据，直接复制原模型
+                logger.info(f"path_id={path_id}: No FP data, copying model from base version")
+                for file_name in ["model.ckpt", "dinomaly_model.pt", "config.json"]:
+                    src_file = base_model_dir / file_name
+                    if src_file.exists():
+                        shutil.copy2(str(src_file), str(new_model_dir / file_name))
+                
+                # 复制 template_variants 目录
+                template_variants_src = base_model_dir / "template_variants"
+                if template_variants_src.exists() and template_variants_src.is_dir():
+                    template_variants_dst = new_model_dir / "template_variants"
+                    if template_variants_dst.exists():
+                        shutil.rmtree(str(template_variants_dst))
+                    shutil.copytree(str(template_variants_src), str(template_variants_dst))
+
+            # ========== 处理 False Negatives：更新原型库 ==========
+            if fn_images:
+                fn_task_id = f"prototype_{int(time.time())}_{path_id}"
+                trainer._update_task_status(fn_task_id, status="preparing", progress=0, stage="1/2")
+                trainer._add_log(fn_task_id, f"Building prototype bank for path_id={path_id}...")
+                
+                logger.info(f"path_id={path_id}: Processing {len(fn_images)} FN for prototype bank")
+                try:
+                    from anomalib.models import Dinomaly
+                    import torch
+                    from utils.prototype_refiner import PrototypeBank, build_anomaly_prototypes_from_images
+
+                    trainer._add_log(fn_task_id, f"Loading base model from {base_model_path}")
+                    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                    try:
+                        model = Dinomaly.load_from_checkpoint(str(base_model_path), map_location=device)
+                    except TypeError:
+                        model = Dinomaly.load_from_checkpoint(str(base_model_path))
+                    model = model.to(device)
+                    model.eval()
+                    
+                    trainer._update_task_status(fn_task_id, progress=30, stage="1/2")
+                    trainer._add_log(fn_task_id, f"Extracting features from {len(fn_images)} FN images...")
+                    
+                    new_prototypes = build_anomaly_prototypes_from_images(model, fn_images, device=str(device))
+                    
+                    trainer._update_task_status(fn_task_id, progress=60, stage="2/2")
+                    trainer._add_log(fn_task_id, "Building and saving prototype bank...")
+                    
+                    prototype_bank = PrototypeBank(str(new_model_dir))
+                    old_prototype_bank = PrototypeBank(str(base_model_dir))
+                    if old_prototype_bank.load():
+                        if old_prototype_bank.has_anomaly_prototypes():
+                            prototype_bank.add_anomaly_prototypes(old_prototype_bank.anomaly_prototypes)
+                            trainer._add_log(fn_task_id, f"Merged {old_prototype_bank.get_prototype_count()} old prototypes")
+
+                    prototype_bank.add_anomaly_prototypes(new_prototypes)
+                    prototype_bank.metadata = {
+                        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "project_id": request.project_id,
+                        "base_task_uuid": request.base_task_uuid,
+                        "new_task_uuid": new_task_uuid,
+                        "path_id": path_id,
+                        "new_fn_samples": len(fn_images),
+                        "total_anomaly_prototypes": prototype_bank.get_prototype_count(),
+                    }
+                    prototype_bank.save()
+                    path_anomaly_count = prototype_bank.get_prototype_count()
+                    total_fn += len(fn_images)
+                    total_prototypes += path_anomaly_count
+                    
+                    trainer._update_task_status(fn_task_id, status="completed", progress=100)
+                    trainer._add_log(fn_task_id, f"Prototype bank built successfully with {path_anomaly_count} prototypes")
+                    path_task_ids.append(fn_task_id)
+
+                    del model
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                except Exception as e:
+                    logger.error(f"Failed to build prototype bank for path_id={path_id}: {e}", exc_info=True)
+                    trainer._update_task_status(fn_task_id, status="failed", error=str(e))
+                    trainer._add_log(fn_task_id, f"Error: {e}")
+            else:
+                # 没有 FN 数据，复制原原型库（如果有）
+                old_prototype_file = base_model_dir / "prototype_bank.pt"
+                if old_prototype_file.exists():
+                    shutil.copy2(str(old_prototype_file), str(new_model_dir / "prototype_bank.pt"))
+                    logger.info(f"path_id={path_id}: No FN data, copied prototype bank from base version")
+
+            # 区分 FP 训练任务和 FN 原型任务
+            fp_task_ids = [tid for tid in path_task_ids if not tid.startswith("prototype_")]
+            fn_task_ids = [tid for tid in path_task_ids if tid.startswith("prototype_")]
+            
+            # 构建 group_ids 列表（用于前端轮询组状态）
+            path_group_ids = []
+            if fp_images and fp_task_ids:
+                path_group_ids.append(path_group_id)
+            if fn_images and fn_task_ids:
+                path_group_ids.append(fn_task_id)
+            
+            results.append({
+                "path_id": path_id,
+                "status": "success",
+                "num_fp": len(fp_images),
+                "num_fn": len(fn_images),
+                "anomaly_prototypes": path_anomaly_count,
+                "fp_task_ids": fp_task_ids,
+                "fn_task_ids": fn_task_ids,
+                "task_ids": path_task_ids,
+                "group_ids": path_group_ids,
+            })
+
+        except Exception as e:
+            logger.error(f"Failed to process path_id={path_id}: {e}", exc_info=True)
+            results.append({
+                "path_id": path_id,
+                "status": "error",
+                "message": str(e)
+            })
+
+    return {
+        "status": "success",
+        "project_id": request.project_id,
+        "base_task_uuid": request.base_task_uuid,
+        "new_task_uuid": new_task_uuid,
+        "total_fp": total_fp,
+        "total_fn": total_fn,
+        "total_anomaly_prototypes": total_prototypes,
+        "task_ids": all_task_ids,
+        "results": results,
+        "message": f"Retraining completed. Total path_ids: {len(results)}, FP: {total_fp}, FN: {total_fn}",
     }
 
 

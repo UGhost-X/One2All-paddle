@@ -215,6 +215,79 @@ def load_augmentation_transform(config_path: Optional[str] = None):
         return None
 
 
+def calculate_adaptive_brightness_range(image: Image.Image) -> Tuple[float, float]:
+    """根据图片当前亮度计算自适应亮度调整范围
+    
+    Args:
+        image: 输入图片 (PIL.Image)
+        
+    Returns:
+        (min_brightness, max_brightness): 亮度调整范围
+    """
+    arr = np.array(image).astype(np.float32)
+    mean_brightness = arr.mean()
+    
+    # 暗图（平均亮度 < 80）：只允许增亮
+    if mean_brightness < 80:
+        return (0.0, 0.4)  # 可以增亮 0-40%
+    # 亮图（平均亮度 > 180）：只允许调暗
+    elif mean_brightness > 180:
+        return (-0.4, 0.0)  # 可以调暗 0-40%
+    # 正常亮度：允许微调
+    else:
+        return (-0.2, 0.2)  # 可以微调 ±20%
+
+
+class AdaptiveBrightnessContrast(A.core.transforms_interface.ImageOnlyTransform):
+    """自适应亮度对比度调整
+    
+    根据图片当前亮度动态调整亮度范围：
+    - 暗图只允许增亮
+    - 亮图只允许调暗
+    - 正常图允许微调
+    """
+    
+    def __init__(
+        self,
+        contrast_limit: Tuple[float, float] = (-0.5, 0.5),
+        always_apply: bool = False,
+        p: float = 0.7,
+    ):
+        super().__init__(always_apply=always_apply, p=p)
+        self.contrast_limit = contrast_limit
+    
+    def apply(self, img: np.ndarray, **params) -> np.ndarray:
+        # 计算当前亮度
+        mean_brightness = img.mean()
+        
+        # 根据亮度确定调整范围
+        if mean_brightness < 80:
+            brightness_limit = (0.0, 0.4)  # 暗图：只增亮
+        elif mean_brightness > 180:
+            brightness_limit = (-0.4, 0.0)  # 亮图：只调暗
+        else:
+            brightness_limit = (-0.2, 0.2)  # 正常：微调
+        
+        # 随机选择调整值
+        brightness = random.uniform(brightness_limit[0], brightness_limit[1])
+        contrast = random.uniform(self.contrast_limit[0], self.contrast_limit[1])
+        
+        # 应用调整
+        # 亮度调整
+        if brightness != 0:
+            img = img * (1 + brightness)
+        
+        # 对比度调整
+        if contrast != 0:
+            mean = img.mean()
+            img = (img - mean) * (1 + contrast) + mean
+        
+        return np.clip(img, 0, 255).astype(np.uint8)
+    
+    def get_transform_init_args_names(self):
+        return ("contrast_limit",)
+
+
 def apply_augmentation(image: Image.Image, transform) -> Image.Image:
     """应用数据增强
     
@@ -225,8 +298,6 @@ def apply_augmentation(image: Image.Image, transform) -> Image.Image:
     Returns:
         增强后的图片 (PIL.Image)
     """
-    if transform is None:
-        return image
         
     # albumentations 需要 numpy array 格式
     image_np = np.array(image)
@@ -658,6 +729,185 @@ class ModelTrainer:
             self._semaphore.release()
             self._persist_state_if_due(force=True)
 
+    def _prepare_fp_combined_dataset(
+        self,
+        task_id: str,
+        base_roi_dir: Path,
+        fp_group_annotations: List[Dict],
+        dataset_dir: str,
+        output_dir: Path,
+        mask_output_dir: Path,
+        num_fp_augmentations: int = 30,
+        normalize_brightness_flag: bool = False,
+        normalize_contrast_flag: bool = False,
+        augmentation_config: Optional[str] = None,
+        fp_image_dir: Optional[Path] = None,
+    ) -> List[Path]:
+        """
+        合并基础模型 ROI 图 + 增强后的 FP 图。
+
+        策略：
+          - 原始 ROI 图：直接复制，不做额外增强
+          - FP 图：提取 ROI 后做 num_fp_augmentations 张增强（含原图本身）
+          - 如果 fp_group_annotations 为空，可从 fp_image_dir 读取预存的 FP 图片
+
+        Returns:
+            合并后所有图片的路径列表
+        """
+        output_dir.mkdir(parents=True, exist_ok=True)
+        mask_output_dir.mkdir(parents=True, exist_ok=True)
+        combined_paths: List[Path] = []
+
+        base_images = sorted(
+            list(base_roi_dir.glob("*.png")) + list(base_roi_dir.glob("*.jpg"))
+        )
+        if not base_images:
+            self._add_log(task_id, f"WARNING: base_roi_dir is empty: {base_roi_dir}")
+
+        for img_path in base_images:
+            dst = output_dir / f"base_{img_path.name}"
+            if not dst.exists():
+                shutil.copy2(img_path, dst)
+            combined_paths.append(dst)
+
+            base_mask_dir = base_roi_dir.parent.parent / "masks" / base_roi_dir.name
+            mask_src = base_mask_dir / (img_path.stem + ".npy")
+            if mask_src.exists():
+                mask_dst = mask_output_dir / f"base_{img_path.stem}.npy"
+                if not mask_dst.exists():
+                    shutil.copy2(mask_src, mask_dst)
+
+        self._add_log(task_id, f"Copied {len(base_images)} base ROI images from {base_roi_dir}")
+
+        fp_image_paths: List[Path] = []
+        if not fp_group_annotations and fp_image_dir and fp_image_dir.exists():
+            fp_image_paths = sorted(
+                list(fp_image_dir.glob("fp_*.jpg")) + list(fp_image_dir.glob("fp_*.png"))
+            )
+            if fp_image_paths:
+                self._add_log(task_id, f"Found {len(fp_image_paths)} pre-existing FP images in {fp_image_dir}")
+
+        if not fp_group_annotations and not fp_image_paths:
+            self._add_log(task_id, "No FP annotations or pre-existing FP images found, skipping FP augmentation")
+            return combined_paths
+
+        augment_transform = load_augmentation_transform(augmentation_config)
+        if augment_transform is None:
+            self._add_log(task_id, "WARNING: No augmentation transform loaded, FP images will be duplicated without augmentation")
+
+        fp_original_count = 0
+        fp_aug_count = 0
+
+        dataset_path = Path(dataset_dir)
+        raw_images_dir = dataset_path / "raw_images"
+        json_path = dataset_path / "annotations.json"
+
+        image_map: Dict[int, str] = {}
+        if json_path.exists():
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            image_map = {img["id"]: img["file_name"] for img in data.get("images", [])}
+
+        if fp_group_annotations:
+            for ann in fp_group_annotations:
+                image_id = ann["image_id"]
+                ann_id = ann["id"]
+                file_name = image_map.get(image_id)
+
+                if not file_name:
+                    self._add_log(task_id, f"WARNING: image_id={image_id} not found, skipping")
+                    continue
+
+                image_path = raw_images_dir / file_name
+                if not image_path.exists():
+                    self._add_log(task_id, f"WARNING: FP image not found: {image_path}")
+                    continue
+
+                segmentation = ann.get("segmentation", [])
+                if not segmentation:
+                    self._add_log(task_id, f"WARNING: annotation {ann_id} has no segmentation, skipping")
+                    continue
+
+                try:
+                    roi_image, roi_mask = extract_polygon_region(image_path, segmentation)
+
+                    if normalize_brightness_flag:
+                        roi_image = normalize_brightness(roi_image)
+                    if normalize_contrast_flag:
+                        roi_image = normalize_contrast(roi_image)
+
+                    file_stem = Path(file_name).stem
+
+                    orig_name = f"fp_{file_stem}_ann{ann_id}.png"
+                    orig_path = output_dir / orig_name
+                    roi_image.save(orig_path)
+                    combined_paths.append(orig_path)
+                    np.save(mask_output_dir / f"fp_{file_stem}_ann{ann_id}.npy", roi_mask)
+                    fp_original_count += 1
+
+                    for i in range(num_fp_augmentations - 1):
+                        if augment_transform:
+                            aug_image = apply_augmentation(roi_image, augment_transform)
+                        else:
+                            aug_image = roi_image
+
+                        aug_name = f"fp_{file_stem}_ann{ann_id}_aug{i:04d}.png"
+                        aug_path = output_dir / aug_name
+                        aug_image.save(aug_path)
+                        combined_paths.append(aug_path)
+                        np.save(mask_output_dir / f"fp_{file_stem}_ann{ann_id}_aug{i:04d}.npy", roi_mask)
+                        fp_aug_count += 1
+
+                except Exception as e:
+                    self._add_log(task_id, f"ERROR: Failed to process FP annotation {ann_id}: {e}")
+        else:
+            for img_path in fp_image_paths:
+                try:
+                    roi_image = Image.open(img_path).convert("RGB")
+                    roi_image, roi_mask = letterbox_resize(roi_image, (224, 224))
+
+                    if normalize_brightness_flag:
+                        roi_image = normalize_brightness(roi_image)
+                    if normalize_contrast_flag:
+                        roi_image = normalize_contrast(roi_image)
+
+                    file_stem = img_path.stem
+
+                    orig_name = f"{file_stem}.png"
+                    orig_path = output_dir / orig_name
+                    roi_image.save(orig_path)
+                    combined_paths.append(orig_path)
+                    np.save(mask_output_dir / f"{file_stem}.npy", roi_mask)
+                    fp_original_count += 1
+
+                    for i in range(num_fp_augmentations - 1):
+                        if augment_transform:
+                            aug_image = apply_augmentation(roi_image, augment_transform)
+                        else:
+                            aug_image = roi_image
+
+                        aug_name = f"{file_stem}_aug{i:04d}.png"
+                        aug_path = output_dir / aug_name
+                        aug_image.save(aug_path)
+                        combined_paths.append(aug_path)
+                        np.save(mask_output_dir / f"{file_stem}_aug{i:04d}.npy", roi_mask)
+                        fp_aug_count += 1
+
+                except Exception as e:
+                    self._add_log(task_id, f"ERROR: Failed to process FP image {img_path.name}: {e}")
+
+        self._add_log(
+            task_id,
+            f"FP augmentation done: {fp_original_count} FP × {num_fp_augmentations} = "
+            f"{fp_original_count + fp_aug_count} FP images"
+        )
+        self._add_log(
+            task_id,
+            f"Combined dataset total: {len(base_images)} base + "
+            f"{fp_original_count + fp_aug_count} FP augmented = {len(combined_paths)} images"
+        )
+        return combined_paths
+
     # ==================== Dinomaly 训练 ====================
 
     def _do_train_dinomaly(
@@ -668,7 +918,7 @@ class ModelTrainer:
         group_id: Any,
         group_annotations: List[Dict],
     ):
-        """执行 Dinomaly 训练"""
+        """执行 Dinomaly 训练（支持从检查点恢复进行微调）"""
         self._add_log(task_id, f"Dinomaly training started for group '{group_id}'")
         self._update_task_status(task_id, status="preparing", progress=5)
 
@@ -692,15 +942,14 @@ class ModelTrainer:
         encoder_name = config.get("encoder_name", "dinov2_vit_base_14")
         decoder_depth = config.get("decoder_depth", 8)
         bottleneck_dropout = config.get("bottleneck_dropout", 0.2)
-        epochs = config.get("epochs", 12)  # 从 20 降到 12，encoder 冻结时收敛更快
-        batch_size = config.get("batch_size", 8)  # 从 2 提升到 8，BF16+inference_mode 后显存充足
+        epochs = config.get("epochs", 12)
+        batch_size = config.get("batch_size", 8)
         num_workers = config.get("num_workers", 4)
         normalize_brightness = config.get("normalize_brightness", False)
         normalize_contrast = config.get("normalize_contrast", False)
         freeze_encoder = config.get("freeze_encoder", True)
         category = config.get("category", "unknown")
         category_label = config.get("category_label", "unknown")
-        # 数据增强参数
         augment = config.get("augment", False)
         num_augmentations = config.get("num_augmentations", 1)
         augmentation_config = config.get("augmentation_config", None)
@@ -726,74 +975,130 @@ class ModelTrainer:
         val_split_ratio_actual = 0.0  # 将在后面根据样本数动态设置
 
         try:
-            # Stage 1: 提取ROI图片
+            # Stage 1: 准备训练图片
             self._update_task_status(task_id, status="preparing", progress=10, stage="1/3")
             self._add_log(task_id, "Stage 1/3: Preparing ROI images...")
 
-            # 根据训练模式确定ROI保存路径
             train_mode = config.get("train_mode", "by_pos_id")
             task_uuid = config.get("task_uuid", "unknown")
             project_id = config.get("project_id", "default")
 
-            # 从 config 中获取 path_id（由 _create_group_training_task 设置），确保一致性
             path_id = config.get("path_id")
             if path_id is None:
-                # 兼容旧逻辑（如果 path_id 未设置）
                 if group_annotations:
                     first_ann = group_annotations[0]
-                    if train_mode == "by_category":
-                        path_id = str(first_ann.get("category_id", 0))
-                    else:  # by_pos_id
-                        path_id = str(first_ann.get("pos_id", group_id))
+                    path_id = str(first_ann.get("category_id", 0)) if train_mode == "by_category" \
+                              else str(first_ann.get("pos_id", group_id))
                 else:
                     path_id = str(group_id)
                 self._add_log(task_id, f"Warning: path_id not in config, fallback to {path_id}")
 
-            # ROI 保存路径: dataset_dir 已经是 product/{project_id}/train/{task_uuid}/
-            # 直接在 dataset_dir 下创建 roi 子目录
             roi_save_dir = Path(dataset_dir) / "roi" / str(path_id)
             mask_save_dir = Path(dataset_dir) / "masks" / str(path_id)
             roi_save_dir.mkdir(parents=True, exist_ok=True)
             mask_save_dir.mkdir(parents=True, exist_ok=True)
 
-            # 提取ROI图片到保存目录（包含数据增强），同时保存 mask
-            image_paths = extract_roi_images(
-                dataset_dir=dataset_dir,
-                output_dir=str(roi_save_dir),
-                mask_output_dir=str(mask_save_dir),
-                group_annotations=group_annotations,
-                normalize_brightness=normalize_brightness,
-                normalize_contrast=normalize_contrast,
-                augment=augment,
-                num_augmentations=num_augmentations,
-                train_mode=train_mode,
-                augmentation_config=augmentation_config,
-            )
+            # 判断是否为 FP 重训模式
+            # 触发条件：提供了 base_roi_dir
+            base_roi_dir_str = config.get("base_roi_dir")
+            is_fp_retrain = bool(base_roi_dir_str)
+
+            if is_fp_retrain:
+                base_roi_dir = Path(base_roi_dir_str)
+                num_fp_augmentations = config.get("num_fp_augmentations", 30)
+
+                self._add_log(task_id, f"[FP Retrain] mode: base_roi_dir={base_roi_dir}, fp_aug={num_fp_augmentations}x")
+
+                if not base_roi_dir.exists():
+                    raise ValueError(f"base_roi_dir does not exist: {base_roi_dir}")
+
+                # 计算数据比例，防止 FP 增强过多导致分布偏移
+                n_base = len(list(base_roi_dir.glob("*.png")) + list(base_roi_dir.glob("*.jpg")))
+                n_fp_raw = len(group_annotations)
+
+                if n_fp_raw == 0:
+                    fp_images_in_dir = list(roi_save_dir.glob("fp_*.jpg")) + list(roi_save_dir.glob("fp_*.png"))
+                    n_fp_raw = len(fp_images_in_dir)
+                    if n_fp_raw > 0:
+                        self._add_log(task_id, f"[FP Retrain] Found {n_fp_raw} pre-existing FP images in {roi_save_dir}")
+
+                if n_fp_raw > 0:
+                    max_fp_aug_total = int(n_base * 0.5)
+                    if n_fp_raw * num_fp_augmentations > max_fp_aug_total:
+                        safe_aug_per_fp = max(1, max_fp_aug_total // n_fp_raw)
+                        self._add_log(task_id, f"[FP Retrain] FP aug capped: {num_fp_augmentations} → {safe_aug_per_fp} per image (base={n_base}, fp_raw={n_fp_raw}, limit={max_fp_aug_total})")
+                        num_fp_augmentations = safe_aug_per_fp
+
+                # 直接使用 roi/{path_id} 和 masks/{path_id} 作为输出目录
+                # 1. 先复制基础模型 ROI 到当前 roi 目录
+                # 2. 然后对 FP 图片进行增强，也保存到 roi 目录
+                image_paths = self._prepare_fp_combined_dataset(
+                    task_id=task_id,
+                    base_roi_dir=base_roi_dir,
+                    fp_group_annotations=group_annotations,
+                    dataset_dir=dataset_dir,
+                    output_dir=roi_save_dir,
+                    mask_output_dir=mask_save_dir,
+                    num_fp_augmentations=num_fp_augmentations,
+                    normalize_brightness_flag=normalize_brightness,
+                    normalize_contrast_flag=normalize_contrast,
+                    augmentation_config=augmentation_config,
+                    fp_image_dir=roi_save_dir,
+                )
+
+                n_total = len(image_paths)
+                if n_total > n_base * 1.5:
+                    actual_epochs = max(8, epochs - 2)
+                    self._add_log(task_id, f"[FP Retrain] Large dataset ({n_total} imgs), reducing epochs: {epochs} → {actual_epochs}")
+                else:
+                    actual_epochs = epochs
+
+                self._add_log(task_id, f"[FP Retrain] Training with {len(image_paths)} images, epochs={actual_epochs}")
+
+            else:
+                # 初次训练：从 raw_images 提取 ROI
+                image_paths = extract_roi_images(
+                    dataset_dir=dataset_dir,
+                    output_dir=str(roi_save_dir),
+                    mask_output_dir=str(mask_save_dir),
+                    group_annotations=group_annotations,
+                    normalize_brightness=normalize_brightness,
+                    normalize_contrast=normalize_contrast,
+                    augment=augment,
+                    num_augmentations=num_augmentations,
+                    train_mode=train_mode,
+                    augmentation_config=augmentation_config,
+                )
+                actual_epochs = epochs
 
             if not image_paths:
-                raise ValueError(f"No ROI images extracted for group {group_id}")
+                raise ValueError(f"No ROI images for group {group_id}")
 
-            self._add_log(task_id, f"Saved {len(image_paths)} ROI images to {roi_save_dir}")
-
-            # 直接使用 roi_save_dir 作为训练数据目录（禁止复制）
-            self._add_log(task_id, f"Using ROI images directly from {roi_save_dir}")
+            self._add_log(task_id, f"Training directory: {roi_save_dir} ({len(image_paths)} images)")
 
             # Stage 2: 创建 Anomalib datamodule 和模型
             self._update_task_status(task_id, status="training", progress=30, stage="2/3")
             self._add_log(task_id, "Stage 2/3: Creating model and datamodule...")
 
             accelerator = 'gpu' if torch.cuda.is_available() else 'cpu'
+            model = None
 
-            try:
-                model = Dinomaly(
-                    encoder_name=encoder_name,
-                    decoder_depth=decoder_depth,
-                    bottleneck_dropout=bottleneck_dropout,
-                )
-            except (OSError, IOError, Exception) as e:
-                if 'dinov2' in str(e).lower() or 'download' in str(e).lower():
-                    raise RuntimeError(f"DINOv2 预训练权重下载失败: {e}")
-                raise
+            # 从不加载 checkpoint，始终从头训练新模型
+            self._add_log(task_id, f"Training new model from scratch: epochs={actual_epochs}")
+            if model is None:
+                try:
+                    model = Dinomaly(
+                        encoder_name=encoder_name,
+                        decoder_depth=decoder_depth,
+                        bottleneck_dropout=bottleneck_dropout,
+                    )
+                    # 注意：即使是新模型，在重训练场景下也应该使用 finetune_epochs
+                    # 因为用户期望的是微调而不是从头训练
+                    self._add_log(task_id, f"Training new model (retrain mode): using {actual_epochs} epochs")
+                except (OSError, IOError, Exception) as e:
+                    if 'dinov2' in str(e).lower() or 'download' in str(e).lower():
+                        raise RuntimeError(f"DINOv2 预训练权重下载失败: {e}")
+                    raise
 
             # 冻结编码器并启用 inference_mode 以释放激活值显存
             if freeze_encoder:
@@ -831,7 +1136,7 @@ class ModelTrainer:
                         f"[task:{self.task_id[-8:]}] Epoch {current}/{self.total_epochs} done"
                     )
 
-            epoch_cb = EpochProgressCallback(self, task_id, epochs)
+            epoch_cb = EpochProgressCallback(self, task_id, actual_epochs)
 
             # 使用临时目录作为 anomalib 日志目录，训练结束后自动清理
             import tempfile
@@ -850,7 +1155,7 @@ class ModelTrainer:
             num_images = len(image_paths)
             min_val_samples = 3  # 验证集最少需要的样本数
             val_split_ratio_actual = 0.2
-            check_val_every_n_epoch = epochs  # 默认只在最后验证
+            check_val_every_n_epoch = actual_epochs  # 默认只在最后验证
 
             # 计算验证集样本数
             val_samples = int(num_images * val_split_ratio_actual)
@@ -882,7 +1187,7 @@ class ModelTrainer:
                     self._add_log(task_id, f"Using val_split_ratio=0.2 ({val_samples} val samples), EarlyStopping disabled (samples <= 50)")
 
             engine = Engine(
-                max_epochs=epochs,
+                max_epochs=actual_epochs,
                 accelerator=accelerator,
                 devices=1,
                 enable_progress_bar=False,   # ✅ 关掉 tqdm，避免多线程输出混乱
@@ -983,6 +1288,25 @@ class ModelTrainer:
             # 保存模型（在清理变量之前，因为需要用到 scores）
             self._update_task_status(task_id, progress=90)
             self._save_dinomaly_model(task_id, save_dir, dataset_dir, model, engine, config, threshold, scores, group_annotations)
+
+            # Stage 4: 初始化并保存原型库（异常原型由后续反馈接口添加）
+            try:
+                from utils.prototype_refiner import PrototypeBank
+                prototype_bank = PrototypeBank(save_dir)
+                prototype_bank.metadata = {
+                    "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "project_id": config.get("project_id"),
+                    "task_uuid": config.get("task_uuid"),
+                    "path_id": config.get("path_id"),
+                    "group_id": str(group_id),
+                    "category": config.get("category", ""),
+                    "category_label": config.get("category_label", ""),
+                    "anomaly_count": 0,
+                }
+                prototype_bank.save()
+                self._add_log(task_id, f"Prototype bank initialized at {save_dir}")
+            except Exception as e:
+                logger.warning(f"Failed to initialize prototype bank: {e}")
 
             self._update_task_status(
                 task_id,
