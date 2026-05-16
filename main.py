@@ -38,6 +38,8 @@ import platform
 import warnings
 import uuid as uuid_lib
 import uvicorn
+from PIL import Image
+from typing import Tuple, List, Dict, Any, Optional
 
 # 屏蔽框架无关紧要的日志和警告
 warnings.filterwarnings("ignore", category=UserWarning, message=".*ccache.*")
@@ -53,6 +55,246 @@ logger = logging.getLogger(__name__)
 
 # 初始化模型训练器（使用环境变量配置的output路径）
 trainer = ModelTrainer(output_dir=str(get_output_dir()), max_concurrent=3)
+
+# SSIM 预处理配置（与推理时一致）
+SSIM_INPUT_SIZE = (224, 224)  # 模型输入尺寸 (W, H)
+
+
+def letterbox_resize_pil(
+    img: Image.Image,
+    target_size: Tuple[int, int],
+    fill_color: Tuple[int, int, int] = (0, 0, 0),
+) -> Tuple[Image.Image, np.ndarray]:
+    """
+    保持宽高比地将图片 padding 到 target_size，并返回有效区域的 mask。
+    与推理服务中的 letterbox_resize 保持一致。
+
+    Returns:
+        img_padded: PIL Image，尺寸为 target_size
+        mask: np.ndarray bool (H, W)，True 表示原始像素，False 表示填充像素
+    """
+    tw, th = target_size
+    ow, oh = img.size
+
+    # 防止除零错误
+    if ow == 0 or oh == 0:
+        logger.warning(f"Invalid image size: {ow}x{oh}, returning blank image")
+        return Image.new("RGB", (tw, th), fill_color), np.zeros((th, tw), dtype=bool)
+
+    scale = min(tw / ow, th / oh)
+    new_w = max(1, int(ow * scale))
+    new_h = max(1, int(oh * scale))
+
+    img_resized = img.resize((new_w, new_h), Image.BILINEAR)
+
+    pad_left = (tw - new_w) // 2
+    pad_top = (th - new_h) // 2
+
+    img_padded = Image.new("RGB", (tw, th), fill_color)
+    img_padded.paste(img_resized, (pad_left, pad_top))
+
+    # 创建有效区域的 mask
+    mask = np.zeros((th, tw), dtype=bool)
+    mask[pad_top:pad_top + new_h, pad_left:pad_left + new_w] = True
+
+    return img_padded, mask
+
+
+def preprocess_fn_image_for_ssim(fn_img: Image.Image, target_size: Tuple[int, int] = None) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    对 FN 图片进行与推理时相同的预处理，用于 SSIM 比对。
+
+    Args:
+        fn_img: PIL Image (RGB)
+        target_size: 目标尺寸 (W, H)，默认 224x224
+
+    Returns:
+        (roi_bgr, mask): 预处理后的 BGR 格式 numpy 数组和有效区域 mask
+    """
+    try:
+        if target_size is None:
+            target_size = SSIM_INPUT_SIZE
+
+        # 确保图片是 RGB 模式
+        if fn_img.mode != 'RGB':
+            fn_img = fn_img.convert('RGB')
+
+        # letterbox_resize 保持宽高比并 padding 到目标尺寸
+        # 注意：letterbox_resize 已经将图片 resize 到 target_size，不需要再次 resize
+        img_padded, mask = letterbox_resize_pil(fn_img, target_size)
+
+        # 转换为 numpy 数组 (RGB)
+        roi_np = np.array(img_padded)
+
+        # 转换为 BGR 格式（与推理时的 ROI 格式一致）
+        roi_bgr = cv2.cvtColor(roi_np, cv2.COLOR_RGB2BGR)
+
+        return roi_bgr, mask
+    except Exception as e:
+        logger.error(f"Error in preprocess_fn_image_for_ssim: {e}, img_size={fn_img.size if fn_img else 'None'}", exc_info=True)
+        # 返回一个空白图片和全 False mask 作为 fallback
+        blank = np.zeros((SSIM_INPUT_SIZE[1], SSIM_INPUT_SIZE[0], 3), dtype=np.uint8)
+        blank_mask = np.zeros((SSIM_INPUT_SIZE[1], SSIM_INPUT_SIZE[0]), dtype=bool)
+        return blank, blank_mask
+
+
+def create_fn_only_simulated_task(
+    trainer: ModelTrainer,
+    project_id: str,
+    task_uuid: str,
+    path_id: str,
+    fn_images: List[Tuple[Image.Image, str]],  # (image, pos_id)
+    base_model_path: str,
+    base_config: dict,
+) -> str:
+    """
+    为纯 FN 场景创建模拟训练任务。
+    不实际训练模型，只复制基础模型并保存 FN 图片（按 pos_id 分文件夹），同时创建任务状态供前端轮询。
+
+    Args:
+        trainer: 模型训练器实例
+        project_id: 项目ID
+        task_uuid: 任务UUID
+        path_id: path_id
+        fn_images: FN 图片列表，每项为 (PIL Image, pos_id)
+        base_model_path: 基础模型路径
+        base_config: 基础模型配置
+
+    Returns:
+        task_id: 模拟任务ID
+    """
+    import random
+    import time
+    import threading
+
+    model_name = "Dinomaly"
+    safe_group_id = str(path_id).replace("/", "_").replace("\\", "_")
+    task_id = f"{model_name.lower()}_fn_only_{int(time.time())}_{safe_group_id}_{random.randint(1000, 9999)}"
+
+    save_dir = os.path.join(
+        str(get_output_dir()),
+        project_id,
+        task_uuid,
+        str(path_id),
+    )
+    os.makedirs(save_dir, exist_ok=True)
+
+    # 创建任务状态
+    trainer.training_status[task_id] = {
+        "status": "starting",
+        "progress": 0,
+        "group_id": f"fn_only_{path_id}",
+        "internal_group_id": path_id,
+        "task_uuid": task_uuid,
+        "logs": [f"Task {task_id} initialized for FN-only processing (SSIM mode)."],
+        "metrics": [],
+        "total_epochs": 1,
+        "start_time": time.time(),
+        "dataset_dir": save_dir,
+        "save_dir": save_dir,
+        "config": {
+            "model_name": model_name,
+            "project_id": project_id,
+            "task_uuid": task_uuid,
+            "path_id": path_id,
+            "train_mode": base_config.get("train_mode", "by_category"),
+            "category": base_config.get("category", ""),
+            "category_label": base_config.get("category_label", "unknown"),
+        },
+        "task_key": f"fn_only_{project_id}_{task_uuid}_{path_id}",
+        "group_annotations": [],
+        "is_simulated": True,  # 标记为模拟任务
+    }
+
+    # 启动模拟训练线程
+    def _simulate_fn_training():
+        try:
+            # Stage 1: 准备中
+            trainer._update_task_status(task_id, status="preparing", progress=10)
+            trainer._add_log(task_id, "Stage 1/3: Preparing FN images for SSIM comparison...")
+            time.sleep(0.5)
+
+            # Stage 2: 保存 FN 图片和 mask（按 pos_id 分文件夹）
+            trainer._update_task_status(task_id, status="training", progress=30)
+            trainer._add_log(task_id, f"Stage 2/3: Saving {len(fn_images)} FN images (organized by pos_id)...")
+
+            fn_images_dir = Path(save_dir) / "fn_images"
+            fn_images_dir.mkdir(parents=True, exist_ok=True)
+
+            # 创建 mask 保存目录
+            fn_masks_dir = Path(save_dir) / "masks" / "fn"
+            fn_masks_dir.mkdir(parents=True, exist_ok=True)
+
+            from collections import defaultdict
+            pos_counters: Dict[str, int] = defaultdict(int)
+
+            for fn_img, fn_pos_id in fn_images:
+                try:
+                    fn_img_processed, fn_mask = preprocess_fn_image_for_ssim(fn_img)
+
+                    # 按 pos_id 分文件夹
+                    pos_dir = fn_images_dir / str(fn_pos_id)
+                    pos_mask_dir = fn_masks_dir / str(fn_pos_id)
+                    pos_dir.mkdir(parents=True, exist_ok=True)
+                    pos_mask_dir.mkdir(parents=True, exist_ok=True)
+
+                    idx = pos_counters[fn_pos_id]
+                    pos_counters[fn_pos_id] += 1
+
+                    # 保存 FN 图片
+                    fn_img_path = pos_dir / f"fn_{idx:04d}.jpg"
+                    cv2.imwrite(str(fn_img_path), fn_img_processed)
+
+                    # 保存 FN mask
+                    fn_mask_path = pos_mask_dir / f"fn_{idx:04d}.npy"
+                    np.save(str(fn_mask_path), fn_mask)
+
+                    trainer._add_log(task_id, f"Saved FN image (pos_id={fn_pos_id}): {fn_img_path.name} (mask: {fn_mask_path.name})")
+                except Exception as e:
+                    trainer._add_log(task_id, f"Failed to save FN image: {e}")
+
+            time.sleep(0.5)
+
+            # Stage 3: 复制基础模型
+            trainer._update_task_status(task_id, status="training", progress=60)
+            trainer._add_log(task_id, "Stage 3/3: Copying base model...")
+
+            base_model_dir = Path(base_model_path).parent
+            for file_name in ["model.ckpt", "dinomaly_model.pt", "config.json"]:
+                src_file = base_model_dir / file_name
+                if src_file.exists():
+                    shutil.copy2(str(src_file), str(Path(save_dir) / file_name))
+                    trainer._add_log(task_id, f"Copied {file_name}")
+
+            # 复制 template_variants
+            template_variants_src = base_model_dir / "template_variants"
+            if template_variants_src.exists() and template_variants_src.is_dir():
+                template_variants_dst = Path(save_dir) / "template_variants"
+                if template_variants_dst.exists():
+                    shutil.rmtree(str(template_variants_dst))
+                shutil.copytree(str(template_variants_src), str(template_variants_dst))
+                trainer._add_log(task_id, "Copied template_variants")
+
+            time.sleep(0.5)
+
+            # 完成
+            trainer._update_task_status(task_id, status="completed", progress=100)
+            trainer._add_log(task_id, "FN-only processing completed. Model ready for SSIM-based inference.")
+            trainer._persist_state_if_due(force=True)
+
+        except Exception as e:
+            logger.error(f"Simulated FN training failed: {e}", exc_info=True)
+            trainer._update_task_status(task_id, status="failed", error=str(e))
+            trainer._add_log(task_id, f"Error: {e}")
+            trainer._persist_state_if_due(force=True)
+
+    t = threading.Thread(target=_simulate_fn_training, daemon=True)
+    trainer.threads[task_id] = t
+    t.start()
+
+    logger.info(f"Created simulated FN-only task: {task_id} for path_id={path_id}")
+    return task_id
+
 
 app = FastAPI(title="One2All Paddle API")
 
@@ -598,6 +840,7 @@ class FeedbackGroup(BaseModel):
     path_id: str  # 位置/类别 ID
     false_positive_images: List[str] = []  # base64 编码的正常样本（被误检为异常）
     false_negative_images: List[str] = []  # base64 编码的异常样本 ROI（被漏检）
+    false_negative_pos_ids: List[str] = []  # 每个 FN 图片对应的 pos_id，用于按位置组织 SSIM 比对
 
 
 class RetrainRequest(BaseModel):
@@ -657,7 +900,6 @@ async def incremental_retrain(request: RetrainRequest):
     all_task_ids = []
     total_fp = 0
     total_fn = 0
-    total_prototypes = 0
 
     # ========== 第一步：复制无反馈的 path_id ==========
     for path_id in copy_path_ids:
@@ -667,7 +909,7 @@ async def incremental_retrain(request: RetrainRequest):
             new_model_dir.mkdir(parents=True, exist_ok=True)
             
             # 复制所有模型相关文件
-            model_files = ["model.ckpt", "dinomaly_model.pt", "config.json", "prototype_bank.pt"]
+            model_files = ["model.ckpt", "dinomaly_model.pt", "config.json"]
             copied_files = []
             for file_name in model_files:
                 src_file = base_model_dir / file_name
@@ -788,18 +1030,19 @@ async def incremental_retrain(request: RetrainRequest):
                     except Exception as e:
                         logger.error(f"Failed to decode FP image[{idx}] for path_id={path_id}: {e}")
 
-            # 解码 False Negative 图片
-            fn_images: List[Image.Image] = []
+            # 解码 False Negative 图片，同时记录每个图片的 pos_id
+            fn_images: List[Tuple[Image.Image, str]] = []  # (image, pos_id)
+            fn_pos_ids = group.false_negative_pos_ids if group.false_negative_pos_ids else []
             for idx, img_b64 in enumerate(group.false_negative_images):
                 try:
                     img_data = base64.b64decode(img_b64)
                     img = Image.open(io.BytesIO(img_data)).convert("RGB")
-                    fn_images.append(img)
+                    pos_id = fn_pos_ids[idx] if idx < len(fn_pos_ids) else "unknown"
+                    fn_images.append((img, pos_id))
                 except Exception as e:
                     logger.error(f"Failed to decode FN image[{idx}] for path_id={path_id}: {e}")
 
             path_task_ids = []
-            path_anomaly_count = 0
 
             # ========== 处理 False Positives：微调 Dinomaly ==========
             if fp_images:
@@ -850,110 +1093,87 @@ async def incremental_retrain(request: RetrainRequest):
                 all_task_ids.extend(path_task_ids)
                 total_fp += num_fp
             else:
-                # 没有 FP 数据，直接复制原模型
-                logger.info(f"path_id={path_id}: No FP data, copying model from base version")
-                for file_name in ["model.ckpt", "dinomaly_model.pt", "config.json"]:
-                    src_file = base_model_dir / file_name
-                    if src_file.exists():
-                        shutil.copy2(str(src_file), str(new_model_dir / file_name))
-                
-                # 复制 template_variants 目录
-                template_variants_src = base_model_dir / "template_variants"
-                if template_variants_src.exists() and template_variants_src.is_dir():
-                    template_variants_dst = new_model_dir / "template_variants"
-                    if template_variants_dst.exists():
-                        shutil.rmtree(str(template_variants_dst))
-                    shutil.copytree(str(template_variants_src), str(template_variants_dst))
+                # 没有 FP 数据，但有 FN 数据时，创建模拟训练任务
+                if fn_images:
+                    logger.info(f"path_id={path_id}: No FP data, but {len(fn_images)} FN images found. Creating simulated training task.")
+                    fn_task_id = create_fn_only_simulated_task(
+                        trainer=trainer,
+                        project_id=request.project_id,
+                        task_uuid=new_task_uuid,
+                        path_id=path_id,
+                        fn_images=fn_images,
+                        base_model_path=str(base_model_path),
+                        base_config=base_config,
+                    )
+                    path_task_ids = [fn_task_id]
+                    all_task_ids.append(fn_task_id)
+                    path_group_id = f"fn_only_{int(time.time())}_{path_id}"
+                else:
+                    # 既没有 FP 也没有 FN，直接复制原模型
+                    logger.info(f"path_id={path_id}: No FP/FN data, copying model from base version")
+                    for file_name in ["model.ckpt", "dinomaly_model.pt", "config.json"]:
+                        src_file = base_model_dir / file_name
+                        if src_file.exists():
+                            shutil.copy2(str(src_file), str(new_model_dir / file_name))
 
-            # ========== 处理 False Negatives：更新原型库 ==========
+                    # 复制 template_variants 目录
+                    template_variants_src = base_model_dir / "template_variants"
+                    if template_variants_src.exists() and template_variants_src.is_dir():
+                        template_variants_dst = new_model_dir / "template_variants"
+                        if template_variants_dst.exists():
+                            shutil.rmtree(str(template_variants_dst))
+                        shutil.copytree(str(template_variants_src), str(template_variants_dst))
+
+            # 保存 FN 图片到模型目录，用于 SSIM 比对
+            # 按 pos_id 分文件夹组织，确保推理时只与同位置的 FN 图片比较
             if fn_images:
-                fn_task_id = f"prototype_{int(time.time())}_{path_id}"
-                trainer._update_task_status(fn_task_id, status="preparing", progress=0, stage="1/2")
-                trainer._add_log(fn_task_id, f"Building prototype bank for path_id={path_id}...")
-                
-                logger.info(f"path_id={path_id}: Processing {len(fn_images)} FN for prototype bank")
-                try:
-                    from anomalib.models import Dinomaly
-                    import torch
-                    from utils.prototype_refiner import PrototypeBank, build_anomaly_prototypes_from_images
+                fn_images_dir = new_model_dir / "fn_images"
+                fn_images_dir.mkdir(parents=True, exist_ok=True)
+                fn_masks_dir = new_model_dir / "masks" / "fn"
+                fn_masks_dir.mkdir(parents=True, exist_ok=True)
+                logger.info(f"Starting to save {len(fn_images)} FN images to {fn_images_dir} (organized by pos_id)")
 
-                    trainer._add_log(fn_task_id, f"Loading base model from {base_model_path}")
-                    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                from collections import defaultdict
+                pos_counters: Dict[str, int] = defaultdict(int)
+
+                for fn_img, fn_pos_id in fn_images:
                     try:
-                        model = Dinomaly.load_from_checkpoint(str(base_model_path), map_location=device)
-                    except TypeError:
-                        model = Dinomaly.load_from_checkpoint(str(base_model_path))
-                    model = model.to(device)
-                    model.eval()
-                    
-                    trainer._update_task_status(fn_task_id, progress=30, stage="1/2")
-                    trainer._add_log(fn_task_id, f"Extracting features from {len(fn_images)} FN images...")
-                    
-                    new_prototypes = build_anomaly_prototypes_from_images(model, fn_images, device=str(device))
-                    
-                    trainer._update_task_status(fn_task_id, progress=60, stage="2/2")
-                    trainer._add_log(fn_task_id, "Building and saving prototype bank...")
-                    
-                    prototype_bank = PrototypeBank(str(new_model_dir))
-                    old_prototype_bank = PrototypeBank(str(base_model_dir))
-                    if old_prototype_bank.load():
-                        if old_prototype_bank.has_anomaly_prototypes():
-                            prototype_bank.add_anomaly_prototypes(old_prototype_bank.anomaly_prototypes)
-                            trainer._add_log(fn_task_id, f"Merged {old_prototype_bank.get_prototype_count()} old prototypes")
+                        logger.info(f"Processing FN image for pos_id={fn_pos_id}, size={fn_img.size}")
+                        fn_img_processed, fn_mask = preprocess_fn_image_for_ssim(fn_img)
 
-                    prototype_bank.add_anomaly_prototypes(new_prototypes)
-                    prototype_bank.metadata = {
-                        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                        "project_id": request.project_id,
-                        "base_task_uuid": request.base_task_uuid,
-                        "new_task_uuid": new_task_uuid,
-                        "path_id": path_id,
-                        "new_fn_samples": len(fn_images),
-                        "total_anomaly_prototypes": prototype_bank.get_prototype_count(),
-                    }
-                    prototype_bank.save()
-                    path_anomaly_count = prototype_bank.get_prototype_count()
-                    total_fn += len(fn_images)
-                    total_prototypes += path_anomaly_count
-                    
-                    trainer._update_task_status(fn_task_id, status="completed", progress=100)
-                    trainer._add_log(fn_task_id, f"Prototype bank built successfully with {path_anomaly_count} prototypes")
-                    path_task_ids.append(fn_task_id)
+                        # 按 pos_id 分文件夹
+                        pos_dir = fn_images_dir / str(fn_pos_id)
+                        pos_mask_dir = fn_masks_dir / str(fn_pos_id)
+                        pos_dir.mkdir(parents=True, exist_ok=True)
+                        pos_mask_dir.mkdir(parents=True, exist_ok=True)
 
-                    del model
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                        idx = pos_counters[fn_pos_id]
+                        pos_counters[fn_pos_id] += 1
 
-                except Exception as e:
-                    logger.error(f"Failed to build prototype bank for path_id={path_id}: {e}", exc_info=True)
-                    trainer._update_task_status(fn_task_id, status="failed", error=str(e))
-                    trainer._add_log(fn_task_id, f"Error: {e}")
-            else:
-                # 没有 FN 数据，复制原原型库（如果有）
-                old_prototype_file = base_model_dir / "prototype_bank.pt"
-                if old_prototype_file.exists():
-                    shutil.copy2(str(old_prototype_file), str(new_model_dir / "prototype_bank.pt"))
-                    logger.info(f"path_id={path_id}: No FN data, copied prototype bank from base version")
+                        fn_img_path = pos_dir / f"fn_{idx:04d}.jpg"
+                        cv2.imwrite(str(fn_img_path), fn_img_processed)
 
-            # 区分 FP 训练任务和 FN 原型任务
-            fp_task_ids = [tid for tid in path_task_ids if not tid.startswith("prototype_")]
-            fn_task_ids = [tid for tid in path_task_ids if tid.startswith("prototype_")]
-            
+                        fn_mask_path = pos_mask_dir / f"fn_{idx:04d}.npy"
+                        np.save(str(fn_mask_path), fn_mask)
+
+                        logger.info(f"Saved FN image to {fn_img_path} (pos_id={fn_pos_id}, shape={fn_img_processed.shape})")
+                    except Exception as e:
+                        logger.error(f"Failed to save FN image for pos_id={fn_pos_id}: {e}", exc_info=True)
+
+                logger.info(f"path_id={path_id}: Saved {len(fn_images)} FN images across {len(pos_counters)} positions to {fn_images_dir}")
+                total_fn += len(fn_images)
+
             # 构建 group_ids 列表（用于前端轮询组状态）
             path_group_ids = []
-            if fp_images and fp_task_ids:
+            if path_task_ids:
                 path_group_ids.append(path_group_id)
-            if fn_images and fn_task_ids:
-                path_group_ids.append(fn_task_id)
-            
+
             results.append({
                 "path_id": path_id,
                 "status": "success",
                 "num_fp": len(fp_images),
                 "num_fn": len(fn_images),
-                "anomaly_prototypes": path_anomaly_count,
-                "fp_task_ids": fp_task_ids,
-                "fn_task_ids": fn_task_ids,
+                "fp_task_ids": path_task_ids,
                 "task_ids": path_task_ids,
                 "group_ids": path_group_ids,
             })
@@ -973,7 +1193,6 @@ async def incremental_retrain(request: RetrainRequest):
         "new_task_uuid": new_task_uuid,
         "total_fp": total_fp,
         "total_fn": total_fn,
-        "total_anomaly_prototypes": total_prototypes,
         "task_ids": all_task_ids,
         "results": results,
         "message": f"Retraining completed. Total path_ids: {len(results)}, FP: {total_fp}, FN: {total_fn}",

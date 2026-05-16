@@ -1289,24 +1289,7 @@ class ModelTrainer:
             self._update_task_status(task_id, progress=90)
             self._save_dinomaly_model(task_id, save_dir, dataset_dir, model, engine, config, threshold, scores, group_annotations)
 
-            # Stage 4: 初始化并保存原型库（异常原型由后续反馈接口添加）
-            try:
-                from utils.prototype_refiner import PrototypeBank
-                prototype_bank = PrototypeBank(save_dir)
-                prototype_bank.metadata = {
-                    "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    "project_id": config.get("project_id"),
-                    "task_uuid": config.get("task_uuid"),
-                    "path_id": config.get("path_id"),
-                    "group_id": str(group_id),
-                    "category": config.get("category", ""),
-                    "category_label": config.get("category_label", ""),
-                    "anomaly_count": 0,
-                }
-                prototype_bank.save()
-                self._add_log(task_id, f"Prototype bank initialized at {save_dir}")
-            except Exception as e:
-                logger.warning(f"Failed to initialize prototype bank: {e}")
+
 
             self._update_task_status(
                 task_id,
