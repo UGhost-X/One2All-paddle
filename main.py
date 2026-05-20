@@ -126,16 +126,71 @@ def preprocess_fn_image_for_ssim(fn_img: Image.Image, target_size: Tuple[int, in
         # 转换为 numpy 数组 (RGB)
         roi_np = np.array(img_padded)
 
-        # 转换为 BGR 格式（与推理时的 ROI 格式一致）
-        roi_bgr = cv2.cvtColor(roi_np, cv2.COLOR_RGB2BGR)
+        # 转换为灰度图（与推理时 SSIM 计算一致，直接保存为 numpy 数组）
+        roi_gray = cv2.cvtColor(roi_np, cv2.COLOR_RGB2GRAY)
 
-        return roi_bgr, mask
+        return roi_gray, mask
     except Exception as e:
         logger.error(f"Error in preprocess_fn_image_for_ssim: {e}, img_size={fn_img.size if fn_img else 'None'}", exc_info=True)
         # 返回一个空白图片和全 False mask 作为 fallback
         blank = np.zeros((SSIM_INPUT_SIZE[1], SSIM_INPUT_SIZE[0], 3), dtype=np.uint8)
         blank_mask = np.zeros((SSIM_INPUT_SIZE[1], SSIM_INPUT_SIZE[0]), dtype=bool)
         return blank, blank_mask
+
+
+def merge_fn_images_from_base(base_model_dir: Path, new_model_dir: Path) -> Dict[str, int]:
+    """
+    将旧模型的 FN 图片和 mask 合并到新模型目录。
+    返回 {pos_id: 已有文件数} 供后续保存新 FN 时递增索引。
+
+    Args:
+        base_model_dir: 旧模型目录（包含 fn_images/ 和 masks/fn/）
+        new_model_dir: 新模型目录
+
+    Returns:
+        pos_counters: {pos_id: 已有 npy 文件数量}
+    """
+    pos_counters: Dict[str, int] = {}
+
+    base_fn_dir = base_model_dir / "fn_images"
+    if not base_fn_dir.exists() or not base_fn_dir.is_dir():
+        return pos_counters
+
+    base_fn_masks_dir = base_model_dir / "masks" / "fn"
+    new_fn_dir = new_model_dir / "fn_images"
+    new_fn_masks_dir = new_model_dir / "masks" / "fn"
+    new_fn_dir.mkdir(parents=True, exist_ok=True)
+    new_fn_masks_dir.mkdir(parents=True, exist_ok=True)
+
+    for pos_dir in base_fn_dir.iterdir():
+        if not pos_dir.is_dir():
+            continue
+        pos_id = pos_dir.name
+
+        new_pos_dir = new_fn_dir / pos_id
+        new_pos_mask_dir = new_fn_masks_dir / pos_id
+        new_pos_dir.mkdir(parents=True, exist_ok=True)
+        new_pos_mask_dir.mkdir(parents=True, exist_ok=True)
+
+        # 复制 .npy FN 图片文件
+        npy_files = list(pos_dir.glob("*.npy"))
+        for npy_file in npy_files:
+            dst = new_pos_dir / npy_file.name
+            if not dst.exists():
+                shutil.copy2(str(npy_file), str(dst))
+
+        # 复制对应的 mask 文件
+        base_pos_mask_dir = base_fn_masks_dir / pos_id
+        if base_pos_mask_dir.exists():
+            for mask_file in base_pos_mask_dir.glob("*.npy"):
+                dst = new_pos_mask_dir / mask_file.name
+                if not dst.exists():
+                    shutil.copy2(str(mask_file), str(dst))
+
+        # 记录该 pos_id 已有的文件数量
+        pos_counters[pos_id] = len(list(new_pos_dir.glob("*.npy")))
+
+    return pos_counters
 
 
 def create_fn_only_simulated_task(
@@ -219,14 +274,14 @@ def create_fn_only_simulated_task(
             trainer._add_log(task_id, f"Stage 2/3: Saving {len(fn_images)} FN images (organized by pos_id)...")
 
             fn_images_dir = Path(save_dir) / "fn_images"
-            fn_images_dir.mkdir(parents=True, exist_ok=True)
-
-            # 创建 mask 保存目录
             fn_masks_dir = Path(save_dir) / "masks" / "fn"
-            fn_masks_dir.mkdir(parents=True, exist_ok=True)
 
+            # 先合并旧模型的 FN 图片，保证重训链上的 FN 不丢失
+            base_model_dir = Path(base_model_path).parent
+            pos_counters = merge_fn_images_from_base(base_model_dir, Path(save_dir))
+            # 用 defaultdict 包装，确保新 pos_id 从 0 开始计数
             from collections import defaultdict
-            pos_counters: Dict[str, int] = defaultdict(int)
+            _pos_counters: Dict[str, int] = defaultdict(int, pos_counters)
 
             for fn_img, fn_pos_id in fn_images:
                 try:
@@ -238,12 +293,12 @@ def create_fn_only_simulated_task(
                     pos_dir.mkdir(parents=True, exist_ok=True)
                     pos_mask_dir.mkdir(parents=True, exist_ok=True)
 
-                    idx = pos_counters[fn_pos_id]
-                    pos_counters[fn_pos_id] += 1
+                    idx = _pos_counters[fn_pos_id]
+                    _pos_counters[fn_pos_id] += 1
 
-                    # 保存 FN 图片
-                    fn_img_path = pos_dir / f"fn_{idx:04d}.jpg"
-                    cv2.imwrite(str(fn_img_path), fn_img_processed)
+                    # 保存 FN 图片（灰度 numpy 数组，避免 JPEG 压缩伪影）
+                    fn_img_path = pos_dir / f"fn_{idx:04d}.npy"
+                    np.save(str(fn_img_path), fn_img_processed)
 
                     # 保存 FN mask
                     fn_mask_path = pos_mask_dir / f"fn_{idx:04d}.npy"
@@ -925,7 +980,12 @@ async def incremental_retrain(request: RetrainRequest):
                     shutil.rmtree(str(template_variants_dst))
                 shutil.copytree(str(template_variants_src), str(template_variants_dst))
                 logger.info(f"path_id={path_id}: Copied template_variants directory")
-            
+
+            # 复制 fn_images 目录（SSIM 比对的 FN 样本）
+            fn_merged = merge_fn_images_from_base(base_model_dir, new_model_dir)
+            if fn_merged:
+                logger.info(f"path_id={path_id}: Merged {sum(fn_merged.values())} FN images from base version")
+
             # 如果没有找到任何模型文件，记录警告
             if not copied_files:
                 logger.warning(f"path_id={path_id}: No model files found in {base_model_dir}")
@@ -1043,6 +1103,7 @@ async def incremental_retrain(request: RetrainRequest):
                     logger.error(f"Failed to decode FN image[{idx}] for path_id={path_id}: {e}")
 
             path_task_ids = []
+            fn_already_saved = False  # 标记 FN 是否已由 create_fn_only_simulated_task 保存
 
             # ========== 处理 False Positives：微调 Dinomaly ==========
             if fp_images:
@@ -1108,6 +1169,7 @@ async def incremental_retrain(request: RetrainRequest):
                     path_task_ids = [fn_task_id]
                     all_task_ids.append(fn_task_id)
                     path_group_id = f"fn_only_{int(time.time())}_{path_id}"
+                    fn_already_saved = True  # create_fn_only_simulated_task 已保存 FN，避免重复
                 else:
                     # 既没有 FP 也没有 FN，直接复制原模型
                     logger.info(f"path_id={path_id}: No FP/FN data, copying model from base version")
@@ -1124,17 +1186,22 @@ async def incremental_retrain(request: RetrainRequest):
                             shutil.rmtree(str(template_variants_dst))
                         shutil.copytree(str(template_variants_src), str(template_variants_dst))
 
+                    # 复制 fn_images 目录（SSIM 比对 FN 样本）
+                    fn_merged = merge_fn_images_from_base(base_model_dir, new_model_dir)
+                    if fn_merged:
+                        logger.info(f"path_id={path_id}: Merged {sum(fn_merged.values())} FN images from base version")
+
             # 保存 FN 图片到模型目录，用于 SSIM 比对
             # 按 pos_id 分文件夹组织，确保推理时只与同位置的 FN 图片比较
-            if fn_images:
+            if fn_images and not fn_already_saved:
                 fn_images_dir = new_model_dir / "fn_images"
-                fn_images_dir.mkdir(parents=True, exist_ok=True)
                 fn_masks_dir = new_model_dir / "masks" / "fn"
-                fn_masks_dir.mkdir(parents=True, exist_ok=True)
-                logger.info(f"Starting to save {len(fn_images)} FN images to {fn_images_dir} (organized by pos_id)")
 
+                # 先合并旧模型的 FN 图片，保证重训链上的历史 FN 不丢失
+                pos_counters = merge_fn_images_from_base(base_model_dir, new_model_dir)
                 from collections import defaultdict
-                pos_counters: Dict[str, int] = defaultdict(int)
+                _pos_counters: Dict[str, int] = defaultdict(int, pos_counters)
+                logger.info(f"Starting to save {len(fn_images)} new FN images to {fn_images_dir} (merged {sum(pos_counters.values())} from base)")
 
                 for fn_img, fn_pos_id in fn_images:
                     try:
@@ -1147,11 +1214,11 @@ async def incremental_retrain(request: RetrainRequest):
                         pos_dir.mkdir(parents=True, exist_ok=True)
                         pos_mask_dir.mkdir(parents=True, exist_ok=True)
 
-                        idx = pos_counters[fn_pos_id]
-                        pos_counters[fn_pos_id] += 1
+                        idx = _pos_counters[fn_pos_id]
+                        _pos_counters[fn_pos_id] += 1
 
-                        fn_img_path = pos_dir / f"fn_{idx:04d}.jpg"
-                        cv2.imwrite(str(fn_img_path), fn_img_processed)
+                        fn_img_path = pos_dir / f"fn_{idx:04d}.npy"
+                        np.save(str(fn_img_path), fn_img_processed)
 
                         fn_mask_path = pos_mask_dir / f"fn_{idx:04d}.npy"
                         np.save(str(fn_mask_path), fn_mask)
@@ -1160,7 +1227,7 @@ async def incremental_retrain(request: RetrainRequest):
                     except Exception as e:
                         logger.error(f"Failed to save FN image for pos_id={fn_pos_id}: {e}", exc_info=True)
 
-                logger.info(f"path_id={path_id}: Saved {len(fn_images)} FN images across {len(pos_counters)} positions to {fn_images_dir}")
+                logger.info(f"path_id={path_id}: Saved {len(fn_images)} new FN images across {len(_pos_counters)} positions to {fn_images_dir}")
                 total_fn += len(fn_images)
 
             # 构建 group_ids 列表（用于前端轮询组状态）

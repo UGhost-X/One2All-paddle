@@ -759,8 +759,13 @@ class ModelTrainer:
         combined_paths: List[Path] = []
 
         base_images = sorted(
-            list(base_roi_dir.glob("*.png")) + list(base_roi_dir.glob("*.jpg"))
+            list(base_roi_dir.glob("base_*.png")) + list(base_roi_dir.glob("base_*.jpg"))
         )
+        if not base_images:
+            # 回退：如果没有 base_ 前缀文件（初次训练的原始数据），读取所有文件
+            base_images = sorted(
+                list(base_roi_dir.glob("*.png")) + list(base_roi_dir.glob("*.jpg"))
+            )
         if not base_images:
             self._add_log(task_id, f"WARNING: base_roi_dir is empty: {base_roi_dir}")
 
@@ -908,6 +913,48 @@ class ModelTrainer:
         )
         return combined_paths
 
+    def _load_annotations_for_path_id(
+        self,
+        task_id: str,
+        dataset_dir: str,
+        path_id: str,
+        train_mode: str = "by_pos_id",
+    ) -> List[Dict]:
+        """
+        从 dataset_dir/annotations.json 中筛选匹配指定 path_id 的标注。
+
+        用于重训时 base_roi_dir 缺失的回退场景：
+        根据 train_mode 选择匹配字段（by_category → category_id, by_pos_id → pos_id）。
+        """
+        annotations_path = Path(dataset_dir) / "annotations.json"
+        if not annotations_path.exists():
+            self._add_log(task_id, f"annotations.json not found in {dataset_dir}")
+            return []
+
+        try:
+            with open(annotations_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            self._add_log(task_id, f"Failed to read annotations.json: {e}")
+            return []
+
+        all_annotations = data.get("annotations", [])
+        filtered = []
+        for ann in all_annotations:
+            if train_mode == "by_category":
+                if str(ann.get("category_id", 0)) == str(path_id):
+                    filtered.append(ann)
+            else:  # by_pos_id or default
+                if str(ann.get("pos_id", "")) == str(path_id):
+                    filtered.append(ann)
+
+        self._add_log(
+            task_id,
+            f"Loaded {len(filtered)} annotations for path_id={path_id} "
+            f"(train_mode={train_mode}, total={len(all_annotations)})"
+        )
+        return filtered
+
     # ==================== Dinomaly 训练 ====================
 
     def _do_train_dinomaly(
@@ -1009,51 +1056,128 @@ class ModelTrainer:
 
                 self._add_log(task_id, f"[FP Retrain] mode: base_roi_dir={base_roi_dir}, fp_aug={num_fp_augmentations}x")
 
+                # 检查 base_roi_dir 是否存在（可能因上一轮是纯 FN 重训而没有 roi 目录）
                 if not base_roi_dir.exists():
-                    raise ValueError(f"base_roi_dir does not exist: {base_roi_dir}")
+                    self._add_log(task_id, f"[FP Retrain] base_roi_dir not found, falling back to annotation-based extraction")
+                    # 回退：从 dataset_dir 的 annotations.json 中提取匹配当前 path_id 的 ROI
+                    filtered_anns = self._load_annotations_for_path_id(
+                        task_id=task_id,
+                        dataset_dir=str(dataset_dir),
+                        path_id=str(path_id),
+                        train_mode=train_mode,
+                    )
+                    if filtered_anns:
+                        image_paths = extract_roi_images(
+                            dataset_dir=str(dataset_dir),
+                            output_dir=str(roi_save_dir),
+                            mask_output_dir=str(mask_save_dir),
+                            group_annotations=filtered_anns,
+                            normalize_brightness=normalize_brightness,
+                            normalize_contrast=normalize_contrast,
+                            augment=False,
+                            num_augmentations=1,
+                            train_mode=train_mode,
+                            augmentation_config=augmentation_config,
+                        )
+                        n_base = len(filtered_anns)
+                        self._add_log(task_id, f"[FP Retrain] Extracted {len(image_paths)} base ROI images from annotations (n_base={n_base})")
+                    else:
+                        n_base = 0
+                        image_paths = []
+                        self._add_log(task_id, f"[FP Retrain] WARNING: No annotations found for path_id={path_id}")
 
-                # 计算数据比例，防止 FP 增强过多导致分布偏移
-                n_base = len(list(base_roi_dir.glob("*.png")) + list(base_roi_dir.glob("*.jpg")))
-                n_fp_raw = len(group_annotations)
-
-                if n_fp_raw == 0:
+                    # 对 FP 图片进行增强（由 retrain 端点预存到 roi_save_dir 的 fp_*.jpg）
                     fp_images_in_dir = list(roi_save_dir.glob("fp_*.jpg")) + list(roi_save_dir.glob("fp_*.png"))
                     n_fp_raw = len(fp_images_in_dir)
-                    if n_fp_raw > 0:
-                        self._add_log(task_id, f"[FP Retrain] Found {n_fp_raw} pre-existing FP images in {roi_save_dir}")
+                    if n_fp_raw > 0 and n_base > 0:
+                        # 增强 FP 图片：使用 _prepare_fp_combined_dataset 但 base_roi_dir 指向
+                        # 已提取好的 roi_save_dir，且只处理 fp_ 前缀文件
+                        max_fp_aug_total = int(n_base * 0.5)
+                        if n_fp_raw * num_fp_augmentations > max_fp_aug_total:
+                            safe_aug_per_fp = max(1, max_fp_aug_total // n_fp_raw)
+                            self._add_log(task_id, f"[FP Retrain] FP aug capped: {num_fp_augmentations} → {safe_aug_per_fp} per image (base={n_base}, fp_raw={n_fp_raw}, limit={max_fp_aug_total})")
+                            num_fp_augmentations = safe_aug_per_fp
 
-                if n_fp_raw > 0:
-                    max_fp_aug_total = int(n_base * 0.5)
-                    if n_fp_raw * num_fp_augmentations > max_fp_aug_total:
-                        safe_aug_per_fp = max(1, max_fp_aug_total // n_fp_raw)
-                        self._add_log(task_id, f"[FP Retrain] FP aug capped: {num_fp_augmentations} → {safe_aug_per_fp} per image (base={n_base}, fp_raw={n_fp_raw}, limit={max_fp_aug_total})")
-                        num_fp_augmentations = safe_aug_per_fp
+                        augment_transform = load_augmentation_transform(augmentation_config)
+                        for fp_img_path in fp_images_in_dir:
+                            try:
+                                roi_image = Image.open(fp_img_path).convert("RGB")
+                                roi_image, roi_mask = letterbox_resize(roi_image, (224, 224))
+                                file_stem = fp_img_path.stem
+                                # 保存原图
+                                orig_path = roi_save_dir / f"{file_stem}.png"
+                                if not orig_path.exists():
+                                    roi_image.save(orig_path)
+                                image_paths.append(orig_path)
+                                np.save(mask_save_dir / f"{file_stem}.npy", roi_mask)
+                                # 生成增强变体
+                                for i in range(num_fp_augmentations - 1):
+                                    if augment_transform:
+                                        aug_image = apply_augmentation(roi_image, augment_transform)
+                                    else:
+                                        aug_image = roi_image
+                                    aug_path = roi_save_dir / f"{file_stem}_aug{i:04d}.png"
+                                    aug_image.save(aug_path)
+                                    image_paths.append(aug_path)
+                                    np.save(mask_save_dir / f"{file_stem}_aug{i:04d}.npy", roi_mask)
+                            except Exception as e:
+                                self._add_log(task_id, f"ERROR: Failed to augment FP image {fp_img_path.name}: {e}")
 
-                # 直接使用 roi/{path_id} 和 masks/{path_id} 作为输出目录
-                # 1. 先复制基础模型 ROI 到当前 roi 目录
-                # 2. 然后对 FP 图片进行增强，也保存到 roi 目录
-                image_paths = self._prepare_fp_combined_dataset(
-                    task_id=task_id,
-                    base_roi_dir=base_roi_dir,
-                    fp_group_annotations=group_annotations,
-                    dataset_dir=dataset_dir,
-                    output_dir=roi_save_dir,
-                    mask_output_dir=mask_save_dir,
-                    num_fp_augmentations=num_fp_augmentations,
-                    normalize_brightness_flag=normalize_brightness,
-                    normalize_contrast_flag=normalize_contrast,
-                    augmentation_config=augmentation_config,
-                    fp_image_dir=roi_save_dir,
-                )
+                        n_fp_total = n_fp_raw * num_fp_augmentations
+                        self._add_log(task_id, f"[FP Retrain] FP augmentation: {n_fp_raw} × {num_fp_augmentations} = {n_fp_total} images")
+                    elif n_fp_raw == 0:
+                        self._add_log(task_id, f"[FP Retrain] No FP images found in {roi_save_dir}")
 
-                n_total = len(image_paths)
-                if n_total > n_base * 1.5:
-                    actual_epochs = max(8, epochs - 2)
-                    self._add_log(task_id, f"[FP Retrain] Large dataset ({n_total} imgs), reducing epochs: {epochs} → {actual_epochs}")
-                else:
+                    n_total = len(image_paths)
                     actual_epochs = epochs
+                    self._add_log(task_id, f"[FP Retrain] Fallback training with {n_total} images, epochs={actual_epochs}")
 
-                self._add_log(task_id, f"[FP Retrain] Training with {len(image_paths)} images, epochs={actual_epochs}")
+                else:
+                    # 正常 FP 重训路径：base_roi_dir 存在
+                    # 只统计 base_* 前缀文件（排除上次重训混入的 fp_* 文件）
+                    n_base = len(list(base_roi_dir.glob("base_*.png")) + list(base_roi_dir.glob("base_*.jpg")))
+                    if n_base == 0:
+                        # 回退：初次训练数据没有 base_ 前缀
+                        n_base = len(list(base_roi_dir.glob("*.png")) + list(base_roi_dir.glob("*.jpg")))
+                    n_fp_raw = len(group_annotations)
+
+                    if n_fp_raw == 0:
+                        fp_images_in_dir = list(roi_save_dir.glob("fp_*.jpg")) + list(roi_save_dir.glob("fp_*.png"))
+                        n_fp_raw = len(fp_images_in_dir)
+                        if n_fp_raw > 0:
+                            self._add_log(task_id, f"[FP Retrain] Found {n_fp_raw} pre-existing FP images in {roi_save_dir}")
+
+                    if n_fp_raw > 0:
+                        max_fp_aug_total = int(n_base * 0.5)
+                        if n_fp_raw * num_fp_augmentations > max_fp_aug_total:
+                            safe_aug_per_fp = max(1, max_fp_aug_total // n_fp_raw)
+                            self._add_log(task_id, f"[FP Retrain] FP aug capped: {num_fp_augmentations} → {safe_aug_per_fp} per image (base={n_base}, fp_raw={n_fp_raw}, limit={max_fp_aug_total})")
+                            num_fp_augmentations = safe_aug_per_fp
+
+                    # 1. 先复制基础模型 ROI 到当前 roi 目录
+                    # 2. 然后对 FP 图片进行增强，也保存到 roi 目录
+                    image_paths = self._prepare_fp_combined_dataset(
+                        task_id=task_id,
+                        base_roi_dir=base_roi_dir,
+                        fp_group_annotations=group_annotations,
+                        dataset_dir=dataset_dir,
+                        output_dir=roi_save_dir,
+                        mask_output_dir=mask_save_dir,
+                        num_fp_augmentations=num_fp_augmentations,
+                        normalize_brightness_flag=normalize_brightness,
+                        normalize_contrast_flag=normalize_contrast,
+                        augmentation_config=augmentation_config,
+                        fp_image_dir=roi_save_dir,
+                    )
+
+                    n_total = len(image_paths)
+                    if n_total > n_base * 1.5:
+                        actual_epochs = max(8, epochs - 2)
+                        self._add_log(task_id, f"[FP Retrain] Large dataset ({n_total} imgs), reducing epochs: {epochs} → {actual_epochs}")
+                    else:
+                        actual_epochs = epochs
+
+                    self._add_log(task_id, f"[FP Retrain] Training with {len(image_paths)} images, epochs={actual_epochs}")
 
             else:
                 # 初次训练：从 raw_images 提取 ROI

@@ -85,6 +85,45 @@ def letterbox_resize(
     return img_padded, mask
 
 
+def letterbox_resize_cv2(
+    img_np: np.ndarray,
+    target_size: Tuple[int, int],
+    fill_color: Tuple[int, int, int] = (0, 0, 0),
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    cv2/numpy 版 letterbox_resize，避免 PIL Image 创建/粘贴开销。
+    直接操作 numpy 数组，在热路径 (_preprocess_rois_to_batch) 中替代 PIL 版本。
+
+    Args:
+        img_np: RGB numpy 数组 (H, W, 3), uint8
+        target_size: (H, W)
+        fill_color: RGB 填充色
+
+    Returns:
+        img_padded: numpy 数组 (target_size[0], target_size[1], 3), uint8
+        mask: bool 数组 (target_size[0], target_size[1]), True=有效像素
+    """
+    h, w = img_np.shape[:2]
+    th, tw = target_size
+
+    scale = min(tw / w, th / h)
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+
+    img_resized = cv2.resize(img_np, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+    pad_left = (tw - new_w) // 2
+    pad_top = (th - new_h) // 2
+
+    img_padded = np.full((th, tw, 3), fill_color, dtype=np.uint8)
+    img_padded[pad_top:pad_top + new_h, pad_left:pad_left + new_w] = img_resized
+
+    mask = np.zeros((th, tw), dtype=bool)
+    mask[pad_top:pad_top + new_h, pad_left:pad_left + new_w] = True
+
+    return img_padded, mask
+
+
 class ExecutorManager:
     def __init__(self, max_workers: int = 1):
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
@@ -142,8 +181,8 @@ async def async_save_roi(roi: np.ndarray, pos_id: str, category_name: str, wp_id
 # 日志配置
 # ─────────────────────────────────────────────────────────────────────────────
 
-LOG_DIR = Path("logs")
-LOG_DIR.mkdir(exist_ok=True)
+LOG_DIR = Path("/home/software/One2All-paddle/logs")
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = LOG_DIR / f"service_{{ service_id }}_{datetime.now().strftime('%Y%m%d')}.log"
 
 file_handler = logging.handlers.RotatingFileHandler(
@@ -315,8 +354,9 @@ _DinoV2Loader.__init__ = _patched_dinov2loader_init
 class DinomalyWrapper:
     """Dinomaly 推理包装器"""
 
-    # SSIM 阈值：如果 SSIM 得分大于此值，直接判定为异常
+    # SSIM 阈值：如果 top-k 平均 SSIM 得分大于此值，判定为异常
     SSIM_THRESHOLD = 0.6
+    SSIM_TOP_K = 3  # 取 top-k 张 FN 图片的 SSIM 平均值，避免单张幸运匹配
 
     def __init__(self, device: str = "cuda"):
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
@@ -404,22 +444,39 @@ class DinomalyWrapper:
         # 检查是否按 pos_id 分文件夹（新格式）还是扁平结构（旧格式兼容）
         subdirs = [d for d in fn_dir.iterdir() if d.is_dir()]
         if subdirs:
-            # 新格式：fn_images/{pos_id}/fn_xxxx.jpg
+            # 新格式：fn_images/{pos_id}/fn_xxxx.npy（灰度 numpy 数组）
             for pos_dir in sorted(subdirs):
                 pos_id = pos_dir.name
+                # .npy 优先：避免同一 stem 的 .npy 和 .jpg 重复加载
+                npy_files = sorted(pos_dir.glob("*.npy"))
+                npy_stems = {f.stem for f in npy_files}
                 jpg_files = sorted(pos_dir.glob("*.jpg"))
-                logger.info(f"[SSIM] pos_id={pos_id}: Found {len(jpg_files)} FN images")
+                legacy_jpg = [f for f in jpg_files if f.stem not in npy_stems]
+                all_files = npy_files + legacy_jpg
+                if len(legacy_jpg) < len(jpg_files):
+                    skipped = len(jpg_files) - len(legacy_jpg)
+                    logger.info(f"[SSIM] pos_id={pos_id}: Found {len(npy_files)} npy + {len(legacy_jpg)} jpg FN images (skipped {skipped} duplicate jpg)")
+                else:
+                    logger.info(f"[SSIM] pos_id={pos_id}: Found {len(npy_files)} npy + {len(legacy_jpg)} jpg FN images")
 
                 images = []
                 masks = []
                 pos_mask_dir = fn_masks_dir / pos_id
 
-                for img_path in jpg_files:
+                for img_path in all_files:
                     try:
-                        img = cv2.imread(str(img_path))
-                        if img is None:
-                            logger.warning(f"[SSIM] Failed to read FN image: {img_path}")
-                            continue
+                        # 加载图像：优先 .npy（灰度数组），其次 .jpg（BGR 图片）
+                        if img_path.suffix == '.npy':
+                            gray = np.load(str(img_path))
+                        else:
+                            img = cv2.imread(str(img_path))
+                            if img is None:
+                                logger.warning(f"[SSIM] Failed to read FN image: {img_path}")
+                                continue
+                            if len(img.shape) == 3:
+                                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                            else:
+                                gray = img
 
                         mask = None
                         mask_path = pos_mask_dir / f"{img_path.stem}.npy"
@@ -435,11 +492,7 @@ class DinomalyWrapper:
                         if mask is None:
                             mask = np.ones((self.input_size[1], self.input_size[0]), dtype=bool)
 
-                        # 预处理为灰度图并统一尺寸，缓存供 SSIM 计算直接使用
-                        if len(img.shape) == 3:
-                            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                        else:
-                            gray = img
+                        # 统一尺寸
                         if gray.shape != (self.input_size[1], self.input_size[0]):
                             gray = cv2.resize(gray, self.input_size)
                         images.append(gray)
@@ -453,17 +506,29 @@ class DinomalyWrapper:
                     self.fn_masks_by_pos[pos_id] = masks
                     logger.info(f"[SSIM] Loaded {len(images)} FN images for pos_id={pos_id}")
         else:
-            # 旧格式兼容：fn_images/fn_xxxx.jpg（扁平结构，所有图片归到 "default" pos_id）
+            # 旧格式兼容：fn_images/fn_xxxx.npy 或 fn_xxxx.jpg（扁平结构，图片归到 "default" pos_id）
+            npy_files = sorted(fn_dir.glob("*.npy"))
+            npy_stems = {f.stem for f in npy_files}
             jpg_files = sorted(fn_dir.glob("*.jpg"))
-            logger.info(f"[SSIM] Legacy format: Found {len(jpg_files)} FN images (will use pos_id='default')")
+            legacy_jpg = [f for f in jpg_files if f.stem not in npy_stems]
+            all_files = npy_files + legacy_jpg
+            skipped = len(jpg_files) - len(legacy_jpg)
+            logger.info(f"[SSIM] Legacy format: Found {len(npy_files)} npy + {len(legacy_jpg)} jpg FN images (skipped {skipped} duplicate jpg, will use pos_id='default')")
 
             images = []
             masks = []
-            for img_path in jpg_files:
+            for img_path in all_files:
                 try:
-                    img = cv2.imread(str(img_path))
-                    if img is None:
-                        continue
+                    if img_path.suffix == '.npy':
+                        gray = np.load(str(img_path))
+                    else:
+                        img = cv2.imread(str(img_path))
+                        if img is None:
+                            continue
+                        if len(img.shape) == 3:
+                            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                        else:
+                            gray = img
 
                     mask = None
                     mask_path = fn_masks_dir / f"{img_path.stem}.npy"
@@ -476,11 +541,7 @@ class DinomalyWrapper:
                     if mask is None:
                         mask = np.ones((self.input_size[1], self.input_size[0]), dtype=bool)
 
-                    # 预处理为灰度图并统一尺寸，缓存供 SSIM 计算直接使用
-                    if len(img.shape) == 3:
-                        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                    else:
-                        gray = img
+                    # 统一尺寸
                     if gray.shape != (self.input_size[1], self.input_size[0]):
                         gray = cv2.resize(gray, self.input_size)
                     images.append(gray)
@@ -499,11 +560,87 @@ class DinomalyWrapper:
         else:
             logger.warning(f"[SSIM] No valid FN images loaded from {fn_dir}")
 
+    def _save_ssim_visualization(self, roi_gray: np.ndarray, fn_gray: np.ndarray,
+                                  roi_mask: np.ndarray, fn_mask: np.ndarray,
+                                  ssim_score: float, idx: int = 0, pos_id: str = None):
+        """保存 SSIM 对比可视化图片到日志目录"""
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+
+            # 计算 mask 的交集
+            valid_mask = roi_mask & fn_mask
+
+            # 裁剪到有效区域
+            rows = np.any(valid_mask, axis=1)
+            cols = np.any(valid_mask, axis=0)
+            if not np.any(rows) or not np.any(cols):
+                return
+            rmin, rmax = np.where(rows)[0][[0, -1]]
+            cmin, cmax = np.where(cols)[0][[0, -1]]
+
+            roi_crop = roi_gray[rmin:rmax+1, cmin:cmax+1]
+            fn_crop = fn_gray[rmin:rmax+1, cmin:cmax+1]
+
+            # 计算差异图
+            diff = np.abs(roi_crop.astype(float) - fn_crop.astype(float))
+
+            # 创建可视化
+            fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+            fig.suptitle(f'SSIM Comparison - Score: {ssim_score:.4f}', fontsize=14)
+
+            # ROI 图片
+            axes[0, 0].imshow(roi_crop, cmap='gray')
+            axes[0, 0].set_title('Input ROI')
+            axes[0, 0].axis('off')
+
+            # FN 图片
+            axes[0, 1].imshow(fn_crop, cmap='gray')
+            axes[0, 1].set_title('FN Image')
+            axes[0, 1].axis('off')
+
+            # 差异热力图
+            im = axes[1, 0].imshow(diff, cmap='hot', vmin=0, vmax=255)
+            axes[1, 0].set_title('Difference Map')
+            axes[1, 0].axis('off')
+            plt.colorbar(im, ax=axes[1, 0], fraction=0.046, pad=0.04)
+
+            # 叠加对比
+            axes[1, 1].imshow(roi_crop, cmap='gray', alpha=0.5)
+            axes[1, 1].imshow(fn_crop, cmap='gray', alpha=0.5)
+            axes[1, 1].set_title('Overlay (ROI + FN)')
+            axes[1, 1].axis('off')
+
+            plt.tight_layout()
+
+            # 保存图片
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            pos_str = f"_{pos_id}" if pos_id else ""
+            filename = f"ssim_viz{pos_str}_fn{idx}_{timestamp}_score{ssim_score:.4f}.png"
+            save_path = LOG_DIR / filename
+            plt.savefig(str(save_path), dpi=150, bbox_inches='tight')
+            plt.close(fig)
+
+            logger.info(f"[SSIM_VIZ] Saved visualization to {save_path}")
+        except Exception as e:
+            logger.warning(f"[SSIM_VIZ] Failed to save visualization: {e}")
+
     def calculate_ssim(self, roi_gray: np.ndarray, fn_gray: np.ndarray,
-                       roi_mask: np.ndarray = None, fn_mask: np.ndarray = None) -> float:
+                       roi_mask: np.ndarray = None, fn_mask: np.ndarray = None,
+                       save_viz: bool = False, viz_idx: int = 0, pos_id: str = None) -> float:
         """
         计算 ROI 与 FN 图片的 SSIM 相似度（标准滑动窗口法），只比较有效区域。
         roi_gray / fn_gray 应为已预处理的灰度图，尺寸一致 (224×224)。
+
+        Args:
+            roi_gray: ROI 灰度图
+            fn_gray: FN 灰度图
+            roi_mask: ROI 有效区域 mask
+            fn_mask: FN 有效区域 mask
+            save_viz: 是否保存可视化图片
+            viz_idx: 可视化图片索引
+            pos_id: 位置 ID，用于文件名
 
         Returns:
             SSIM 得分 (0-1, 1 表示完全相同)
@@ -547,6 +684,11 @@ class DinomalyWrapper:
             win_size = min(7, min_side if min_side % 2 == 1 else min_side - 1)
             ssim_value = ssim(roi_crop, fn_crop, data_range=255, win_size=win_size)
 
+            # 保存可视化（如果启用）
+            if save_viz:
+                self._save_ssim_visualization(roi_gray, fn_gray, roi_mask, fn_mask,
+                                              ssim_value, viz_idx, pos_id)
+
             return float(ssim_value)
 
         except Exception as e:
@@ -555,16 +697,17 @@ class DinomalyWrapper:
 
     def check_ssim_anomaly(self, roi: np.ndarray, pos_id: str = None) -> Tuple[bool, float]:
         """
-        使用 SSIM 检查 ROI 是否与同位置的 FN 图片相似
+        使用 SSIM 检查 ROI 是否与同位置的 FN 图片相似。
+        取 top-k 张 FN 图片的 SSIM 平均值，避免单张幸运匹配导致误判。
 
         Args:
             roi: 输入 ROI
             pos_id: 位置 ID，用于匹配同位置的 FN 图片。为 None 时使用所有 FN 图片。
 
         Returns:
-            (is_anomaly, max_ssim_score)
-            - is_anomaly: 如果最大 SSIM > SSIM_THRESHOLD 返回 True
-            - max_ssim_score: 最大 SSIM 得分
+            (is_anomaly, avg_ssim_score)
+            - is_anomaly: 如果 top-k 平均 SSIM > SSIM_THRESHOLD 返回 True
+            - avg_ssim_score: top-k 平均 SSIM 得分
         """
         if not self.fn_images_by_pos or not SSIM_AVAILABLE:
             return False, 0.0
@@ -596,19 +739,32 @@ class DinomalyWrapper:
         # 对 ROI 进行预处理（与 FN 图片保存时的预处理一致），同时获取 mask
         roi_processed, roi_mask = self._preprocess_for_ssim(roi)
 
-        max_ssim = 0.0
+        all_scores = []
         roi_shape = roi.shape if roi is not None else "None"
         processed_shape = roi_processed.shape
         logger.debug(f"[SSIM] Checking anomaly for ROI shape={roi_shape} -> processed={processed_shape}, pos_id={pos_id}, FN images={len(fn_images)}")
 
         for idx, (fn_img, fn_mask) in enumerate(zip(fn_images, fn_masks)):
-            ssim_score = self.calculate_ssim(roi_processed, fn_img, roi_mask, fn_mask)
-            max_ssim = max(max_ssim, ssim_score)
-            logger.debug(f"[SSIM] Compared with FN[{idx}]: score={ssim_score:.4f}, max_so_far={max_ssim:.4f}")
+            ssim_score = self.calculate_ssim(roi_processed, fn_img, roi_mask, fn_mask,
+                                              save_viz=False, viz_idx=idx, pos_id=pos_id)
+            all_scores.append(ssim_score)
+            logger.debug(f"[SSIM] Compared with FN[{idx}]: score={ssim_score:.4f}")
 
-        is_anomaly = max_ssim > self.SSIM_THRESHOLD
-        logger.info(f"[SSIM] Result: pos_id={pos_id}, max_score={max_ssim:.4f}, threshold={self.SSIM_THRESHOLD}, is_anomaly={is_anomaly}")
-        return is_anomaly, max_ssim
+        # 取 top-k 平均，比单张 max 更鲁棒
+        k = min(self.SSIM_TOP_K, len(all_scores))
+        top_k_scores = sorted(all_scores, reverse=True)[:k]
+        avg_ssim = sum(top_k_scores) / len(top_k_scores)
+
+        # 调试可视化默认关闭（matplotlib 保存耗时 0.5-2s），需要时设置环境变量启用
+        if top_k_scores and os.environ.get("SSIM_DEBUG_VIZ"):
+            top1_score = top_k_scores[0]
+            top1_idx = all_scores.index(top1_score)
+            self.calculate_ssim(roi_processed, fn_images[top1_idx], roi_mask, fn_masks[top1_idx],
+                                save_viz=True, viz_idx=top1_idx, pos_id=pos_id)
+
+        is_anomaly = avg_ssim > self.SSIM_THRESHOLD
+        logger.info(f"[SSIM] Result: pos_id={pos_id}, top{k}_avg={avg_ssim:.4f} (scores={[f'{s:.4f}' for s in top_k_scores]}), threshold={self.SSIM_THRESHOLD}, is_anomaly={is_anomaly}")
+        return is_anomaly, avg_ssim
 
     def load_config(self, config_path: str):
         """加载配置文件"""
@@ -648,12 +804,7 @@ class DinomalyWrapper:
         if target_size is None:
             target_size = getattr(self, 'target_size', None)
 
-        # 首先使用 SSIM 检查是否与同位置的 FN 图片相似
-        is_ssim_anomaly, ssim_score = self.check_ssim_anomaly(roi, pos_id=pos_id)
-        if is_ssim_anomaly:
-            logger.info(f"[SSIM] Anomaly detected with score {ssim_score:.4f} > {self.SSIM_THRESHOLD}")
-            return {"error": 1.0, "infer_failed": False, "ssim_score": float(ssim_score), "ssim_anomaly": True}
-
+        # 首先使用 Dinomaly 进行推理
         try:
             # 直接预处理为 tensor，跳过磁盘 I/O
             image_batch, masks = self._preprocess_rois_to_batch(
@@ -669,8 +820,20 @@ class DinomalyWrapper:
 
             # 提取分数
             score = self._extract_score_with_mask([output], masks[0])
+            dinomaly_score = float(score)
 
-            return {"error": float(score), "infer_failed": False, "ssim_score": float(ssim_score)}
+            # 如果 Dinomaly 已判定为异常，跳过 SSIM 检查
+            if dinomaly_score > self.threshold:
+                logger.info(f"[Dinomaly] Anomaly detected: dinomaly={dinomaly_score:.4f} > threshold={self.threshold:.4f}, skip SSIM")
+                return {"error": dinomaly_score, "infer_failed": False, "ssim_score": 0.0, "dinomaly_score": dinomaly_score}
+
+            # Dinomaly 判定正常，再使用 SSIM 检查是否与同位置的 FN 图片相似
+            is_ssim_anomaly, ssim_score = self.check_ssim_anomaly(roi, pos_id=pos_id)
+            if is_ssim_anomaly:
+                logger.info(f"[SSIM] Anomaly detected: dinomaly={dinomaly_score:.4f}, ssim={ssim_score:.4f} > {self.SSIM_THRESHOLD}")
+                return {"error": 1.0, "infer_failed": False, "ssim_score": float(ssim_score), "ssim_anomaly": True, "dinomaly_score": dinomaly_score}
+
+            return {"error": dinomaly_score, "infer_failed": False, "ssim_score": float(ssim_score), "dinomaly_score": dinomaly_score}
 
         except Exception as e:
             logger.error(f"[DinomalyWrapper] inference failed: {e}")
@@ -695,49 +858,14 @@ class DinomalyWrapper:
         if target_size is None:
             target_size = getattr(self, 'target_size', None)
 
-        # 首先使用 SSIM 检查每个 ROI（按 pos_id 匹配同位置的 FN 图片）
-        ssim_results = []
-        rois_for_dinomaly = []
-        roi_indices = []
-
-        for i, roi in enumerate(rois):
-            pos_id = pos_ids[i] if pos_ids and i < len(pos_ids) else None
-            is_ssim_anomaly, ssim_score = self.check_ssim_anomaly(roi, pos_id=pos_id)
-            ssim_results.append({
-                "index": i,
-                "is_ssim_anomaly": is_ssim_anomaly,
-                "ssim_score": ssim_score
-            })
-            if not is_ssim_anomaly:
-                rois_for_dinomaly.append(roi)
-                roi_indices.append(i)
-
-        # 如果有 SSIM 检测为异常的，记录日志
-        ssim_anomaly_count = sum(1 for r in ssim_results if r["is_ssim_anomaly"])
-        if ssim_anomaly_count > 0:
-            logger.info(f"[SSIM] {ssim_anomaly_count}/{len(rois)} ROIs detected as anomaly by SSIM")
-
-        # 初始化结果列表（使用列表推导式创建独立字典）
+        # 初始化结果列表
         results = [{"error": 0.0, "infer_failed": True, "ssim_score": 0.0} for _ in range(len(rois))]
 
-        # 填充 SSIM 异常的结果
-        for r in ssim_results:
-            if r["is_ssim_anomaly"]:
-                results[r["index"]] = {
-                    "error": 1.0,
-                    "infer_failed": False,
-                    "ssim_score": float(r["ssim_score"]),
-                    "ssim_anomaly": True
-                }
-
-        # 如果没有需要 Dinomaly 推理的 ROI，直接返回
-        if not rois_for_dinomaly:
-            return results
-
+        # 首先使用 Dinomaly 对所有 ROI 进行批量推理
         try:
             # 直接预处理为 tensor batch，跳过磁盘 I/O
             image_batch, masks = self._preprocess_rois_to_batch(
-                rois_for_dinomaly, target_size, normalize_brightness, normalize_contrast
+                rois, target_size, normalize_brightness, normalize_contrast
             )
 
             if image_batch is None:
@@ -747,32 +875,54 @@ class DinomalyWrapper:
             with torch.no_grad():
                 output = self.model.model(image_batch)
 
-            # 提取分数（复用现有方法，InferenceBatch 兼容 _extract_scores_with_masks）
+            # 提取分数
             scores = self._extract_scores_with_masks([output], masks)
 
             # 填充 Dinomaly 推理结果
-            for idx_in_batch, original_idx in enumerate(roi_indices):
-                ssim_score = ssim_results[original_idx]["ssim_score"]
-                if idx_in_batch < len(scores):
-                    results[original_idx] = {
-                        "error": float(scores[idx_in_batch]),
+            for i in range(len(rois)):
+                if i < len(scores):
+                    dinomaly_score = float(scores[i])
+                    results[i] = {
+                        "error": dinomaly_score,
                         "infer_failed": False,
-                        "ssim_score": float(ssim_score)
+                        "ssim_score": 0.0,
+                        "dinomaly_score": dinomaly_score
                     }
-
-            return results
 
         except Exception as e:
             logger.error(f"[DinomalyWrapper] batch inference failed: {e}")
-            # 异常时，保留已计算的 SSIM 结果，将未处理的 ROI 标记为失败
-            for i in range(len(rois)):
-                if results[i].get("infer_failed", False) and not results[i].get("ssim_anomaly", False):
-                    results[i] = {
-                        "error": 0.0,
-                        "infer_failed": True,
-                        "ssim_score": ssim_results[i]["ssim_score"]
-                    }
             return results
+
+        # 对 Dinomaly 判定为正常的 ROI，再使用 SSIM 检查
+        dinomaly_normal_count = 0
+        for i, roi in enumerate(rois):
+            if results[i].get("infer_failed", True):
+                continue
+            dinomaly_score = results[i]["error"]
+            if dinomaly_score > self.threshold:
+                logger.debug(f"[Dinomaly] ROI[{i}] anomaly detected, skip SSIM: score={dinomaly_score:.4f} > {self.threshold:.4f}")
+                continue
+
+            # Dinomaly 判定正常，进行 SSIM 检查
+            dinomaly_normal_count += 1
+            pos_id = pos_ids[i] if pos_ids and i < len(pos_ids) else None
+            is_ssim_anomaly, ssim_score = self.check_ssim_anomaly(roi, pos_id=pos_id)
+            results[i]["ssim_score"] = float(ssim_score)
+            if is_ssim_anomaly:
+                logger.info(f"[SSIM] ROI[{i}] anomaly detected: dinomaly={dinomaly_score:.4f}, ssim={ssim_score:.4f} > {self.SSIM_THRESHOLD}")
+                results[i] = {
+                    "error": 1.0,
+                    "infer_failed": False,
+                    "ssim_score": float(ssim_score),
+                    "ssim_anomaly": True,
+                    "dinomaly_score": dinomaly_score
+                }
+
+        if dinomaly_normal_count > 0:
+            ssim_anomaly_count = sum(1 for r in results if r.get("ssim_anomaly", False))
+            logger.info(f"[SSIM] Checked {dinomaly_normal_count} Dinomaly-normal ROIs, {ssim_anomaly_count} SSIM anomalies found")
+
+        return results
 
     def infer_batch_direct(self, rois: List[np.ndarray],
                            target_size: Tuple[int, int] = None,
@@ -836,6 +986,35 @@ class DinomalyWrapper:
             scale = target_mean / current_mean
             arr[hole_mask] = np.clip(arr[hole_mask] * scale, 0, 255)
         return Image.fromarray(arr.astype(np.uint8))
+
+    @staticmethod
+    def _normalize_brightness_np(img_np: np.ndarray, target_mean: float = 168.0, threshold: int = 10) -> np.ndarray:
+        """numpy 原生亮度归一化，避免 PIL 往返。热路径优化版。"""
+        arr = img_np.astype(np.float32)
+        brightness = arr.mean(axis=2) if len(arr.shape) == 3 else arr
+        hole_mask = brightness > threshold
+        if np.sum(hole_mask) == 0:
+            return img_np
+        current_mean = arr[hole_mask].mean()
+        if current_mean > 0:
+            scale = target_mean / current_mean
+            arr[hole_mask] = np.clip(arr[hole_mask] * scale, 0, 255)
+        return arr.astype(np.uint8)
+
+    @staticmethod
+    def _autocontrast_np(img_np: np.ndarray, cutoff: float = 0.0) -> np.ndarray:
+        """numpy 原生自动对比度，等价于 PIL ImageOps.autocontrast。热路径优化版。"""
+        arr = img_np.astype(np.float32)
+        for c in range(arr.shape[2]):
+            channel = arr[:, :, c]
+            if cutoff > 0:
+                lo, hi = np.percentile(channel, [cutoff, 100 - cutoff])
+            else:
+                lo, hi = channel.min(), channel.max()
+            if hi > lo:
+                channel = np.clip((channel - lo) * 255.0 / (hi - lo), 0, 255)
+            arr[:, :, c] = channel
+        return arr.astype(np.uint8)
 
     def _preprocess_for_save(self, roi: np.ndarray, target_size: Tuple[int, int] = None,
                              normalize_brightness: bool = False, normalize_contrast: bool = False) -> Tuple[np.ndarray, np.ndarray]:
@@ -923,7 +1102,7 @@ class DinomalyWrapper:
         masks_out = []
 
         for roi in rois:
-            # BGR → RGB PIL（与 _preprocess_for_save 一致）
+            # BGR → RGB（保持 numpy，避免 PIL 创建/销毁开销）
             if len(roi.shape) == 2:
                 roi_rgb = cv2.cvtColor(roi, cv2.COLOR_GRAY2RGB)
             elif roi.shape[2] == 4:
@@ -933,20 +1112,18 @@ class DinomalyWrapper:
             else:
                 roi_rgb = roi
 
-            pil_img = Image.fromarray(roi_rgb)
-
+            # 亮度/对比度归一化（numpy 原生实现，避免 PIL 往返）
             if normalize_brightness:
-                pil_img = self._normalize_brightness_pil(pil_img)
+                roi_rgb = self._normalize_brightness_np(roi_rgb)
             if normalize_contrast:
-                pil_img = ImageOps.autocontrast(pil_img)
+                roi_rgb = self._autocontrast_np(roi_rgb)
 
-            # letterbox_resize 保持宽高比，同时获取有效区域 mask
-            if target_size is not None:
-                img_padded, mask = letterbox_resize(pil_img, target_size)
-            else:
-                img_padded, mask = letterbox_resize(pil_img, self.input_size)
+            # letterbox_resize（cv2 版本，避免 PIL Image.new/paste 开销）
+            _ts = target_size if target_size is not None else self.input_size
+            img_padded, mask = letterbox_resize_cv2(roi_rgb, _ts)
 
-            # Resize → CenterCrop → ToTensor → Normalize（与 anomalib Folder 管线一致）
+            # Resize → CenterCrop → ToTensor → Normalize
+            # F.to_tensor 直接接受 numpy (H,W,C) uint8，无需 PIL 中转
             t = transforms.functional.to_tensor(img_padded)  # (3, H, W) float [0,1]
             t = transforms.functional.resize(t, list(resize_size), antialias=True)
             t = transforms.functional.center_crop(t, crop_size)
@@ -1365,13 +1542,15 @@ class MultiModelDetector:
 
                     for idx, result in zip(batch_indices, batch_results):
                         score = result["error"]
+                        dinomaly_score = result.get("dinomaly_score", score)
                         ssim_score = result.get("ssim_score", 0.0)
                         is_ssim_anomaly = result.get("ssim_anomaly", False)
+                        dinomaly_info = f" dinomaly={dinomaly_score:.4f}"
                         ssim_info = f" ssim={ssim_score:.4f}({'anomaly' if is_ssim_anomaly else 'normal'})"
                         logger.info(
                             f"[{request_id}] [{category}] ROI {idx+1}/{total_rois} "
                             f"pos_id={pos_id} roi_size={rois_for_model[start].shape[1]}x{rois_for_model[start].shape[0]} "
-                            f"score={score:.4f} threshold={threshold:.4f}{ssim_info} (batch)"
+                            f"score={score:.4f} threshold={threshold:.4f}{dinomaly_info}{ssim_info} (batch)"
                         )
                         result_pairs[idx] = (make_result(score, result["infer_failed"]), False)
 
@@ -1383,13 +1562,15 @@ class MultiModelDetector:
                         real_pos_id = str(ann.get('pos_id', pos_id))
                         result = model.infer_single(roi, pos_id=real_pos_id)
                         score = result["error"]
+                        dinomaly_score = result.get("dinomaly_score", score)
                         ssim_score = result.get("ssim_score", 0.0)
                         is_ssim_anomaly = result.get("ssim_anomaly", False)
+                        dinomaly_info = f" dinomaly={dinomaly_score:.4f}"
                         ssim_info = f" ssim={ssim_score:.4f}({'anomaly' if is_ssim_anomaly else 'normal'})"
                         logger.info(
                             f"[{request_id}] [{category}] ROI {idx+1}/{total_rois} "
                             f"pos_id={real_pos_id} roi_size={roi.shape[1]}x{roi.shape[0]} "
-                            f"score={score:.4f} threshold={threshold:.4f}{ssim_info} (single)"
+                            f"score={score:.4f} threshold={threshold:.4f}{dinomaly_info}{ssim_info} (single)"
                         )
                         result_pairs[idx] = (make_result(score, result["infer_failed"]), False)
                     except Exception as e2:
@@ -1732,7 +1913,11 @@ def _load_precomputed_template_variants(
                     "angle": angle,
                     "h": orig_h,
                     "w": orig_w,
-                    "feats": feats  # 预提取的特征
+                    "feats": feats,  # 预提取的特征（GPU tensors）
+                    # 缓存 numpy keypoints，避免 RANSAC 验证时重复 rbd()+.cpu().numpy()
+                    "feats_np": {
+                        "keypoints": feats_data['keypoints'].astype(np.float32)
+                    }
                 })
 
             if len(variants) == len(rotations):
@@ -1803,6 +1988,10 @@ def precompute_template_variant_features(
             if extractor.training is False and next(extractor.parameters()).dtype == torch.float16:
                 t_tensor = t_tensor.half()
             v["feats"] = extractor.extract(t_tensor.to(device))
+            # 同时缓存 numpy 版 keypoints，避免后续 RANSAC 验证时重复 rbd()+.cpu().numpy()
+            v["feats_np"] = {
+                "keypoints": v["feats"]["keypoints"][0].cpu().numpy().astype(np.float32)
+            }
 
     # 存入缓存
     _TEMPLATE_VARIANT_FEATURES[rotations_tuple] = variants
@@ -1979,6 +2168,46 @@ def batch_match_template_variants(
     return results
 
 
+def _points_in_polygon(points: np.ndarray, poly: np.ndarray) -> np.ndarray:
+    """
+    向量化射线投射算法，一次性判断所有点是否在多边形内。
+
+    只遍历多边形的边（通常 4~10 条），对数千个点做向量化运算，
+    比逐点调用 cv2.pointPolygonTest 快 10-50x。
+
+    Args:
+        points: (N, 2) 待判断点坐标
+        poly: (M, 2) 多边形顶点
+
+    Returns:
+        bool 数组 (N,), True=点在多边形内部
+    """
+    n_verts = len(poly)
+    if n_verts < 3:
+        return np.zeros(len(points), dtype=bool)
+
+    x, y = points[:, 0], points[:, 1]
+    inside = np.zeros(len(points), dtype=bool)
+
+    x1 = poly[:, 0]
+    y1 = poly[:, 1]
+    x2 = np.roll(x1, -1)
+    y2 = np.roll(y1, -1)
+
+    for i in range(n_verts):
+        # 射线(向右)与边 (x1[i],y1[i])→(x2[i],y2[i]) 相交测试
+        dy = y2[i] - y1[i]
+        # 跳过水平边
+        if dy == 0:
+            continue
+        y_between = (y1[i] > y) != (y2[i] > y)
+        x_intersect = x < (x2[i] - x1[i]) * (y - y1[i]) / dy + x1[i]
+        mask = y_between & x_intersect
+        inside[mask] = ~inside[mask]
+
+    return inside
+
+
 def filter_scene_features_by_polygon(
     feats_scene: Dict[str, torch.Tensor],
     poly: np.ndarray,
@@ -2028,11 +2257,8 @@ def filter_scene_features_by_polygon(
             expanded_poly.append(expanded_pt)
         poly = np.array(expanded_poly, dtype=np.float32)
 
-    # 判断每个关键点是否在多边形内部
-    inside = np.array([
-        cv2.pointPolygonTest(poly.astype(np.float32), (float(pt[0]), float(pt[1])), False) >= 0
-        for pt in kpts_np
-    ])
+    # 向量化判断所有点是否在多边形内（比逐点 pointPolygonTest 快 10-50x）
+    inside = _points_in_polygon(kpts_np, poly)
 
     # 保留在多边形外部的关键点
     valid_mask = ~inside
@@ -2190,6 +2416,9 @@ def detect_workpieces_with_lightglue(
         # 使用批量匹配所有变体（更高效）
         batch_results = batch_match_template_variants(variants, feats_scene, matcher, device, min_matches)
 
+        # 预提取场景特征 numpy keypoints（每轮只需一次，避免 RANSAC 循环中重复 rbd()）
+        scene_kpts_np = feats_scene["keypoints"][0].cpu().numpy()
+
         best = None
         best_inliers = 0
 
@@ -2200,11 +2429,13 @@ def detect_workpieces_with_lightglue(
             v = result["variant"]
             matches = result["matches"]
 
-            # 获取原始特征中的关键点坐标
-            f0 = rbd(v["feats"])
-            f1 = rbd(feats_scene)
-            kpts0 = f0["keypoints"].cpu().numpy()
-            kpts1 = f1["keypoints"].cpu().numpy()
+            # 使用预缓存的 numpy keypoints 避免 rbd() + .cpu().numpy() 开销
+            kpts0 = v.get("feats_np", {}).get("keypoints")
+            if kpts0 is None:
+                # 回退：兼容没有预缓存 keypoints 的旧变体
+                f0 = rbd(v["feats"])
+                kpts0 = f0["keypoints"][0].cpu().numpy()
+            kpts1 = scene_kpts_np
 
             pts0 = kpts0[matches[:, 0]]
             pts1 = kpts1[matches[:, 1]]
