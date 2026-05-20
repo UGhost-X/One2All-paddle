@@ -886,7 +886,7 @@ async def incremental_retrain(request: RetrainRequest):
     if not base_output_dir.exists():
         raise HTTPException(status_code=404, detail=f"Base model directory not found: {base_output_dir}")
     
-    all_base_path_ids = [d.name for d in base_output_dir.iterdir() if d.is_dir()]
+    all_base_path_ids = [d.name for d in base_output_dir.iterdir() if d.is_dir() and d.name != "temp"]
     logger.info(f"Found {len(all_base_path_ids)} path_ids in base model: {all_base_path_ids}")
     
     # 有反馈的 path_id 集合
@@ -999,7 +999,7 @@ async def incremental_retrain(request: RetrainRequest):
             new_annotations_path = train_base_dir / "annotations.json"
             
             if base_raw_images_dir.exists() and base_raw_images_dir.is_dir() and not new_raw_images_dir.exists():
-                shutil.copytree(str(base_raw_images_dir), str(new_raw_images_dir))
+                shutil.copytree(str(base_raw_images_dir), str(new_raw_images_dir), ignore=shutil.ignore_patterns("temp"))
                 logger.info(f"Copied {len(list(base_raw_images_dir.glob('*.jpg')))} raw images from base model to {new_raw_images_dir}")
             elif not new_raw_images_dir.exists():
                 new_raw_images_dir.mkdir(parents=True, exist_ok=True)

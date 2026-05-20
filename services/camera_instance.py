@@ -110,6 +110,37 @@ class CameraInstance:
     def camera_id(self) -> str:
         return self.config.camera_id
 
+    def _is_connection_error(self, error_msg: str) -> bool:
+        """
+        检查错误信息是否表示连接问题
+
+        Args:
+            error_msg: 错误信息字符串
+
+        Returns:
+            如果是连接问题返回 True
+        """
+        if not error_msg:
+            return False
+
+        error_lower = error_msg.lower()
+        connection_error_keywords = [
+            "physically removed",
+            "device has been removed",
+            "not connected",
+            "connection lost",
+            "disconnected",
+            "timeout",
+            "grab failed",
+            "camera not connected",
+            "failed to allocate resources",
+            "0xc0070057",
+            "runtimeexception",
+            "instantcameraimpl",
+        ]
+
+        return any(keyword in error_lower for keyword in connection_error_keywords)
+
     def connect(self) -> Tuple[bool, str]:
         """连接相机"""
         
@@ -257,9 +288,22 @@ class CameraInstance:
             for attempt in range(self.config.max_retry):
                 try:
                     success, result = self._driver.capture(self.config.timeout_ms)
-                    
+
                     if not success:
                         logger.warning(f"Capture attempt {attempt+1} failed: {result}")
+
+                        # 检查是否是连接问题，如果是则尝试重连
+                        if self._is_connection_error(result) and attempt < self.config.max_retry - 1:
+                            logger.info(f"Detected connection error, attempting to reconnect...")
+                            self._driver.disconnect()
+                            time.sleep(0.5)
+                            reconnect_success, reconnect_msg = self.connect()
+                            if reconnect_success:
+                                logger.info(f"Reconnected successfully, retrying capture...")
+                            else:
+                                logger.error(f"Reconnection failed: {reconnect_msg}")
+                            continue
+
                         time.sleep(0.5)
                         continue
 
@@ -289,7 +333,24 @@ class CameraInstance:
                         }
 
                 except Exception as e:
+                    error_str = str(e)
                     logger.warning(f"Capture attempt {attempt+1} failed: {e}")
+
+                    # 检查是否是连接问题，如果是则尝试重连
+                    if self._is_connection_error(error_str) and attempt < self.config.max_retry - 1:
+                        logger.info(f"Detected connection error (exception), attempting to reconnect...")
+                        try:
+                            self._driver.disconnect()
+                        except:
+                            pass
+                        time.sleep(0.5)
+                        reconnect_success, reconnect_msg = self.connect()
+                        if reconnect_success:
+                            logger.info(f"Reconnected successfully, retrying capture...")
+                            continue
+                        else:
+                            logger.error(f"Reconnection failed: {reconnect_msg}")
+
                     time.sleep(0.5)
 
             error_msg = f"Failed to capture after {self.config.max_retry} attempts"

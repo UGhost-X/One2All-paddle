@@ -8,15 +8,13 @@ import json
 import base64
 import time
 import asyncio
-import psutil
 import numpy as np
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from functools import lru_cache
-from typing import Dict, Any, List, Optional, Union, Tuple
+from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, Any, List, Optional, Tuple
 from pathlib import Path
 from datetime import datetime
 from contextlib import contextmanager
-from PIL import Image
+from PIL import Image, ImageOps
 
 try:
     from skimage.metrics import structural_similarity as ssim
@@ -44,6 +42,14 @@ REFERENCE_WORKPIECE_SIZE = (1988, 683)
 REFERENCE_IMAGE_SIZE = (3200, 2100)
 
 TRAIN_MODE = "{{ train_mode }}"  # "by_pos_id" | "by_category"
+
+# 当前任务UUID和输出目录配置
+TASK_UUID = "{{ task_uuid }}"
+PROJECT_ID = "{{ project_id }}"
+OUTPUT_BASE_DIR = PROJECT_ROOT / "output" / PROJECT_ID / TASK_UUID
+
+# ROI临时保存配置
+SAVE_ROI_TO_TEMP = True  # 是否保存非工件主体ROI到temp目录
 
 
 def letterbox_resize(
@@ -79,24 +85,6 @@ def letterbox_resize(
     return img_padded, mask
 
 
-def get_workpiece_area_ratio_range(
-    image_shape: Tuple[int, ...],
-    reference_size: Tuple[int, int] = REFERENCE_WORKPIECE_SIZE,
-    reference_image_size: Tuple[int, int] = REFERENCE_IMAGE_SIZE,
-    tolerance: float = 0.15
-) -> Tuple[float, float]:
-    img_h, img_w = image_shape[:2]
-    img_area = img_h * img_w
-    ref_w, ref_h = reference_size
-    ref_img_w, ref_img_h = reference_image_size
-    ref_area_ratio = (ref_w * ref_h) / (ref_img_w * ref_img_h)
-    min_ratio = ref_area_ratio * (1 - tolerance)
-    max_ratio = ref_area_ratio * (1 + tolerance)
-    min_ratio = max(0.03, min_ratio)
-    max_ratio = min(0.50, max_ratio)
-    return min_ratio, max_ratio
-
-
 class ExecutorManager:
     def __init__(self, max_workers: int = 1):
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
@@ -122,6 +110,33 @@ class ExecutorManager:
 
 _executor_manager = ExecutorManager(max_workers=4)
 _infer_semaphore: Optional[asyncio.Semaphore] = None
+
+# 全局保存线程池，用于异步保存 ROI 到 temp 目录，不阻塞推理主线程
+_save_executor = ThreadPoolExecutor(max_workers=2)
+
+
+def _save_roi_to_temp_sync(roi: np.ndarray, pos_id: str, category_name: str, wp_idx: int) -> Optional[Path]:
+    """同步保存 ROI 到 temp 目录（在后台线程中执行）"""
+    try:
+        workpiece_temp_dir = OUTPUT_BASE_DIR / "temp" / str(wp_idx)
+        temp_dir = workpiece_temp_dir / str(pos_id)
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        filename = f"roi_{timestamp}.jpg"
+        save_path = temp_dir / filename
+        cv2.imwrite(str(save_path), roi)
+        logger.info(f"[ROI_TEMP] Saved ROI to {save_path} (category: {category_name})")
+        return save_path
+    except Exception as e:
+        logger.warning(f"[ROI_TEMP] Failed to save ROI to temp: {e}")
+        return None
+
+
+async def async_save_roi(roi: np.ndarray, pos_id: str, category_name: str, wp_idx: int):
+    """异步保存 ROI，不阻塞推理"""
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(_save_executor, _save_roi_to_temp_sync, roi, pos_id, category_name, wp_idx)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 日志配置
@@ -181,7 +196,6 @@ class PerformanceMonitor:
     def __init__(self, request_id: str):
         self.request_id = request_id
         self.step_times: Dict[str, float] = {}
-        self.resource_snapshots: Dict[str, Dict[str, Any]] = {}
         self._step_start_time: Optional[float] = None
         self._current_step: Optional[str] = None
 
@@ -250,21 +264,6 @@ def _get_gpu_memory_info() -> Dict[str, Any]:
         }
     except Exception:
         return {}
-
-
-def chunked_cdist(x: torch.Tensor, y: torch.Tensor, chunk_size: int = 1024) -> torch.Tensor:
-    """分块计算欧氏距离，使用 FP32 确保数值稳定性"""
-    # 转为 FP32 以确保数值稳定性
-    x = x.float()
-    y = y.float()
-    n = x.shape[0]
-    if n * y.shape[0] < chunk_size * chunk_size * 4:
-        return torch.cdist(x, y)
-    distances = []
-    for i in range(0, n, chunk_size):
-        end_i = min(i + chunk_size, n)
-        distances.append(torch.cdist(x[i:end_i], y))
-    return torch.cat(distances, dim=0)
 
 
 def cv2_put_chinese_text(img, text, position, color, font_size=20):
@@ -436,7 +435,14 @@ class DinomalyWrapper:
                         if mask is None:
                             mask = np.ones((self.input_size[1], self.input_size[0]), dtype=bool)
 
-                        images.append(img)
+                        # 预处理为灰度图并统一尺寸，缓存供 SSIM 计算直接使用
+                        if len(img.shape) == 3:
+                            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                        else:
+                            gray = img
+                        if gray.shape != (self.input_size[1], self.input_size[0]):
+                            gray = cv2.resize(gray, self.input_size)
+                        images.append(gray)
                         masks.append(mask)
 
                     except Exception as e:
@@ -470,7 +476,14 @@ class DinomalyWrapper:
                     if mask is None:
                         mask = np.ones((self.input_size[1], self.input_size[0]), dtype=bool)
 
-                    images.append(img)
+                    # 预处理为灰度图并统一尺寸，缓存供 SSIM 计算直接使用
+                    if len(img.shape) == 3:
+                        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                    else:
+                        gray = img
+                    if gray.shape != (self.input_size[1], self.input_size[0]):
+                        gray = cv2.resize(gray, self.input_size)
+                    images.append(gray)
                     masks.append(mask)
                 except Exception as e:
                     logger.warning(f"[SSIM] Failed to load FN image {img_path}: {e}")
@@ -486,15 +499,11 @@ class DinomalyWrapper:
         else:
             logger.warning(f"[SSIM] No valid FN images loaded from {fn_dir}")
 
-    def calculate_ssim(self, roi: np.ndarray, fn_img: np.ndarray, roi_mask: np.ndarray = None, fn_mask: np.ndarray = None) -> float:
+    def calculate_ssim(self, roi_gray: np.ndarray, fn_gray: np.ndarray,
+                       roi_mask: np.ndarray = None, fn_mask: np.ndarray = None) -> float:
         """
-        计算 ROI 与 FN 图片的 SSIM 相似度（标准滑动窗口法），只比较有效区域
-
-        Args:
-            roi: 输入 ROI (BGR 格式)
-            fn_img: FN 图片 (BGR 格式)
-            roi_mask: ROI 的有效区域 mask，None 表示全有效
-            fn_mask: FN 图片的有效区域 mask，None 表示全有效
+        计算 ROI 与 FN 图片的 SSIM 相似度（标准滑动窗口法），只比较有效区域。
+        roi_gray / fn_gray 应为已预处理的灰度图，尺寸一致 (224×224)。
 
         Returns:
             SSIM 得分 (0-1, 1 表示完全相同)
@@ -503,22 +512,9 @@ class DinomalyWrapper:
             return 0.0
 
         try:
-            # 转换为灰度图
-            if len(roi.shape) == 3:
-                gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-            else:
-                gray_roi = roi
-
-            if len(fn_img.shape) == 3:
-                gray_fn = cv2.cvtColor(fn_img, cv2.COLOR_BGR2GRAY)
-            else:
-                gray_fn = fn_img
-
-            # 调整大小一致（以 ROI 为基准）
-            if gray_roi.shape != gray_fn.shape:
-                gray_fn = cv2.resize(gray_fn, (gray_roi.shape[1], gray_roi.shape[0]))
-                if fn_mask is not None:
-                    fn_mask = cv2.resize(fn_mask.astype(np.uint8), (gray_roi.shape[1], gray_roi.shape[0]), interpolation=cv2.INTER_NEAREST).astype(bool)
+            # 输入已是灰度图，直接使用
+            gray_roi = roi_gray
+            gray_fn = fn_gray
 
             # 如果没有提供 mask，创建全 True 的 mask
             if roi_mask is None:
@@ -550,6 +546,7 @@ class DinomalyWrapper:
             # 使用 skimage 标准窗口化 SSIM
             win_size = min(7, min_side if min_side % 2 == 1 else min_side - 1)
             ssim_value = ssim(roi_crop, fn_crop, data_range=255, win_size=win_size)
+
             return float(ssim_value)
 
         except Exception as e:
@@ -637,148 +634,6 @@ class DinomalyWrapper:
                     return float(val)
         return self.threshold
 
-    @staticmethod
-    def _normalize_brightness(image: np.ndarray, target_mean: float = 168.0, threshold: int = 10) -> np.ndarray:
-        arr = image.astype(np.float32)
-        brightness = arr.mean(axis=2)
-        hole_mask = brightness > threshold
-        if np.sum(hole_mask) == 0:
-            return image
-        current_mean = arr[hole_mask].mean()
-        if current_mean > 0:
-            scale = target_mean / current_mean
-            arr[hole_mask] = np.clip(arr[hole_mask] * scale, 0, 255)
-        return arr.astype(np.uint8)
-
-    @staticmethod
-    def _normalize_contrast(image: np.ndarray, target_std: float = 65.0, threshold: int = 10) -> np.ndarray:
-        arr = image.astype(np.float32)
-        brightness = arr.mean(axis=2)
-        hole_mask = brightness > threshold
-        if np.sum(hole_mask) == 0:
-            return image
-        current_mean = arr[hole_mask].mean()
-        current_std = arr[hole_mask].std()
-        if current_std > 0:
-            arr[hole_mask] = (arr[hole_mask] - current_mean) / current_std * target_std + current_mean
-            arr = np.clip(arr, 0, 255)
-        return arr.astype(np.uint8)
-
-    @staticmethod
-    def _pad_to_size(roi: np.ndarray, target_size: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        将 ROI padding 到 target_size，保持居中，并返回 mask。
-        
-        Returns:
-            padded: padding 后的图像
-            mask: np.ndarray bool (H, W)，True 表示有效像素区域
-        """
-        current_height, current_width = roi.shape[:2]
-        target_width, target_height = target_size
-        if current_width >= target_width and current_height >= target_height:
-            # 如果 ROI 已经大于目标尺寸，直接 resize
-            if len(roi.shape) == 3:
-                resized = cv2.resize(roi, target_size, interpolation=cv2.INTER_LINEAR)
-            else:
-                resized = cv2.resize(roi, target_size, interpolation=cv2.INTER_LINEAR)
-            mask = np.ones((target_height, target_width), dtype=bool)
-            return resized, mask
-        
-        pad_left = (target_width - current_width) // 2
-        pad_right = target_width - current_width - pad_left
-        pad_top = (target_height - current_height) // 2
-        pad_bottom = target_height - current_height - pad_top
-        
-        if len(roi.shape) == 3:
-            padded = np.zeros((target_height, target_width, roi.shape[2]), dtype=roi.dtype)
-        else:
-            padded = np.zeros((target_height, target_width), dtype=roi.dtype)
-        padded[pad_top:pad_top + current_height, pad_left:pad_left + current_width] = roi
-        
-        # 创建 mask
-        mask = np.zeros((target_height, target_width), dtype=bool)
-        mask[pad_top:pad_top + current_height, pad_left:pad_left + current_width] = True
-        
-        return padded, mask
-
-    def preprocess_roi(self, roi: np.ndarray, target_size: Tuple[int, int] = None,
-                       normalize_brightness: bool = False, normalize_contrast: bool = False) -> Tuple[torch.Tensor, np.ndarray]:
-        """
-        预处理 ROI - 使用 letterbox_resize 保持宽高比，与训练时一致
-        
-        Returns:
-            tensor: 预处理后的张量
-            mask: 有效区域 mask (H, W) bool
-        """
-        # 转换为 PIL Image 格式以使用 letterbox_resize
-        if len(roi.shape) == 2:
-            roi_rgb = cv2.cvtColor(roi, cv2.COLOR_GRAY2RGB)
-        elif roi.shape[2] == 4:
-            roi_rgb = cv2.cvtColor(roi, cv2.COLOR_RGBA2RGB)
-        elif roi.shape[2] == 3:
-            roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
-        else:
-            roi_rgb = roi
-
-        pil_img = Image.fromarray(roi_rgb)
-
-        # 应用亮度和对比度归一化（在 letterbox_resize 之前）
-        if normalize_brightness:
-            pil_img = self._normalize_brightness_pil(pil_img)
-        if normalize_contrast:
-            pil_img = self._normalize_contrast_pil(pil_img)
-
-        # 使用 letterbox_resize 保持宽高比（与训练时一致）
-        if target_size is not None:
-            img_padded, mask = letterbox_resize(pil_img, target_size)
-        else:
-            img_padded, mask = letterbox_resize(pil_img, self.input_size)
-
-        # 转换为 numpy 数组
-        roi_np = np.array(img_padded)
-
-        # resize 到模型输入尺寸 (224, 224)
-        roi_resized = cv2.resize(roi_np, self.input_size, interpolation=cv2.INTER_LINEAR)
-        roi_normalized = roi_resized.astype(np.float32) / 255.0
-        tensor = torch.from_numpy(roi_normalized).permute(2, 0, 1)
-        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        tensor = normalize(tensor)
-
-        # resize mask 到 input_size
-        mask_resized = cv2.resize(mask.astype(np.uint8), self.input_size, interpolation=cv2.INTER_NEAREST)
-        mask = mask_resized.astype(bool)
-
-        return tensor.half(), mask
-
-    @staticmethod
-    def _normalize_brightness_pil(image: Image.Image, target_mean: float = 168.0, threshold: int = 10) -> Image.Image:
-        """对 PIL Image 进行亮度归一化"""
-        arr = np.array(image).astype(np.float32)
-        brightness = arr.mean(axis=2)
-        hole_mask = brightness > threshold
-        if np.sum(hole_mask) == 0:
-            return image
-        current_mean = arr[hole_mask].mean()
-        if current_mean > 0:
-            scale = target_mean / current_mean
-            arr[hole_mask] = np.clip(arr[hole_mask] * scale, 0, 255)
-        return Image.fromarray(arr.astype(np.uint8))
-
-    @staticmethod
-    def _normalize_contrast_pil(image: Image.Image, target_std: float = 65.0, threshold: int = 10) -> Image.Image:
-        """对 PIL Image 进行对比度归一化"""
-        arr = np.array(image).astype(np.float32)
-        brightness = arr.mean(axis=2)
-        hole_mask = brightness > threshold
-        if np.sum(hole_mask) == 0:
-            return image
-        current_mean = arr[hole_mask].mean()
-        current_std = arr[hole_mask].std()
-        if current_std > 0:
-            arr[hole_mask] = (arr[hole_mask] - current_mean) / current_std * target_std + current_mean
-            arr = np.clip(arr, 0, 255)
-        return Image.fromarray(arr.astype(np.uint8))
-
     def infer_single(self, roi: np.ndarray, target_size: Tuple[int, int] = None,
                      normalize_brightness: bool = None, normalize_contrast: bool = None,
                      pos_id: str = None) -> Dict[str, Any]:
@@ -800,46 +655,20 @@ class DinomalyWrapper:
             return {"error": 1.0, "infer_failed": False, "ssim_score": float(ssim_score), "ssim_anomaly": True}
 
         try:
-            from anomalib.data import Folder
-            import tempfile
-            from skimage.transform import resize as sk_resize
+            # 直接预处理为 tensor，跳过磁盘 I/O
+            image_batch, masks = self._preprocess_rois_to_batch(
+                [roi], target_size, normalize_brightness, normalize_contrast
+            )
 
-            # 创建临时 datamodule
-            with tempfile.TemporaryDirectory() as tmpdir:
-                tmpdir_path = Path(tmpdir)
-                normal_dir = tmpdir_path / "normal"
-                mask_dir = tmpdir_path / "masks"
-                normal_dir.mkdir(parents=True, exist_ok=True)
-                mask_dir.mkdir(parents=True, exist_ok=True)
+            if image_batch is None:
+                raise RuntimeError("_preprocess_rois_to_batch returned None")
 
-                # 保存临时图片 - 使用与 infer_batch 一致的预处理
-                temp_img_path = normal_dir / "temp_0000.png"
-                processed_roi, mask = self._preprocess_for_save(roi, target_size, normalize_brightness, normalize_contrast)
-                cv2.imwrite(str(temp_img_path), processed_roi)
-                # 保存 mask
-                np.save(mask_dir / "temp_0000.npy", mask)
+            # 直接调用 torch model（与 predict_step 一致，不经过 post_processor）
+            with torch.no_grad():
+                output = self.model.model(image_batch)
 
-                # 创建临时 datamodule
-                from anomalib.data.utils import TestSplitMode, ValSplitMode
-                temp_dm = Folder(
-                    name="infer_temp",
-                    root=tmpdir_path,
-                    normal_dir="normal",
-                    normal_test_dir="normal",
-                    train_batch_size=1,
-                    eval_batch_size=1,
-                    num_workers=0,
-                    test_split_mode=TestSplitMode.FROM_DIR,
-                    val_split_mode=ValSplitMode.SAME_AS_TEST,
-                    val_split_ratio=0.0,
-                )
-                temp_dm.setup()
-
-                # 使用 engine.predict 进行推理
-                predictions = self.engine.predict(model=self.model, dataloaders=temp_dm.test_dataloader())
-
-                # 提取分数（使用 mask 处理 anomaly_map）
-                score = self._extract_score_with_mask(predictions, mask)
+            # 提取分数
+            score = self._extract_score_with_mask([output], masks[0])
 
             return {"error": float(score), "infer_failed": False, "ssim_score": float(ssim_score)}
 
@@ -906,50 +735,20 @@ class DinomalyWrapper:
             return results
 
         try:
-            from anomalib.data import Folder
-            import tempfile
-            from skimage.transform import resize as sk_resize
+            # 直接预处理为 tensor batch，跳过磁盘 I/O
+            image_batch, masks = self._preprocess_rois_to_batch(
+                rois_for_dinomaly, target_size, normalize_brightness, normalize_contrast
+            )
 
-            # 创建临时目录
-            with tempfile.TemporaryDirectory() as tmpdir:
-                tmpdir_path = Path(tmpdir)
-                normal_dir = tmpdir_path / "normal"
-                mask_dir = tmpdir_path / "masks"
-                normal_dir.mkdir(parents=True, exist_ok=True)
-                mask_dir.mkdir(parents=True, exist_ok=True)
+            if image_batch is None:
+                raise RuntimeError("_preprocess_rois_to_batch returned None")
 
-                # 保存所有 ROI 为临时图片，同时保存 mask
-                masks = []
-                for i, roi in enumerate(rois_for_dinomaly):
-                    temp_img_path = normal_dir / f"temp_{i:04d}.png"
-                    # 预处理并保存
-                    processed_roi, mask = self._preprocess_for_save(roi, target_size, normalize_brightness, normalize_contrast)
-                    cv2.imwrite(str(temp_img_path), processed_roi)
-                    # 保存 mask
-                    np.save(mask_dir / f"temp_{i:04d}.npy", mask)
-                    masks.append(mask)
+            # 直接调用 torch model（与 predict_step 一致，不经过 post_processor）
+            with torch.no_grad():
+                output = self.model.model(image_batch)
 
-                # 创建临时 datamodule
-                from anomalib.data.utils import TestSplitMode, ValSplitMode
-                temp_dm = Folder(
-                    name="infer_temp",
-                    root=tmpdir_path,
-                    normal_dir="normal",
-                    normal_test_dir="normal",
-                    train_batch_size=min(len(rois_for_dinomaly), 8),
-                    eval_batch_size=min(len(rois_for_dinomaly), 8),
-                    num_workers=0,
-                    test_split_mode=TestSplitMode.FROM_DIR,
-                    val_split_mode=ValSplitMode.SAME_AS_TEST,
-                    val_split_ratio=0.0,
-                )
-                temp_dm.setup()
-
-                # 使用 engine.predict 进行批量推理
-                predictions = self.engine.predict(model=self.model, dataloaders=temp_dm.test_dataloader())
-
-                # 提取分数（使用 mask 处理 anomaly_map）
-                scores = self._extract_scores_with_masks(predictions, masks)
+            # 提取分数（复用现有方法，InferenceBatch 兼容 _extract_scores_with_masks）
+            scores = self._extract_scores_with_masks([output], masks)
 
             # 填充 Dinomaly 推理结果
             for idx_in_batch, original_idx in enumerate(roi_indices):
@@ -980,10 +779,7 @@ class DinomalyWrapper:
                            normalize_brightness: bool = None,
                            normalize_contrast: bool = None,
                            pos_ids: List[str] = None) -> List[Dict[str, Any]]:
-        """
-        批量推理 - 使用 engine.predict 确保分数经过归一化，与阈值在同一尺度。
-        虽然会走临时文件，但确保结果与训练时的统计一致。
-        """
+        """批量推理 - 直接调用模型 forward，跳过磁盘 I/O 和 engine.predict。"""
         # 直接复用 infer_batch 的实现，确保一致性
         return self.infer_batch(rois, target_size, normalize_brightness, normalize_contrast, pos_ids=pos_ids)
 
@@ -995,22 +791,12 @@ class DinomalyWrapper:
             roi: 输入 ROI (BGR 格式)
 
         Returns:
-            (roi_bgr, mask): 预处理后的 BGR 格式 numpy 数组 (224, 224, 3) 和有效区域 mask (224, 224)
+            (roi_gray, mask): 预处理后的灰度图 (224, 224) 和有效区域 mask (224, 224)
         """
         h, w = roi.shape[:2]
         th, tw = self.input_size  # (224, 224)
 
-        if h == th and w == tw:
-            # 已经是目标尺寸（被 _extract_roi_from_segmentation 处理过）
-            # 从非黑色区域检测实际内容 mask，还原真实 letterbox 边界
-            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-            mask = gray > 10  # 黑色 padding 像素值接近 0
-            # 如果检测结果太稀疏（全黑图），fallback 到全 True
-            if mask.sum() < 100:
-                mask = np.ones((th, tw), dtype=bool)
-            return roi.copy(), mask
-
-        # 原始尺寸，走正常 letterbox 流程
+        # 转换为 PIL Image 格式以使用 letterbox_resize
         if len(roi.shape) == 2:
             roi_rgb = cv2.cvtColor(roi, cv2.COLOR_GRAY2RGB)
         elif roi.shape[2] == 4:
@@ -1022,16 +808,34 @@ class DinomalyWrapper:
 
         pil_img = Image.fromarray(roi_rgb)
 
+        # 应用亮度/对比度归一化（在 letterbox_resize 之前，与训练时一致）
+        if self.normalize_brightness_config:
+            pil_img = self._normalize_brightness_pil(pil_img)
+        if self.normalize_contrast_config:
+            pil_img = ImageOps.autocontrast(pil_img)
+
         # letterbox_resize 到 224x224（与 FN 图片保存时一致），同时获取 mask
         img_padded, mask = letterbox_resize(pil_img, self.input_size)
 
-        # 转换为 numpy 数组 (RGB)
+        # 转换为 numpy 数组 (RGB) → 灰度图（SSIM 计算只需要灰度）
         roi_np = np.array(img_padded)
+        roi_gray = cv2.cvtColor(roi_np, cv2.COLOR_RGB2GRAY)
 
-        # 转换为 BGR 格式
-        roi_bgr = cv2.cvtColor(roi_np, cv2.COLOR_RGB2BGR)
+        return roi_gray, mask
 
-        return roi_bgr, mask
+    @staticmethod
+    def _normalize_brightness_pil(img: Image.Image, target_mean: float = 168.0, threshold: int = 10) -> Image.Image:
+        """对 PIL Image 进行亮度归一化，与训练时的 normalize_brightness 保持一致"""
+        arr = np.array(img).astype(np.float32)
+        brightness = arr.mean(axis=2) if len(arr.shape) == 3 else arr
+        hole_mask = brightness > threshold
+        if np.sum(hole_mask) == 0:
+            return img
+        current_mean = arr[hole_mask].mean()
+        if current_mean > 0:
+            scale = target_mean / current_mean
+            arr[hole_mask] = np.clip(arr[hole_mask] * scale, 0, 255)
+        return Image.fromarray(arr.astype(np.uint8))
 
     def _preprocess_for_save(self, roi: np.ndarray, target_size: Tuple[int, int] = None,
                              normalize_brightness: bool = False, normalize_contrast: bool = False) -> Tuple[np.ndarray, np.ndarray]:
@@ -1077,40 +881,84 @@ class DinomalyWrapper:
 
         return roi_resized, mask
 
-    def _extract_score(self, predictions) -> float:
-        """从预测结果中提取单个分数"""
-        score_keys = ['pred_score', 'anomaly_score', 'pred_scores', 'anomaly_scores']
+    def _preprocess_rois_to_batch(
+        self,
+        rois: List[np.ndarray],
+        target_size: Tuple[int, int] = None,
+        normalize_brightness: bool = False,
+        normalize_contrast: bool = False,
+    ) -> Tuple[Optional[torch.Tensor], List[np.ndarray]]:
+        """将 ROI 列表预处理为可直接送入模型的归一化 tensor batch。
 
-        for batch in predictions:
-            for key in score_keys:
-                val = getattr(batch, key, None)
-                if val is None and isinstance(batch, dict):
-                    val = batch.get(key)
-                if val is not None:
-                    if isinstance(val, torch.Tensor):
-                        return float(val.detach().cpu().item())
-                    else:
-                        return float(val)
-        return 0.0
+        跳过磁盘 I/O：letterbox + 亮度/对比度归一化 + Resize→CenterCrop→Normalize。
+        返回 (image_batch_on_device, masks_list)。
+        """
+        if self.model is None:
+            return None, []
 
-    def _extract_scores(self, predictions) -> List[float]:
-        """从预测结果中提取批量分数"""
-        scores = []
-        score_keys = ['pred_score', 'anomaly_score', 'pred_scores', 'anomaly_scores']
+        # 从模型的 pre_processor 提取变换参数，回退到 DinoV2 默认值
+        try:
+            pre_transform = self.model.pre_processor.transform
+            resize_size = None
+            crop_size = 392  # DinoV2 default
+            for t in pre_transform.transforms:
+                if isinstance(t, transforms.Resize):
+                    resize_size = t.size  # (H, W) or int
+                elif isinstance(t, transforms.CenterCrop):
+                    crop_size = t.size  # int or (H, W)
+            if resize_size is None:
+                resize_size = (448, 448)
+            if isinstance(resize_size, int):
+                resize_size = (resize_size, resize_size)
+            if isinstance(crop_size, (list, tuple)):
+                crop_size = crop_size[0]
+        except Exception:
+            resize_size = (448, 448)
+            crop_size = 392
 
-        for batch in predictions:
-            for key in score_keys:
-                val = getattr(batch, key, None)
-                if val is None and isinstance(batch, dict):
-                    val = batch.get(key)
-                if val is not None:
-                    if isinstance(val, torch.Tensor):
-                        scores.extend(val.detach().cpu().numpy().flatten().tolist())
-                    else:
-                        scores.append(float(val))
-                    break
+        imagenet_mean = torch.tensor([0.485, 0.456, 0.406])
+        imagenet_std = torch.tensor([0.229, 0.224, 0.225])
 
-        return scores
+        tensors = []
+        masks_out = []
+
+        for roi in rois:
+            # BGR → RGB PIL（与 _preprocess_for_save 一致）
+            if len(roi.shape) == 2:
+                roi_rgb = cv2.cvtColor(roi, cv2.COLOR_GRAY2RGB)
+            elif roi.shape[2] == 4:
+                roi_rgb = cv2.cvtColor(roi, cv2.COLOR_RGBA2RGB)
+            elif roi.shape[2] == 3:
+                roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
+            else:
+                roi_rgb = roi
+
+            pil_img = Image.fromarray(roi_rgb)
+
+            if normalize_brightness:
+                pil_img = self._normalize_brightness_pil(pil_img)
+            if normalize_contrast:
+                pil_img = ImageOps.autocontrast(pil_img)
+
+            # letterbox_resize 保持宽高比，同时获取有效区域 mask
+            if target_size is not None:
+                img_padded, mask = letterbox_resize(pil_img, target_size)
+            else:
+                img_padded, mask = letterbox_resize(pil_img, self.input_size)
+
+            # Resize → CenterCrop → ToTensor → Normalize（与 anomalib Folder 管线一致）
+            t = transforms.functional.to_tensor(img_padded)  # (3, H, W) float [0,1]
+            t = transforms.functional.resize(t, list(resize_size), antialias=True)
+            t = transforms.functional.center_crop(t, crop_size)
+            t = transforms.functional.normalize(
+                t, mean=imagenet_mean.tolist(), std=imagenet_std.tolist()
+            )
+
+            tensors.append(t)
+            masks_out.append(mask)
+
+        batch = torch.stack(tensors).to(self.device)
+        return batch, masks_out
 
     def _extract_score_with_mask(self, predictions, mask: np.ndarray) -> float:
         """
@@ -1446,7 +1294,10 @@ class MultiModelDetector:
                 if load_tasks:
                     await asyncio.gather(*load_tasks, return_exceptions=True)
 
-            result_pairs = self._detect_by_pos_id_original(
+            loop = asyncio.get_running_loop()
+            result_pairs = await loop.run_in_executor(
+                _executor_manager.executor,
+                self._detect_by_pos_id_original,
                 pos_id_groups, category, request_id, total_rois
             )
 
@@ -1651,16 +1502,16 @@ def _extract_roi_from_bbox(img: np.ndarray, bbox: List[float]) -> np.ndarray:
 
 
 def _extract_roi_from_segmentation(img: np.ndarray, segmentation: List[List[float]],
-                                   target_size: Tuple[int, int] = (224, 224)) -> Optional[np.ndarray]:
+                                   target_size: Optional[Tuple[int, int]] = (224, 224)) -> Optional[np.ndarray]:
     """从 segmentation 提取 ROI 并缩放到固定大小
 
     Args:
         img: 原始图片 (numpy array)
         segmentation: 多边形坐标列表
-        target_size: 目标尺寸 (width, height)，默认 (224, 224)
+        target_size: 目标尺寸 (width, height)，默认 (224, 224)；如果为 None，则返回原始ROI不做缩放
 
     Returns:
-        裁剪并缩放后的 ROI 图片
+        裁剪后的 ROI 图片，如果 target_size 不为空则缩放到指定大小，否则返回原始大小
     """
     if not segmentation:
         return None
@@ -1691,6 +1542,10 @@ def _extract_roi_from_segmentation(img: np.ndarray, segmentation: List[List[floa
 
     if roi.size == 0:
         return None
+
+    # 如果 target_size 为 None，返回原始ROI不做缩放
+    if target_size is None:
+        return roi
 
     # 使用 letterbox_resize 保持宽高比，与训练预处理和 FN 图片保存一致
     roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
@@ -2568,6 +2423,14 @@ async def process_single_workpiece_roi(
     """
     padding = roi_info.get("padding", 20)
 
+    # 同步清理该 workpiece 的 temp 目录（仅一次，在异步保存之前）
+    if SAVE_ROI_TO_TEMP:
+        workpiece_temp_dir = OUTPUT_BASE_DIR / "temp" / str(wp_idx)
+        if workpiece_temp_dir.exists():
+            import shutil
+            shutil.rmtree(workpiece_temp_dir)
+            logger.info(f"[ROI_TEMP] Cleaned temp directory: {workpiece_temp_dir}")
+
     def _transform_bbox_to_roi(bbox: List[float]) -> Tuple[int, int, int, int]:
         """将模板 bbox 的四角点仿射变换到 roi_image，返回轴对齐外接矩形 (x,y,w,h)。"""
         x, y, w, h = bbox
@@ -2616,10 +2479,14 @@ async def process_single_workpiece_roi(
         bbox = ann.get("bbox", [0, 0, 0, 0])
 
         roi_sub = None
+        roi_sub_raw = None  # 原始ROI，用于保存到temp目录（不做letterbox）
 
         # FIX: 用透视变换后的 segmentation 提取 ROI（替换原来的 pts + padding）
         if segmentation and len(segmentation) > 0:
             seg_roi_transformed = _transform_segmentation_to_roi(segmentation)
+            # 先提取原始ROI用于保存
+            roi_sub_raw = _extract_roi_from_segmentation(roi_image, seg_roi_transformed, target_size=None)
+            # 再提取letterbox后的ROI用于推理
             roi_sub = _extract_roi_from_segmentation(roi_image, seg_roi_transformed)
 
         # FIX: fallback 用透视变换后的 bbox 提取 ROI（替换原来的 x += padding）
@@ -2631,7 +2498,8 @@ async def process_single_workpiece_roi(
                 rw = min(rw, roi_image.shape[1] - rx)
                 rh = min(rh, roi_image.shape[0] - ry)
                 if rw > 0 and rh > 0:
-                    roi_sub = roi_image[ry:ry + rh, rx:rx + rw]
+                    roi_sub_raw = roi_image[ry:ry + rh, rx:rx + rw]
+                    roi_sub = roi_sub_raw
             else:
                 continue
 
@@ -2639,6 +2507,15 @@ async def process_single_workpiece_roi(
             rois_for_inference.append(roi_sub)
             anns_for_inference.append(ann)
             categories.append(category_str)  # 使用字符串版本
+
+            # 异步保存ROI到临时目录（跳过工件主体）- 使用原始ROI，不做letterbox
+            category_name = ann.get("category_name", ann.get("label", ""))
+            if SAVE_ROI_TO_TEMP and category_name != "工件主体":
+                pos_id_str = str(ann.get("pos_id", category_str))
+                asyncio.create_task(async_save_roi(
+                    roi_sub_raw if roi_sub_raw is not None else roi_sub,
+                    pos_id_str, category_name, wp_idx
+                ))
 
     if not rois_for_inference:
         return {
@@ -2874,59 +2751,6 @@ async def detect_multiple_workpieces(
         "total_workpieces": len(wp_results),
         "total_anomalies": total_anomalies,
     }
-
-
-def create_multi_workpiece_visualization(
-    original_image: np.ndarray,
-    workpiece_results: List[Dict],
-    request_id: str = "",
-) -> np.ndarray:
-    COLOR_NORMAL = (0, 255, 0)
-    COLOR_ANOMALY = (0, 0, 255)
-    COLOR_NORMAL_ROI = (0, 255, 255)
-    COLOR_TEXT = (255, 255, 255)
-
-    viz = original_image.copy()
-
-    for wp_result in workpiece_results:
-        wp_id = wp_result.get("workpiece_id", 0)
-        anomaly_count = wp_result.get("anomaly_count", 0)
-        wp_color = COLOR_ANOMALY if anomaly_count > 0 else COLOR_NORMAL
-        roi_info = wp_result.get("roi_info", {})
-
-        poly = roi_info.get("poly")
-        if poly:
-            pts = np.array(poly, dtype=np.int32).reshape(-1, 1, 2)
-            cv2.polylines(viz, [pts], True, wp_color, 3)
-            cx = int(np.mean([p[0] for p in poly]))
-            cy = int(np.mean([p[1] for p in poly]))
-        else:
-            bbox = wp_result.get("bbox", (0, 0, 0, 0))
-            wx, wy, ww, wh = [int(v) for v in bbox]
-            cv2.rectangle(viz, (wx, wy), (wx+ww, wy+wh), wp_color, 3)
-            cx, cy = wx + ww//2, wy + wh//2
-
-        label = f"WP{wp_id}: {'NG' if anomaly_count > 0 else 'OK'} ({roi_info.get('inliers', 0)} pts)"
-        viz = cv2_put_chinese_text(viz, label, (cx-60, max(cy-60, 0)), wp_color, 20)
-
-        for res in wp_result.get("results", []):
-            is_anomaly = res.get("is_anomaly", False)
-            roi_color = COLOR_ANOMALY if is_anomaly else COLOR_NORMAL_ROI
-            poly = res.get("poly_in_pred", [])
-
-            if poly and len(poly) >= 6:
-                try:
-                    pts = np.array(poly).reshape(-1, 2).astype(np.int32)
-                    cv2.polylines(viz, [pts], True, roi_color, 2)
-                except Exception:
-                    pass
-
-    total_wp = len(workpiece_results)
-    total_ng = sum(wp.get("anomaly_count", 0) > 0 for wp in workpiece_results)
-    total_roi = sum(len(wp.get("results", [])) for wp in workpiece_results)
-    summary = f"工件: {total_wp} (NG:{total_ng} OK:{total_wp-total_ng}) | ROI: {total_roi}"
-    viz = cv2_put_chinese_text(viz, summary, (10, 30), COLOR_TEXT, 24)
-    return viz
 
 
 def create_multi_workpiece_visualization_with_roi(
@@ -3361,8 +3185,6 @@ MODEL_PATHS                                            = {{ models_config | tojs
 DINORMALY_DETECTOR: Optional[MultiModelDetector] = None
 TEMPLATE_IMAGE: Optional[np.ndarray] = None
 TEMPLATE_ANNOTATIONS: List[Dict[str, Any]] = []
-# by_category 模式下：category_name -> category_id 的映射
-CATEGORY_NAME_TO_ID: Dict[str, str] = {}
 
 
 class WorkpieceResult(BaseModel):
@@ -3390,7 +3212,7 @@ def encode_image_to_base64(img: np.ndarray) -> str:
 
 
 def load_models():
-    global DINORMALY_DETECTOR, MODELS, TEMPLATE_IMAGE, TEMPLATE_ANNOTATIONS, CATEGORY_NAME_TO_ID
+    global DINORMALY_DETECTOR, MODELS, TEMPLATE_IMAGE, TEMPLATE_ANNOTATIONS
 
     # 打印当前推理模式
     logger.info(f"[TRAIN_MODE] 当前推理模式: {TRAIN_MODE}")
@@ -3426,7 +3248,6 @@ def load_models():
                             config = json.load(f)
                         category_label = config.get("category_label", "")
                         if category_label:
-                            CATEGORY_NAME_TO_ID[category_label] = str(cat_id)
                             logger.info(f"[CATEGORY_MAPPING] {category_label} -> {cat_id}")
                     except Exception as e:
                         logger.warning(f"Failed to load config for {cat_id}: {e}")
@@ -3621,6 +3442,172 @@ async def predict_multiple(
         except Exception as e:
             logger.error(f"[{request_id}] Prediction error: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
+
+
+class GetRoiImagesRequest(BaseModel):
+    task_uuid: str
+    workpiece_id: str
+    pos_id: str
+    roi_filenames: Optional[List[str]] = None  # 如果为None，则返回该pos_id下的所有ROI
+    normalize_brightness: bool = False  # 是否进行亮度归一化
+    normalize_contrast: bool = False    # 是否进行对比度归一化
+
+
+class RoiImageData(BaseModel):
+    filename: str
+    image_b64: str  # Base64编码的图像数据
+    mask_b64: str   # Base64编码的mask数据
+    width: int
+    height: int
+
+
+class GetRoiImagesResponse(BaseModel):
+    success: bool
+    message: str
+    rois: List[RoiImageData] = []
+
+
+def _encode_image_to_base64(img: np.ndarray) -> str:
+    """将numpy图像编码为base64字符串"""
+    _, buffer = cv2.imencode('.jpg', img)
+    return base64.b64encode(buffer).decode('utf-8')
+
+
+@app.post("/get_roi_images", response_model=GetRoiImagesResponse)
+async def get_roi_images(request: GetRoiImagesRequest):
+    """
+    获取临时保存的ROI图像数据（经过预处理），以Base64格式返回。
+    支持获取多张ROI图像。
+    """
+    try:
+        # 构建源目录路径: output/{product_id}/{task_uuid}/temp/{workpiece_id}/{pos_id}/
+        source_dir = PROJECT_ROOT / "output" / PROJECT_ID / request.task_uuid / "temp" / request.workpiece_id / request.pos_id
+
+        if not source_dir.exists():
+            return GetRoiImagesResponse(
+                success=False,
+                message=f"Source directory not found: {source_dir}",
+                rois=[]
+            )
+
+        roi_images = []
+
+        # 确定要处理的文件列表
+        if request.roi_filenames:
+            # 获取指定的文件
+            source_files = []
+            for filename in request.roi_filenames:
+                file_path = source_dir / filename
+                if file_path.exists():
+                    source_files.append(file_path)
+                else:
+                    logger.warning(f"[GET_ROI] File not found: {file_path}")
+        else:
+            # 获取该目录下的所有jpg文件
+            source_files = sorted(source_dir.glob("*.jpg"))
+
+        if not source_files:
+            return GetRoiImagesResponse(
+                success=False,
+                message=f"No ROI files found in {source_dir}",
+                rois=[]
+            )
+
+        for source_file in source_files:
+            try:
+                # 读取原始ROI图像
+                roi = cv2.imread(str(source_file))
+                if roi is None:
+                    logger.warning(f"[GET_ROI] Failed to read ROI: {source_file}")
+                    continue
+
+                # 直接返回原图，不做预处理
+                image_b64 = _encode_image_to_base64(roi)
+
+                height, width = roi.shape[:2]
+
+                roi_images.append(RoiImageData(
+                    filename=source_file.name,
+                    image_b64=image_b64,
+                    mask_b64="",
+                    width=width,
+                    height=height
+                ))
+
+                logger.info(f"[GET_ROI] Processed ROI: {source_file.name}")
+
+            except Exception as e:
+                logger.warning(f"[GET_ROI] Failed to process {source_file}: {e}")
+                continue
+
+        if roi_images:
+            return GetRoiImagesResponse(
+                success=True,
+                message=f"Successfully processed {len(roi_images)} ROI(s)",
+                rois=roi_images
+            )
+        else:
+            return GetRoiImagesResponse(
+                success=False,
+                message="No ROIs were successfully processed",
+                rois=[]
+            )
+
+    except Exception as e:
+        logger.error(f"[GET_ROI] Error getting ROI images: {e}", exc_info=True)
+        return GetRoiImagesResponse(
+            success=False,
+            message=f"Error: {str(e)}",
+            rois=[]
+        )
+
+
+@app.get("/list_temp_rois")
+async def list_temp_rois(task_uuid: str, workpiece_id: str, pos_id: str):
+    """
+    列出临时目录中保存的所有ROI文件。
+    用于前端展示可供选择的ROI列表。
+    """
+    try:
+        temp_dir = PROJECT_ROOT / "output" / PROJECT_ID / task_uuid / "temp" / workpiece_id / pos_id
+
+        if not temp_dir.exists():
+            return {
+                "success": True,
+                "rois": [],
+                "message": "No temp directory found"
+            }
+
+        roi_files = sorted(temp_dir.glob("*.jpg"))
+        roi_list = []
+
+        for roi_file in roi_files:
+            try:
+                # 获取文件信息
+                stat = roi_file.stat()
+                roi_list.append({
+                    "filename": roi_file.name,
+                    "path": str(roi_file.relative_to(PROJECT_ROOT)),
+                    "size_bytes": stat.st_size,
+                    "created_at": datetime.fromtimestamp(stat.st_ctime).isoformat()
+                })
+            except Exception as e:
+                logger.warning(f"[LIST_TEMP] Failed to get info for {roi_file}: {e}")
+                continue
+
+        return {
+            "success": True,
+            "rois": roi_list,
+            "count": len(roi_list)
+        }
+
+    except Exception as e:
+        logger.error(f"[LIST_TEMP] Error listing temp ROIs: {e}", exc_info=True)
+        return {
+            "success": False,
+            "rois": [],
+            "message": f"Error: {str(e)}"
+        }
 
 
 def signal_handler(sig, frame):
