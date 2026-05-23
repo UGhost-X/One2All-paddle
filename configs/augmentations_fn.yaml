@@ -1,0 +1,53 @@
+# FN 图像专用轻度增强配置
+# 用于 YOLO 检测训练中扩充 defect 类样本
+
+__version__: 1.4.0
+transform:
+  __class_fullname__: Compose
+  additional_targets: {}
+  bbox_params: null
+  keypoint_params: null
+  p: 1.0
+  transforms:
+    # 水平翻转
+    - __class_fullname__: HorizontalFlip
+      p: 0.5
+
+    # 轻微旋转 (±10°)
+    - __class_fullname__: Rotate
+      limit: [-10, 10]
+      interpolation: 1
+      border_mode: 0
+      rotate_method: largest_box
+      crop_border: false
+      p: 0.3
+
+    # 轻微缩放
+    - __class_fullname__: Affine
+      scale: [0.85, 1.15]
+      keep_ratio: true
+      rotate: 0
+      shear: 0
+      translate_percent: 0
+      p: 0.4
+
+    # 模糊增强（Gaussian / Motion / Median 三选一）
+    - __class_fullname__: OneOf
+      p: 0.3
+      transforms:
+        - __class_fullname__: GaussianBlur
+          blur_limit: [3, 5]
+          sigma_limit: [0.1, 1.0]
+          p: 1.0
+        - __class_fullname__: MotionBlur
+          blur_limit: [3, 5]
+          p: 1.0
+        - __class_fullname__: MedianBlur
+          blur_limit: [3, 5]
+          p: 1.0
+
+    # 轻微亮度/对比度调整
+    - __class_fullname__: RandomBrightnessContrast
+      brightness_limit: 0.2
+      contrast_limit: 0.2
+      p: 0.5

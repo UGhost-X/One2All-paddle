@@ -16,13 +16,6 @@ from datetime import datetime
 from contextlib import contextmanager
 from PIL import Image, ImageOps
 
-try:
-    from skimage.metrics import structural_similarity as ssim
-    SSIM_AVAILABLE = True
-except ImportError:
-    SSIM_AVAILABLE = False
-    logging.warning("scikit-image not available, SSIM feature will be disabled")
-
 # 设置 anomalib 预训练模型缓存目录为本地路径（必须在导入 anomalib 之前设置）
 PROJECT_ROOT = Path(__file__).parent.parent
 PRETRAINED_DIR = PROJECT_ROOT / "models" / "pretrained"
@@ -55,10 +48,13 @@ SAVE_ROI_TO_TEMP = True  # 是否保存非工件主体ROI到temp目录
 def letterbox_resize(
     img: Image.Image,
     target_size: Tuple[int, int],
-    fill_color: Tuple[int, int, int] = (0, 0, 0),
+    fill_color: Optional[Tuple[int, int, int]] = None,
 ) -> Tuple[Image.Image, np.ndarray]:
     """
     保持宽高比地将图片 padding 到 target_size，并返回有效区域的 binary mask。
+
+    填充色默认为图片自身的平均颜色（自适应），避免固定黑色填充让模型学到
+    "暗色=padding=可忽略"，导致暗背景上的暗色异物漏检。
 
     Returns:
         img_padded: PIL Image，尺寸为 target_size (H×W)
@@ -72,6 +68,11 @@ def letterbox_resize(
     new_h = int(oh * scale)
 
     img_resized = img.resize((new_w, new_h), Image.BILINEAR)
+
+    if fill_color is None:
+        arr = np.array(img_resized)
+        mean_color = tuple(int(c) for c in arr.reshape(-1, 3).mean(axis=0))
+        fill_color = mean_color
 
     pad_left = (tw - new_w) // 2
     pad_top = (th - new_h) // 2
@@ -88,16 +89,19 @@ def letterbox_resize(
 def letterbox_resize_cv2(
     img_np: np.ndarray,
     target_size: Tuple[int, int],
-    fill_color: Tuple[int, int, int] = (0, 0, 0),
+    fill_color: Optional[Tuple[int, int, int]] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     cv2/numpy 版 letterbox_resize，避免 PIL Image 创建/粘贴开销。
     直接操作 numpy 数组，在热路径 (_preprocess_rois_to_batch) 中替代 PIL 版本。
 
+    填充色默认为图片自身的平均颜色（自适应），避免固定黑色填充让模型学到
+    "暗色=padding=可忽略"。
+
     Args:
         img_np: RGB numpy 数组 (H, W, 3), uint8
         target_size: (H, W)
-        fill_color: RGB 填充色
+        fill_color: RGB 填充色，None 则使用图片均值
 
     Returns:
         img_padded: numpy 数组 (target_size[0], target_size[1], 3), uint8
@@ -111,6 +115,10 @@ def letterbox_resize_cv2(
     new_h = int(h * scale)
 
     img_resized = cv2.resize(img_np, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+    if fill_color is None:
+        mean_color = tuple(int(c) for c in img_resized.reshape(-1, 3).mean(axis=0))
+        fill_color = mean_color
 
     pad_left = (tw - new_w) // 2
     pad_top = (th - new_h) // 2
@@ -354,9 +362,8 @@ _DinoV2Loader.__init__ = _patched_dinov2loader_init
 class DinomalyWrapper:
     """Dinomaly 推理包装器"""
 
-    # SSIM 阈值：如果 top-k 平均 SSIM 得分大于此值，判定为异常
-    SSIM_THRESHOLD = 0.6
-    SSIM_TOP_K = 3  # 取 top-k 张 FN 图片的 SSIM 平均值，避免单张幸运匹配
+    # YOLO 检测置信度阈值（bbox confidence）
+    YOLO_CONFIDENCE_THRESHOLD = 0.5
 
     def __init__(self, device: str = "cuda"):
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
@@ -367,8 +374,7 @@ class DinomalyWrapper:
         self.normalize_brightness_config = False
         self.normalize_contrast_config = False
         self.threshold = 0.5
-        self.fn_images_by_pos: Dict[str, List[np.ndarray]] = {}  # 按 pos_id 组织的 FN 图片
-        self.fn_masks_by_pos: Dict[str, List[np.ndarray]] = {}   # 按 pos_id 组织的 FN mask
+        self.yolo_model = None  # YOLO 检测模型（可选）
 
     def load_from_checkpoint(self, model_path: str, config_path: str = None):
         """从 checkpoint 加载模型"""
@@ -403,368 +409,60 @@ class DinomalyWrapper:
         # 获取阈值
         self.threshold = self._get_threshold()
 
-        # 加载 FN 图片（用于 SSIM 比对）
-        self._load_fn_images(model_path)
+        # 加载 YOLO 检测模型（如果存在）
+        self._load_yolo_model(model_path)
 
-        logger.info(f"Dinomaly model loaded. Threshold: {self.threshold:.4f}, FN positions: {len(self.fn_images_by_pos)}")
+        yolo_status = "loaded" if self.yolo_model is not None else "not found"
+        logger.info(f"Dinomaly model loaded. Threshold: {self.threshold:.4f}, YOLO: {yolo_status}")
 
-    def _load_fn_images(self, model_path: str):
-        """加载模型目录下的 FN 图片和 mask，按 pos_id 组织用于 SSIM 比对"""
-        model_dir = Path(model_path).parent
-        fn_dir = model_dir / "fn_images"
-        fn_masks_dir = model_dir / "masks" / "fn"
-
-        # 本目录找不到时，去兄弟目录里找 {pos_id} 子目录
-        if not fn_dir.exists():
-            pos_id = model_dir.name          # e.g. "2"
-            parent = model_dir.parent
-            for sibling in sorted(parent.iterdir()):
-                if not sibling.is_dir() or sibling == model_dir:
-                    continue
-                candidate = sibling / "fn_images" / pos_id
-                if candidate.exists():
-                    logger.info(
-                        f"[SSIM] Redirecting fn_images: "
-                        f"{fn_dir} → {sibling / 'fn_images'} (pos_id={pos_id})"
-                    )
-                    fn_dir = sibling / "fn_images"
-                    fn_masks_dir = sibling / "masks" / "fn"
-                    break
-
-        logger.info(f"[SSIM] Looking for FN images in: {fn_dir}")
-        logger.info(f"[SSIM] Looking for FN masks in: {fn_masks_dir}")
-
-        if not fn_dir.exists():
-            logger.warning(f"[SSIM] FN images directory not found: {fn_dir}")
+    def _load_yolo_model(self, model_path: str):
+        """如果存在则加载 YOLO 检测模型。"""
+        try:
+            from ultralytics import YOLO
+        except ImportError:
+            logger.warning("[YOLO] ultralytics not installed, skip YOLO model loading")
             return
 
-        self.fn_images_by_pos = {}
-        self.fn_masks_by_pos = {}
+        yolo_path = Path(model_path).parent / "yolo_model.pt"
+        if yolo_path.exists():
+            self.yolo_model = YOLO(str(yolo_path))
+            logger.info(f"[YOLO] Detection model loaded from {yolo_path}")
+        else:
+            logger.info(f"[YOLO] No yolo_model.pt found at {yolo_path}, YOLO secondary check disabled")
 
-        # 检查是否按 pos_id 分文件夹（新格式）还是扁平结构（旧格式兼容）
-        subdirs = [d for d in fn_dir.iterdir() if d.is_dir()]
-        if subdirs:
-            # 新格式：fn_images/{pos_id}/fn_xxxx.npy（灰度 numpy 数组）
-            for pos_dir in sorted(subdirs):
-                pos_id = pos_dir.name
-                # .npy 优先：避免同一 stem 的 .npy 和 .jpg 重复加载
-                npy_files = sorted(pos_dir.glob("*.npy"))
-                npy_stems = {f.stem for f in npy_files}
-                jpg_files = sorted(pos_dir.glob("*.jpg"))
-                legacy_jpg = [f for f in jpg_files if f.stem not in npy_stems]
-                all_files = npy_files + legacy_jpg
-                if len(legacy_jpg) < len(jpg_files):
-                    skipped = len(jpg_files) - len(legacy_jpg)
-                    logger.info(f"[SSIM] pos_id={pos_id}: Found {len(npy_files)} npy + {len(legacy_jpg)} jpg FN images (skipped {skipped} duplicate jpg)")
+    def check_yolo_anomaly(self, roi: np.ndarray) -> Tuple[bool, float]:
+        """对单个 ROI 运行 YOLO 检测。返回 (is_anomaly, max_confidence)。"""
+        if self.yolo_model is None:
+            return False, 0.0
+        results = self.check_yolo_anomaly_batch([roi])
+        return results[0] if results else (False, 0.0)
+
+    def check_yolo_anomaly_batch(self, rois: List[np.ndarray]) -> List[Tuple[bool, float]]:
+        """对一批 ROI 运行 YOLO 检测。返回 [(is_anomaly, max_confidence), ...]。"""
+        if self.yolo_model is None:
+            return [(False, 0.0)] * len(rois)
+        if not rois:
+            return []
+
+        try:
+            rois_rgb = [cv2.cvtColor(roi, cv2.COLOR_BGR2RGB) for roi in rois]
+            results = self.yolo_model.predict(
+                rois_rgb, verbose=False, imgsz=320, conf=self.YOLO_CONFIDENCE_THRESHOLD
+            )
+
+            output = []
+            for i, result in enumerate(results):
+                boxes = result.boxes
+                if boxes is not None and len(boxes) > 0:
+                    max_conf = float(boxes.conf.max())
+                    logger.debug(f"[YOLO] ROI[{i}] Detected {len(boxes)} box(es), max_conf={max_conf:.4f}")
+                    output.append((True, max_conf))
                 else:
-                    logger.info(f"[SSIM] pos_id={pos_id}: Found {len(npy_files)} npy + {len(legacy_jpg)} jpg FN images")
-
-                images = []
-                masks = []
-                pos_mask_dir = fn_masks_dir / pos_id
-
-                for img_path in all_files:
-                    try:
-                        # 加载图像：优先 .npy（灰度数组），其次 .jpg（BGR 图片）
-                        if img_path.suffix == '.npy':
-                            gray = np.load(str(img_path))
-                        else:
-                            img = cv2.imread(str(img_path))
-                            if img is None:
-                                logger.warning(f"[SSIM] Failed to read FN image: {img_path}")
-                                continue
-                            if len(img.shape) == 3:
-                                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                            else:
-                                gray = img
-
-                        mask = None
-                        mask_path = pos_mask_dir / f"{img_path.stem}.npy"
-                        if mask_path.exists():
-                            try:
-                                mask = np.load(mask_path)
-                                if mask.shape != (self.input_size[1], self.input_size[0]):
-                                    logger.warning(f"[SSIM] Mask shape mismatch for {img_path.name}: {mask.shape}")
-                                    mask = None
-                            except Exception as e:
-                                logger.warning(f"[SSIM] Failed to load mask for {img_path.name}: {e}")
-
-                        if mask is None:
-                            mask = np.ones((self.input_size[1], self.input_size[0]), dtype=bool)
-
-                        # 统一尺寸
-                        if gray.shape != (self.input_size[1], self.input_size[0]):
-                            gray = cv2.resize(gray, self.input_size)
-                        images.append(gray)
-                        masks.append(mask)
-
-                    except Exception as e:
-                        logger.warning(f"[SSIM] Failed to load FN image {img_path}: {e}")
-
-                if images:
-                    self.fn_images_by_pos[pos_id] = images
-                    self.fn_masks_by_pos[pos_id] = masks
-                    logger.info(f"[SSIM] Loaded {len(images)} FN images for pos_id={pos_id}")
-        else:
-            # 旧格式兼容：fn_images/fn_xxxx.npy 或 fn_xxxx.jpg（扁平结构，图片归到 "default" pos_id）
-            npy_files = sorted(fn_dir.glob("*.npy"))
-            npy_stems = {f.stem for f in npy_files}
-            jpg_files = sorted(fn_dir.glob("*.jpg"))
-            legacy_jpg = [f for f in jpg_files if f.stem not in npy_stems]
-            all_files = npy_files + legacy_jpg
-            skipped = len(jpg_files) - len(legacy_jpg)
-            logger.info(f"[SSIM] Legacy format: Found {len(npy_files)} npy + {len(legacy_jpg)} jpg FN images (skipped {skipped} duplicate jpg, will use pos_id='default')")
-
-            images = []
-            masks = []
-            for img_path in all_files:
-                try:
-                    if img_path.suffix == '.npy':
-                        gray = np.load(str(img_path))
-                    else:
-                        img = cv2.imread(str(img_path))
-                        if img is None:
-                            continue
-                        if len(img.shape) == 3:
-                            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                        else:
-                            gray = img
-
-                    mask = None
-                    mask_path = fn_masks_dir / f"{img_path.stem}.npy"
-                    if mask_path.exists():
-                        try:
-                            mask = np.load(mask_path)
-                        except Exception:
-                            pass
-
-                    if mask is None:
-                        mask = np.ones((self.input_size[1], self.input_size[0]), dtype=bool)
-
-                    # 统一尺寸
-                    if gray.shape != (self.input_size[1], self.input_size[0]):
-                        gray = cv2.resize(gray, self.input_size)
-                    images.append(gray)
-                    masks.append(mask)
-                except Exception as e:
-                    logger.warning(f"[SSIM] Failed to load FN image {img_path}: {e}")
-
-            if images:
-                self.fn_images_by_pos["default"] = images
-                self.fn_masks_by_pos["default"] = masks
-
-        total_images = sum(len(v) for v in self.fn_images_by_pos.values())
-        total_positions = len(self.fn_images_by_pos)
-        if total_images > 0:
-            logger.info(f"[SSIM] Total loaded {total_images} FN images across {total_positions} positions")
-        else:
-            logger.warning(f"[SSIM] No valid FN images loaded from {fn_dir}")
-
-    def _save_ssim_visualization(self, roi_gray: np.ndarray, fn_gray: np.ndarray,
-                                  roi_mask: np.ndarray, fn_mask: np.ndarray,
-                                  ssim_score: float, idx: int = 0, pos_id: str = None):
-        """保存 SSIM 对比可视化图片到日志目录"""
-        try:
-            import matplotlib
-            matplotlib.use('Agg')
-            import matplotlib.pyplot as plt
-
-            # 计算 mask 的交集
-            valid_mask = roi_mask & fn_mask
-
-            # 裁剪到有效区域
-            rows = np.any(valid_mask, axis=1)
-            cols = np.any(valid_mask, axis=0)
-            if not np.any(rows) or not np.any(cols):
-                return
-            rmin, rmax = np.where(rows)[0][[0, -1]]
-            cmin, cmax = np.where(cols)[0][[0, -1]]
-
-            roi_crop = roi_gray[rmin:rmax+1, cmin:cmax+1]
-            fn_crop = fn_gray[rmin:rmax+1, cmin:cmax+1]
-
-            # 计算差异图
-            diff = np.abs(roi_crop.astype(float) - fn_crop.astype(float))
-
-            # 创建可视化
-            fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-            fig.suptitle(f'SSIM Comparison - Score: {ssim_score:.4f}', fontsize=14)
-
-            # ROI 图片
-            axes[0, 0].imshow(roi_crop, cmap='gray')
-            axes[0, 0].set_title('Input ROI')
-            axes[0, 0].axis('off')
-
-            # FN 图片
-            axes[0, 1].imshow(fn_crop, cmap='gray')
-            axes[0, 1].set_title('FN Image')
-            axes[0, 1].axis('off')
-
-            # 差异热力图
-            im = axes[1, 0].imshow(diff, cmap='hot', vmin=0, vmax=255)
-            axes[1, 0].set_title('Difference Map')
-            axes[1, 0].axis('off')
-            plt.colorbar(im, ax=axes[1, 0], fraction=0.046, pad=0.04)
-
-            # 叠加对比
-            axes[1, 1].imshow(roi_crop, cmap='gray', alpha=0.5)
-            axes[1, 1].imshow(fn_crop, cmap='gray', alpha=0.5)
-            axes[1, 1].set_title('Overlay (ROI + FN)')
-            axes[1, 1].axis('off')
-
-            plt.tight_layout()
-
-            # 保存图片
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            pos_str = f"_{pos_id}" if pos_id else ""
-            filename = f"ssim_viz{pos_str}_fn{idx}_{timestamp}_score{ssim_score:.4f}.png"
-            save_path = LOG_DIR / filename
-            plt.savefig(str(save_path), dpi=150, bbox_inches='tight')
-            plt.close(fig)
-
-            logger.info(f"[SSIM_VIZ] Saved visualization to {save_path}")
+                    output.append((False, 0.0))
+            return output
         except Exception as e:
-            logger.warning(f"[SSIM_VIZ] Failed to save visualization: {e}")
-
-    def calculate_ssim(self, roi_gray: np.ndarray, fn_gray: np.ndarray,
-                       roi_mask: np.ndarray = None, fn_mask: np.ndarray = None,
-                       save_viz: bool = False, viz_idx: int = 0, pos_id: str = None) -> float:
-        """
-        计算 ROI 与 FN 图片的 SSIM 相似度（标准滑动窗口法），只比较有效区域。
-        roi_gray / fn_gray 应为已预处理的灰度图，尺寸一致 (224×224)。
-
-        Args:
-            roi_gray: ROI 灰度图
-            fn_gray: FN 灰度图
-            roi_mask: ROI 有效区域 mask
-            fn_mask: FN 有效区域 mask
-            save_viz: 是否保存可视化图片
-            viz_idx: 可视化图片索引
-            pos_id: 位置 ID，用于文件名
-
-        Returns:
-            SSIM 得分 (0-1, 1 表示完全相同)
-        """
-        if not SSIM_AVAILABLE:
-            return 0.0
-
-        try:
-            # 输入已是灰度图，直接使用
-            gray_roi = roi_gray
-            gray_fn = fn_gray
-
-            # 如果没有提供 mask，创建全 True 的 mask
-            if roi_mask is None:
-                roi_mask = np.ones(gray_roi.shape, dtype=bool)
-            if fn_mask is None:
-                fn_mask = np.ones(gray_fn.shape, dtype=bool)
-
-            # 计算 mask 的交集（只比较两个都有效的区域）
-            valid_mask = roi_mask & fn_mask
-
-            # 如果没有有效区域，返回 0
-            if not np.any(valid_mask):
-                return 0.0
-
-            # 裁剪到有效区域的 bounding box（letterbox 的有效区域是矩形）
-            rows = np.any(valid_mask, axis=1)
-            cols = np.any(valid_mask, axis=0)
-            rmin, rmax = np.where(rows)[0][[0, -1]]
-            cmin, cmax = np.where(cols)[0][[0, -1]]
-
-            roi_crop = gray_roi[rmin:rmax+1, cmin:cmax+1]
-            fn_crop = gray_fn[rmin:rmax+1, cmin:cmax+1]
-
-            # 确保裁剪区域足够大（至少 7x7，即 SSIM 默认 win_size）
-            min_side = min(roi_crop.shape[0], roi_crop.shape[1])
-            if min_side < 7:
-                return 0.0
-
-            # 使用 skimage 标准窗口化 SSIM
-            win_size = min(7, min_side if min_side % 2 == 1 else min_side - 1)
-            ssim_value = ssim(roi_crop, fn_crop, data_range=255, win_size=win_size)
-
-            # 保存可视化（如果启用）
-            if save_viz:
-                self._save_ssim_visualization(roi_gray, fn_gray, roi_mask, fn_mask,
-                                              ssim_value, viz_idx, pos_id)
-
-            return float(ssim_value)
-
-        except Exception as e:
-            logger.warning(f"SSIM calculation failed: {e}")
-            return 0.0
-
-    def check_ssim_anomaly(self, roi: np.ndarray, pos_id: str = None) -> Tuple[bool, float]:
-        """
-        使用 SSIM 检查 ROI 是否与同位置的 FN 图片相似。
-        取 top-k 张 FN 图片的 SSIM 平均值，避免单张幸运匹配导致误判。
-
-        Args:
-            roi: 输入 ROI
-            pos_id: 位置 ID，用于匹配同位置的 FN 图片。为 None 时使用所有 FN 图片。
-
-        Returns:
-            (is_anomaly, avg_ssim_score)
-            - is_anomaly: 如果 top-k 平均 SSIM > SSIM_THRESHOLD 返回 True
-            - avg_ssim_score: top-k 平均 SSIM 得分
-        """
-        if not self.fn_images_by_pos or not SSIM_AVAILABLE:
-            return False, 0.0
-
-        # 根据 pos_id 选择 FN 图片
-        if pos_id is not None and pos_id in self.fn_images_by_pos:
-            fn_images = self.fn_images_by_pos[pos_id]
-            fn_masks = self.fn_masks_by_pos[pos_id]
-        elif pos_id is not None:
-            # 指定了 pos_id 但没有对应的 FN 图片，尝试使用 "default"
-            if "default" in self.fn_images_by_pos:
-                fn_images = self.fn_images_by_pos["default"]
-                fn_masks = self.fn_masks_by_pos["default"]
-                logger.debug(f"[SSIM] pos_id={pos_id} not found, using 'default' FN images")
-            else:
-                logger.debug(f"[SSIM] No FN images for pos_id={pos_id}")
-                return False, 0.0
-        else:
-            # 未指定 pos_id，使用所有 FN 图片（兼容旧逻辑）
-            fn_images = []
-            fn_masks = []
-            for imgs, mks in zip(self.fn_images_by_pos.values(), self.fn_masks_by_pos.values()):
-                fn_images.extend(imgs)
-                fn_masks.extend(mks)
-
-        if not fn_images:
-            return False, 0.0
-
-        # 对 ROI 进行预处理（与 FN 图片保存时的预处理一致），同时获取 mask
-        roi_processed, roi_mask = self._preprocess_for_ssim(roi)
-
-        all_scores = []
-        roi_shape = roi.shape if roi is not None else "None"
-        processed_shape = roi_processed.shape
-        logger.debug(f"[SSIM] Checking anomaly for ROI shape={roi_shape} -> processed={processed_shape}, pos_id={pos_id}, FN images={len(fn_images)}")
-
-        for idx, (fn_img, fn_mask) in enumerate(zip(fn_images, fn_masks)):
-            ssim_score = self.calculate_ssim(roi_processed, fn_img, roi_mask, fn_mask,
-                                              save_viz=False, viz_idx=idx, pos_id=pos_id)
-            all_scores.append(ssim_score)
-            logger.debug(f"[SSIM] Compared with FN[{idx}]: score={ssim_score:.4f}")
-
-        # 取 top-k 平均，比单张 max 更鲁棒
-        k = min(self.SSIM_TOP_K, len(all_scores))
-        top_k_scores = sorted(all_scores, reverse=True)[:k]
-        avg_ssim = sum(top_k_scores) / len(top_k_scores)
-
-        # 调试可视化默认关闭（matplotlib 保存耗时 0.5-2s），需要时设置环境变量启用
-        if top_k_scores and os.environ.get("SSIM_DEBUG_VIZ"):
-            top1_score = top_k_scores[0]
-            top1_idx = all_scores.index(top1_score)
-            self.calculate_ssim(roi_processed, fn_images[top1_idx], roi_mask, fn_masks[top1_idx],
-                                save_viz=True, viz_idx=top1_idx, pos_id=pos_id)
-
-        is_anomaly = avg_ssim > self.SSIM_THRESHOLD
-        logger.info(f"[SSIM] Result: pos_id={pos_id}, top{k}_avg={avg_ssim:.4f} (scores={[f'{s:.4f}' for s in top_k_scores]}), threshold={self.SSIM_THRESHOLD}, is_anomaly={is_anomaly}")
-        return is_anomaly, avg_ssim
+            logger.warning(f"[YOLO] Batch detection failed: {e}")
+            return [(False, 0.0)] * len(rois)
 
     def load_config(self, config_path: str):
         """加载配置文件"""
@@ -822,18 +520,18 @@ class DinomalyWrapper:
             score = self._extract_score_with_mask([output], masks[0])
             dinomaly_score = float(score)
 
-            # 如果 Dinomaly 已判定为异常，跳过 SSIM 检查
+            # 如果 Dinomaly 已判定为异常，跳过 YOLO 检查
             if dinomaly_score > self.threshold:
-                logger.info(f"[Dinomaly] Anomaly detected: dinomaly={dinomaly_score:.4f} > threshold={self.threshold:.4f}, skip SSIM")
-                return {"error": dinomaly_score, "infer_failed": False, "ssim_score": 0.0, "dinomaly_score": dinomaly_score}
+                logger.info(f"[Dinomaly] Anomaly detected: dinomaly={dinomaly_score:.4f} > threshold={self.threshold:.4f}, skip YOLO")
+                return {"error": dinomaly_score, "infer_failed": False, "yolo_score": 0.0, "dinomaly_score": dinomaly_score}
 
-            # Dinomaly 判定正常，再使用 SSIM 检查是否与同位置的 FN 图片相似
-            is_ssim_anomaly, ssim_score = self.check_ssim_anomaly(roi, pos_id=pos_id)
-            if is_ssim_anomaly:
-                logger.info(f"[SSIM] Anomaly detected: dinomaly={dinomaly_score:.4f}, ssim={ssim_score:.4f} > {self.SSIM_THRESHOLD}")
-                return {"error": 1.0, "infer_failed": False, "ssim_score": float(ssim_score), "ssim_anomaly": True, "dinomaly_score": dinomaly_score}
+            # Dinomaly 判定正常，再使用 YOLO 检测二次确认
+            is_yolo_anomaly, yolo_conf = self.check_yolo_anomaly(roi)
+            if is_yolo_anomaly:
+                logger.info(f"[YOLO] Anomaly detected: dinomaly={dinomaly_score:.4f}, yolo_conf={yolo_conf:.4f} > {self.YOLO_CONFIDENCE_THRESHOLD}")
+                return {"error": 1.0, "infer_failed": False, "yolo_score": float(yolo_conf), "yolo_anomaly": True, "dinomaly_score": dinomaly_score}
 
-            return {"error": dinomaly_score, "infer_failed": False, "ssim_score": float(ssim_score), "dinomaly_score": dinomaly_score}
+            return {"error": dinomaly_score, "infer_failed": False, "yolo_score": float(yolo_conf), "dinomaly_score": dinomaly_score}
 
         except Exception as e:
             logger.error(f"[DinomalyWrapper] inference failed: {e}")
@@ -859,7 +557,7 @@ class DinomalyWrapper:
             target_size = getattr(self, 'target_size', None)
 
         # 初始化结果列表
-        results = [{"error": 0.0, "infer_failed": True, "ssim_score": 0.0} for _ in range(len(rois))]
+        results = [{"error": 0.0, "infer_failed": True, "yolo_score": 0.0} for _ in range(len(rois))]
 
         # 首先使用 Dinomaly 对所有 ROI 进行批量推理
         try:
@@ -885,7 +583,7 @@ class DinomalyWrapper:
                     results[i] = {
                         "error": dinomaly_score,
                         "infer_failed": False,
-                        "ssim_score": 0.0,
+                        "yolo_score": 0.0,
                         "dinomaly_score": dinomaly_score
                     }
 
@@ -893,34 +591,36 @@ class DinomalyWrapper:
             logger.error(f"[DinomalyWrapper] batch inference failed: {e}")
             return results
 
-        # 对 Dinomaly 判定为正常的 ROI，再使用 SSIM 检查
-        dinomaly_normal_count = 0
+        # 对 Dinomaly 判定为正常的 ROI，再使用 YOLO 检测二次确认
+        # 收集所有需要 YOLO 检查的 ROI，批量推理
+        yolo_check_indices: List[int] = []
+        yolo_check_rois: List[np.ndarray] = []
         for i, roi in enumerate(rois):
             if results[i].get("infer_failed", True):
                 continue
-            dinomaly_score = results[i]["error"]
-            if dinomaly_score > self.threshold:
-                logger.debug(f"[Dinomaly] ROI[{i}] anomaly detected, skip SSIM: score={dinomaly_score:.4f} > {self.threshold:.4f}")
+            if results[i]["error"] > self.threshold:
+                logger.debug(f"[Dinomaly] ROI[{i}] anomaly detected, skip YOLO: score={results[i]['error']:.4f} > {self.threshold:.4f}")
                 continue
+            yolo_check_indices.append(i)
+            yolo_check_rois.append(roi)
 
-            # Dinomaly 判定正常，进行 SSIM 检查
-            dinomaly_normal_count += 1
-            pos_id = pos_ids[i] if pos_ids and i < len(pos_ids) else None
-            is_ssim_anomaly, ssim_score = self.check_ssim_anomaly(roi, pos_id=pos_id)
-            results[i]["ssim_score"] = float(ssim_score)
-            if is_ssim_anomaly:
-                logger.info(f"[SSIM] ROI[{i}] anomaly detected: dinomaly={dinomaly_score:.4f}, ssim={ssim_score:.4f} > {self.SSIM_THRESHOLD}")
-                results[i] = {
-                    "error": 1.0,
-                    "infer_failed": False,
-                    "ssim_score": float(ssim_score),
-                    "ssim_anomaly": True,
-                    "dinomaly_score": dinomaly_score
-                }
+        if yolo_check_rois:
+            yolo_batch_results = self.check_yolo_anomaly_batch(yolo_check_rois)
+            for idx, (is_yolo_anomaly, yolo_conf) in zip(yolo_check_indices, yolo_batch_results):
+                dinomaly_score = results[idx]["dinomaly_score"]
+                results[idx]["yolo_score"] = float(yolo_conf)
+                if is_yolo_anomaly:
+                    logger.info(f"[YOLO] ROI[{idx}] anomaly detected: dinomaly={dinomaly_score:.4f}, yolo_conf={yolo_conf:.4f} > {self.YOLO_CONFIDENCE_THRESHOLD}")
+                    results[idx] = {
+                        "error": 1.0,
+                        "infer_failed": False,
+                        "yolo_score": float(yolo_conf),
+                        "yolo_anomaly": True,
+                        "dinomaly_score": dinomaly_score
+                    }
 
-        if dinomaly_normal_count > 0:
-            ssim_anomaly_count = sum(1 for r in results if r.get("ssim_anomaly", False))
-            logger.info(f"[SSIM] Checked {dinomaly_normal_count} Dinomaly-normal ROIs, {ssim_anomaly_count} SSIM anomalies found")
+            yolo_anomaly_count = sum(1 for r in results if r.get("yolo_anomaly", False))
+            logger.info(f"[YOLO] Batch checked {len(yolo_check_rois)} Dinomaly-normal ROIs, {yolo_anomaly_count} YOLO anomalies found")
 
         return results
 
@@ -932,46 +632,6 @@ class DinomalyWrapper:
         """批量推理 - 直接调用模型 forward，跳过磁盘 I/O 和 engine.predict。"""
         # 直接复用 infer_batch 的实现，确保一致性
         return self.infer_batch(rois, target_size, normalize_brightness, normalize_contrast, pos_ids=pos_ids)
-
-    def _preprocess_for_ssim(self, roi: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        预处理 ROI 用于 SSIM 比对，与 FN 图片保存时的预处理一致。
-
-        Args:
-            roi: 输入 ROI (BGR 格式)
-
-        Returns:
-            (roi_gray, mask): 预处理后的灰度图 (224, 224) 和有效区域 mask (224, 224)
-        """
-        h, w = roi.shape[:2]
-        th, tw = self.input_size  # (224, 224)
-
-        # 转换为 PIL Image 格式以使用 letterbox_resize
-        if len(roi.shape) == 2:
-            roi_rgb = cv2.cvtColor(roi, cv2.COLOR_GRAY2RGB)
-        elif roi.shape[2] == 4:
-            roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGRA2RGB)
-        elif roi.shape[2] == 3:
-            roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
-        else:
-            roi_rgb = roi
-
-        pil_img = Image.fromarray(roi_rgb)
-
-        # 应用亮度/对比度归一化（在 letterbox_resize 之前，与训练时一致）
-        if self.normalize_brightness_config:
-            pil_img = self._normalize_brightness_pil(pil_img)
-        if self.normalize_contrast_config:
-            pil_img = ImageOps.autocontrast(pil_img)
-
-        # letterbox_resize 到 224x224（与 FN 图片保存时一致），同时获取 mask
-        img_padded, mask = letterbox_resize(pil_img, self.input_size)
-
-        # 转换为 numpy 数组 (RGB) → 灰度图（SSIM 计算只需要灰度）
-        roi_np = np.array(img_padded)
-        roi_gray = cv2.cvtColor(roi_np, cv2.COLOR_RGB2GRAY)
-
-        return roi_gray, mask
 
     @staticmethod
     def _normalize_brightness_pil(img: Image.Image, target_mean: float = 168.0, threshold: int = 10) -> Image.Image:
@@ -1530,10 +1190,8 @@ class MultiModelDetector:
                     end = start + INFERENCE_BATCH_SIZE
                     batch_rois = rois_for_model[start:end]
                     batch_indices = indices_for_model[start:end]
-                    # 从每个 ROI 的 annotation 中提取真实的 pos_id，用于 SSIM 按位置匹配 FN 图片
-                    # （by_category 模式下 pos_id 是类别名，ann['pos_id'] 才是实际位置ID）
+                    # 批处理推理（YOLO 辅助检查在 infer_batch 内部完成）
                     batch_pos_ids = [str(ann.get('pos_id', pos_id)) for _, _, ann in group[start:end]]
-
                     batch_results = model.infer_batch_direct(batch_rois, pos_ids=batch_pos_ids)
 
                     # 如果全部失败，抛出异常触发 fallback
@@ -1543,14 +1201,14 @@ class MultiModelDetector:
                     for idx, result in zip(batch_indices, batch_results):
                         score = result["error"]
                         dinomaly_score = result.get("dinomaly_score", score)
-                        ssim_score = result.get("ssim_score", 0.0)
-                        is_ssim_anomaly = result.get("ssim_anomaly", False)
+                        yolo_score = result.get("yolo_score", 0.0)
+                        is_yolo_anomaly = result.get("yolo_anomaly", False)
                         dinomaly_info = f" dinomaly={dinomaly_score:.4f}"
-                        ssim_info = f" ssim={ssim_score:.4f}({'anomaly' if is_ssim_anomaly else 'normal'})"
+                        yolo_info = f" yolo={yolo_score:.4f}({'anomaly' if is_yolo_anomaly else 'normal'})"
                         logger.info(
                             f"[{request_id}] [{category}] ROI {idx+1}/{total_rois} "
                             f"pos_id={pos_id} roi_size={rois_for_model[start].shape[1]}x{rois_for_model[start].shape[0]} "
-                            f"score={score:.4f} threshold={threshold:.4f}{dinomaly_info}{ssim_info} (batch)"
+                            f"score={score:.4f} threshold={threshold:.4f}{dinomaly_info}{yolo_info} (batch)"
                         )
                         result_pairs[idx] = (make_result(score, result["infer_failed"]), False)
 
@@ -1563,14 +1221,14 @@ class MultiModelDetector:
                         result = model.infer_single(roi, pos_id=real_pos_id)
                         score = result["error"]
                         dinomaly_score = result.get("dinomaly_score", score)
-                        ssim_score = result.get("ssim_score", 0.0)
-                        is_ssim_anomaly = result.get("ssim_anomaly", False)
+                        yolo_score = result.get("yolo_score", 0.0)
+                        is_yolo_anomaly = result.get("yolo_anomaly", False)
                         dinomaly_info = f" dinomaly={dinomaly_score:.4f}"
-                        ssim_info = f" ssim={ssim_score:.4f}({'anomaly' if is_ssim_anomaly else 'normal'})"
+                        yolo_info = f" yolo={yolo_score:.4f}({'anomaly' if is_yolo_anomaly else 'normal'})"
                         logger.info(
                             f"[{request_id}] [{category}] ROI {idx+1}/{total_rois} "
                             f"pos_id={real_pos_id} roi_size={roi.shape[1]}x{roi.shape[0]} "
-                            f"score={score:.4f} threshold={threshold:.4f}{dinomaly_info}{ssim_info} (single)"
+                            f"score={score:.4f} threshold={threshold:.4f}{dinomaly_info}{yolo_info} (single)"
                         )
                         result_pairs[idx] = (make_result(score, result["infer_failed"]), False)
                     except Exception as e2:
@@ -1916,7 +1574,7 @@ def _load_precomputed_template_variants(
                     "feats": feats,  # 预提取的特征（GPU tensors）
                     # 缓存 numpy keypoints，避免 RANSAC 验证时重复 rbd()+.cpu().numpy()
                     "feats_np": {
-                        "keypoints": feats_data['keypoints'].astype(np.float32)
+                        "keypoints": feats_data['keypoints'][0].astype(np.float32)
                     }
                 })
 
@@ -2372,7 +2030,7 @@ def detect_workpieces_with_lightglue(
     - A_template_to_roi_image: 直接计算的模板 → roi_image 仿射变换矩阵
     """
     if rotations is None:
-        rotations = rotations = list(range(0, 360, 15))
+        rotations = rotations = list(range(0, 360, 30))
 
     extractor, matcher, device = _get_lightglue_models()
     if extractor is None or matcher is None:
@@ -3504,7 +3162,7 @@ def load_models():
         TEMPLATE_IMAGE, TEMPLATE_ANNOTATIONS, subject_label="工件主体"
     )
     if subject_img is not None:
-        default_rotations = list(range(0, 360, 15))
+        default_rotations = list(range(0, 360, 30))
         # 传入 models_dir 以支持加载预计算的模板变体
         precompute_template_variant_features(subject_img, default_rotations, models_dir=base_dir)
     else:

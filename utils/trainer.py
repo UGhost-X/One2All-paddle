@@ -117,10 +117,13 @@ def normalize_contrast(image: Image.Image, target_std: float = 65.0, threshold: 
 def letterbox_resize(
     img: Image.Image,
     target_size: Tuple[int, int],
-    fill_color: Tuple[int, int, int] = (0, 0, 0),
+    fill_color: Optional[Tuple[int, int, int]] = None,
 ) -> Tuple[Image.Image, np.ndarray]:
     """
     保持宽高比地将图片 padding 到 target_size，并返回有效区域的 binary mask。
+
+    填充色默认为图片自身的平均颜色（自适应），避免固定黑色填充让模型学到
+    "暗色=padding=可忽略"，导致暗背景上的暗色异物漏检。
 
     Returns:
         img_padded: PIL Image，尺寸为 target_size (H×W)
@@ -134,6 +137,11 @@ def letterbox_resize(
     new_h = int(oh * scale)
 
     img_resized = img.resize((new_w, new_h), Image.BILINEAR)
+
+    if fill_color is None:
+        arr = np.array(img_resized)
+        mean_color = tuple(int(c) for c in arr.reshape(-1, 3).mean(axis=0))
+        fill_color = mean_color
 
     pad_left = (tw - new_w) // 2
     pad_top = (th - new_h) // 2
@@ -683,6 +691,84 @@ class ModelTrainer:
         t.start()
         return task_id
 
+    def _create_yolo_only_training_task(
+        self,
+        dataset_dir: str,
+        config: dict,
+        path_id: str,
+        base_model_dir: str,
+    ) -> str:
+        """创建纯 YOLO 训练任务（无 FP，仅 FN 图像）。复制基础 Dinomaly 模型 + 训练 YOLO 检测器。"""
+        model_name = config.get("model_name", "Dinomaly")
+        safe_path_id = str(path_id).replace("/", "_").replace("\\", "_")
+        task_id = f"{model_name.lower()}_yolo_{int(time.time())}_{safe_path_id}_{random.randint(1000, 9999)}"
+
+        task_uuid = config.get("task_uuid", "unknown")
+        save_dir = os.path.join(
+            self.output_dir,
+            config.get("project_id", "default"),
+            task_uuid,
+            str(path_id),
+        )
+
+        external_group_id = config.get("external_group_id")
+        task_key = self._make_task_key(dataset_dir, config, roi_id=safe_path_id)
+
+        self.training_status[task_id] = {
+            "status": "starting",
+            "progress": 0,
+            "group_id": external_group_id or f"yolo_only_{path_id}",
+            "internal_group_id": path_id,
+            "task_uuid": task_uuid,
+            "logs": [f"YOLO-only task {task_id} initialized for path_id={path_id}"],
+            "metrics": [],
+            "total_epochs": 1,
+            "start_time": time.time(),
+            "dataset_dir": dataset_dir,
+            "save_dir": save_dir,
+            "config": config,
+            "task_key": task_key,
+            "group_annotations": [],
+        }
+        self._persist_state_if_due(force=True)
+
+        self._stop_events[task_id] = threading.Event()
+        t = threading.Thread(
+            target=self._train_yolo_group_process,
+            args=(task_id, dataset_dir, config, path_id, base_model_dir),
+            daemon=True,
+        )
+        self.threads[task_id] = t
+        t.start()
+        return task_id
+
+    def _train_yolo_group_process(
+        self,
+        task_id: str,
+        dataset_dir: str,
+        config: dict,
+        path_id: str,
+        base_model_dir: str,
+    ):
+        """纯 YOLO 训练进程入口（detection 模式）。"""
+        self._semaphore.acquire()
+        with self._active_lock:
+            self._active_tasks += 1
+        try:
+            self._do_train_yolo_only(task_id, dataset_dir, config, path_id, base_model_dir)
+        except SystemExit:
+            self._add_log(task_id, "YOLO training cancelled")
+            self._update_task_status(task_id, status="cancelled")
+        except Exception as e:
+            logger.exception(f"YOLO training failed for {task_id}")
+            self._update_task_status(task_id, status="failed", error=str(e))
+            self._add_log(task_id, f"Error: {e}")
+        finally:
+            with self._active_lock:
+                self._active_tasks -= 1
+            self._semaphore.release()
+            self._persist_state_if_due(force=True)
+
     def _make_task_key(self, dataset_dir: str, config: dict, roi_id=None) -> str:
         """生成任务唯一标识"""
         parts = [
@@ -990,7 +1076,7 @@ class ModelTrainer:
         decoder_depth = config.get("decoder_depth", 8)
         bottleneck_dropout = config.get("bottleneck_dropout", 0.2)
         epochs = config.get("epochs", 12)
-        batch_size = config.get("batch_size", 8)
+        batch_size = config.get("batch_size", 2)
         num_workers = config.get("num_workers", 4)
         normalize_brightness = config.get("normalize_brightness", False)
         normalize_contrast = config.get("normalize_contrast", False)
@@ -1413,7 +1499,37 @@ class ModelTrainer:
             self._update_task_status(task_id, progress=90)
             self._save_dinomaly_model(task_id, save_dir, dataset_dir, model, engine, config, threshold, scores, group_annotations)
 
+            # Stage 4/4: 如果存在 FN 图像，训练 YOLO 检测器
+            fn_images_dir = Path(save_dir) / "fn_images"
+            if fn_images_dir.exists() and list(fn_images_dir.rglob("fn_*.jpg")):
+                self._update_task_status(task_id, progress=92, stage="YOLO")
+                self._add_log(task_id, "Stage 4/4: Preparing YOLO detection dataset...")
 
+                yolo_dataset_dir = Path(save_dir) / "_yolo_dataset"
+                normal_roi_dir = Path(dataset_dir) / "roi" / str(path_id)
+                count = self._prepare_yolo_dataset(
+                    task_id=task_id,
+                    normal_roi_dir=str(normal_roi_dir),
+                    fn_images_dir=str(fn_images_dir),
+                    output_dir=yolo_dataset_dir,
+                    config=config,
+                )
+                if count > 0:
+                    self._add_log(task_id, "Stage 4/4: Training YOLO detector on FN images...")
+                    self._train_yolo_detector(task_id, yolo_dataset_dir, save_dir, config, progress_range=(93, 98))
+                    try:
+                        keep = True
+                        if keep:
+                            self._add_log(task_id, f"[YOLO] Dataset kept: {yolo_dataset_dir}")
+                        else:
+                            shutil.rmtree(yolo_dataset_dir, ignore_errors=True)
+                    except Exception:
+                        pass
+                    self._add_log(task_id, f"YOLO detector training done ({count} defect samples)")
+                else:
+                    self._add_log(task_id, "YOLO training skipped (insufficient FN images or missing normal ROI)")
+            else:
+                self._add_log(task_id, "No FN images found, skipping YOLO training")
 
             self._update_task_status(
                 task_id,
@@ -1754,7 +1870,7 @@ class ModelTrainer:
                 logger.info("No subject annotation found, using full template image")
 
             # 生成24个旋转角度（每15度一个）
-            rotations = list(range(0, 360, 15))
+            rotations = list(range(0, 360, 30))
             variants_dir = Path(save_dir) / "template_variants"
             variants_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1838,6 +1954,377 @@ class ModelTrainer:
             logger.warning(f"Failed to precompute template variants: {e}")
             import traceback
             traceback.print_exc()
+
+    # ==================== YOLO 检测训练 ====================
+
+    def _sample_normal_images(self, roi_dir: Path, num_samples: int) -> List[Path]:
+        """从正常 ROI 目录随机采样指定数量的图像（不增强）。"""
+        all_images = list(roi_dir.glob("*.png")) + list(roi_dir.glob("*.jpg"))
+        if len(all_images) <= num_samples:
+            return all_images
+        return random.sample(all_images, num_samples)
+
+    def _augment_fn_images(
+        self,
+        task_id: str,
+        fn_dir: Path,
+        output_dir: Path,
+        target_total: int = 200,
+    ) -> int:
+        """对 FN 原图预处理 (letterbox_resize) 后应用轻度增强，使总数接近 target_total。返回最终总数。"""
+        fn_originals = sorted(list(fn_dir.rglob("fn_*.jpg")))
+        n_orig = len(fn_originals)
+        self._add_log(task_id, f"[YOLO] Found {n_orig} original FN images, target={target_total}")
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # 先对 FN 原图做预处理（与 Dinomaly 训练时 extract_roi_images 一致），再保存
+        input_size = (224, 224)
+        preprocessed_originals = []
+        for p in fn_originals:
+            try:
+                img = Image.open(p).convert("RGB")
+                # letterbox_resize 保持宽高比，自适应填充色，与训练预处理一致
+                img_padded, _ = letterbox_resize(img, input_size)
+                dst = output_dir / p.name
+                img_padded.save(str(dst), quality=95)
+                preprocessed_originals.append((p, img_padded))
+            except Exception as e:
+                self._add_log(task_id, f"[YOLO] Failed to preprocess FN image {p}: {e}")
+
+        n_valid = len(preprocessed_originals)
+        if n_valid == 0:
+            self._add_log(task_id, "[YOLO] No valid FN images after preprocessing")
+            return 0
+
+        if n_valid >= target_total:
+            self._add_log(task_id, f"[YOLO] FN images already >= target ({n_valid} >= {target_total}), skip augmentation")
+            return n_valid
+
+        # 计算每张原图需要的增强数量
+        aug_per_image = max(1, (target_total - n_valid) // n_valid)
+        self._add_log(task_id, f"[YOLO] Augmenting {aug_per_image}x per FN image ({(target_total - n_valid)} needed)")
+
+        fn_aug_config = PROJECT_ROOT / "configs" / "augmentations_fn.yaml"
+        transform = load_augmentation_transform(str(fn_aug_config))
+
+        total = n_valid
+        for img_path, img_padded in preprocessed_originals:
+            for j in range(aug_per_image):
+                if total >= target_total:
+                    break
+                try:
+                    aug_img = apply_augmentation(img_padded, transform) if transform else img_padded
+                except Exception:
+                    aug_img = img_padded
+                aug_path = output_dir / f"{img_path.stem}_aug{j:04d}.jpg"
+                aug_img.save(str(aug_path), quality=95)
+                total += 1
+
+        self._add_log(task_id, f"[YOLO] FN augmentation done: {n_valid} preprocessed + {total - n_valid} augmented = {total}")
+        return total
+
+    def _prepare_yolo_dataset(
+        self,
+        task_id: str,
+        normal_roi_dir: str,
+        fn_images_dir: str,
+        output_dir: Path,
+        config: dict,
+    ) -> int:
+        """
+        构建 YOLO 检测二分类数据集（detection 格式）。
+        - normal 图 → 空 label（无目标）
+        - defect 图 → 整图 bbox（class 0 = defect）
+        返回 defect 类样本数；返回 0 表示跳过训练。
+        """
+        fn_dir = Path(fn_images_dir)
+        fn_originals = list(fn_dir.rglob("fn_*.jpg"))
+        min_samples = config.get("yolo_min_samples", 1)
+
+        self._add_log(task_id, f"[YOLO] Preparing detection dataset: normal={normal_roi_dir}, fn={fn_images_dir}, min_samples={min_samples}")
+
+        if len(fn_originals) < min_samples:
+            self._add_log(task_id, f"[YOLO] Insufficient FN images ({len(fn_originals)} < {min_samples}), skipping")
+            return 0
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # YOLO detection 目录结构: train/images/, train/labels/, val/images/, val/labels/
+        train_img_dir = output_dir / "train" / "images"
+        train_lbl_dir = output_dir / "train" / "labels"
+        val_img_dir = output_dir / "val" / "images"
+        val_lbl_dir = output_dir / "val" / "labels"
+        for d in [train_img_dir, train_lbl_dir, val_img_dir, val_lbl_dir]:
+            d.mkdir(parents=True, exist_ok=True)
+
+        # 1. defect 类：FN 原图 + 增强（目标 200），整图作为 bbox
+        defect_aug_dir = output_dir / "_defect_aug"
+        defect_count = self._augment_fn_images(task_id, fn_dir, defect_aug_dir, target_total=200)
+
+        # 2. normal 类：从 Dinomaly 训练数据随机采样（不增强），与 defect 数量匹配
+        normal_roi_path = Path(normal_roi_dir)
+
+        # 如果当前 task_uuid 的 roi 目录不存在，向上追溯到父级 train 目录
+        if not normal_roi_path.exists():
+            train_base = normal_roi_path.parent.parent.parent  # product/{project_id}/train/
+            path_id_str = normal_roi_path.name  # path_id
+            found_roi_dirs = sorted(train_base.glob(f"*/roi/{path_id_str}"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if found_roi_dirs:
+                normal_roi_path = found_roi_dirs[0]
+                self._add_log(task_id, f"[YOLO] Fallback to ancestor normal ROI: {normal_roi_path}")
+            else:
+                self._add_log(task_id, f"[YOLO] WARNING: normal_roi_dir not found in current or any ancestor train dir: {normal_roi_dir}")
+                return 0
+
+        normal_paths = self._sample_normal_images(normal_roi_path, defect_count)
+        self._add_log(task_id, f"[YOLO] Sampled {len(normal_paths)} normal images from {normal_roi_path}")
+
+        # 3. 收集所有图片列表并拆分 train/val (80/20)
+        defect_paths = sorted(defect_aug_dir.iterdir())
+        all_normal = [p for p in normal_paths]
+        all_defect = [p for p in defect_paths if p.suffix.lower() in ('.jpg', '.png')]
+
+        random.shuffle(all_normal)
+        random.shuffle(all_defect)
+
+        n_val_normal = max(1, int(len(all_normal) * 0.2))
+        n_val_defect = max(1, int(len(all_defect) * 0.2))
+
+        train_normals = all_normal[n_val_normal:]
+        val_normals = all_normal[:n_val_normal]
+        train_defects = all_defect[n_val_defect:]
+        val_defects = all_defect[:n_val_defect]
+
+        # 4. 复制图片并生成 label 文件（normal=空label, defect=整图bbox）
+        def _place_images(paths, img_dir, lbl_dir, is_defect):
+            for p in paths:
+                dst_name = p.name
+                shutil.copy2(str(p), str(img_dir / dst_name))
+                label_path = lbl_dir / (Path(dst_name).stem + ".txt")
+                if is_defect:
+                    label_path.write_text("0 0.5 0.5 1.0 1.0\n")
+                else:
+                    label_path.write_text("")
+
+        _place_images(train_normals, train_img_dir, train_lbl_dir, is_defect=False)
+        _place_images(train_defects, train_img_dir, train_lbl_dir, is_defect=True)
+        _place_images(val_normals, val_img_dir, val_lbl_dir, is_defect=False)
+        _place_images(val_defects, val_img_dir, val_lbl_dir, is_defect=True)
+
+        # 5. 生成 YAML 配置文件
+        yaml_path = output_dir / "dataset.yaml"
+        yaml_content = f"""# YOLO detection dataset (auto-generated)
+path: {output_dir}
+train: train/images
+val: val/images
+
+names:
+  0: defect
+"""
+        yaml_path.write_text(yaml_content)
+
+        self._add_log(
+            task_id,
+            f"[YOLO] Dataset built: train normal={len(train_normals)}, train defect={len(train_defects)}, "
+            f"val normal={len(val_normals)}, val defect={len(val_defects)}, "
+            f"yaml={yaml_path}"
+        )
+
+        # 清理临时目录
+        shutil.rmtree(defect_aug_dir, ignore_errors=True)
+
+        return defect_count
+
+    def _train_yolo_detector(
+        self,
+        task_id: str,
+        dataset_dir: Path,
+        save_dir: str,
+        config: dict,
+        progress_range: tuple = (92, 98),
+    ):
+        """训练 YOLOv8 检测器（epochs=100, patience=15 早停）。"""
+        try:
+            from ultralytics import YOLO
+        except ImportError:
+            self._add_log(task_id, "[YOLO] ERROR: ultralytics not installed, skip YOLO training")
+            return
+
+        pretrained_path = PROJECT_ROOT / "models" / "pretrained" / "yolov8n.pt"
+        if not pretrained_path.exists():
+            self._add_log(task_id, f"[YOLO] Local detection model not found at {pretrained_path}, will try auto-download")
+            pretrained_path = "yolov8n.pt"
+
+        yolo_epochs =40
+        yolo_imgsz = 320
+        yaml_path = dataset_dir / "dataset.yaml"
+        self._add_log(task_id, f"[YOLO] Starting detection training: epochs={yolo_epochs}, patience=15, imgsz={yolo_imgsz}, lr0=0.01, cos_lr=True, data={yaml_path}")
+        train_start = time.time()
+
+        trainer_ref = self
+        p_min, p_max = progress_range
+
+        def on_epoch_end(trainer):
+            current = trainer.epoch + 1
+            progress = int(p_min + (current / yolo_epochs) * (p_max - p_min))
+            trainer_ref._update_task_status(task_id, progress=min(progress, 99))
+            loss = trainer.loss
+            metrics = getattr(trainer, 'metrics', {}) or {}
+            mAP50 = metrics.get('metrics/mAP50(B)', None)
+            mAP50_95 = metrics.get('metrics/mAP50-95(B)', None)
+            parts = [f"loss={loss:.4f}"] if loss is not None else []
+            if mAP50 is not None:
+                parts.append(f"mAP50={mAP50:.4f}")
+            if mAP50_95 is not None:
+                parts.append(f"mAP50-95={mAP50_95:.4f}")
+            metrics_str = " ".join(parts) if parts else ""
+            trainer_ref._add_log(
+                task_id,
+                f"[YOLO] Epoch {current}/{yolo_epochs} {metrics_str}"
+            )
+
+        model = YOLO(str(pretrained_path))
+        model.add_callback("on_train_epoch_end", on_epoch_end)
+
+        import io
+        old_stdout = sys.stdout
+        sys.stdout = io.StringIO()
+
+        try:
+            results = model.train(
+                data=str(yaml_path),
+                epochs=yolo_epochs,
+                patience=15,
+                imgsz=yolo_imgsz,
+                batch=config.get("yolo_batch", 16),
+                workers=0,
+                lr0=0.01,
+                amp=False,
+                cos_lr=True,
+                seed=42,
+                verbose=False,
+                exist_ok=True,
+            )
+        finally:
+            sys.stdout = old_stdout
+
+        # 记录训练结果指标
+        elapsed = time.time() - train_start
+        results_dict = getattr(results, 'results_dict', {}) or {}
+        mAP50 = results_dict.get('metrics/mAP50(B)', None)
+        mAP50_95 = results_dict.get('metrics/mAP50-95(B)', None)
+        precision = results_dict.get('metrics/precision(B)', None)
+        recall = results_dict.get('metrics/recall(B)', None)
+
+        # 从 savedir 获取实际完成的 epoch 数
+        actual_epochs = "?"
+        if hasattr(results, "save_dir") and results.save_dir:
+            results_csv = Path(results.save_dir) / "results.csv"
+            if results_csv.exists():
+                try:
+                    lines = results_csv.read_text().strip().split("\n")
+                    actual_epochs = str(len(lines) - 1)
+                except Exception:
+                    pass
+
+        self._add_log(task_id,
+            f"[YOLO] Training finished in {elapsed:.1f}s: "
+            f"epochs={actual_epochs}/{yolo_epochs}, "
+            f"mAP50={mAP50 if mAP50 is not None else 'N/A'}, "
+            f"mAP50-95={mAP50_95 if mAP50_95 is not None else 'N/A'}, "
+            f"P={precision if precision is not None else 'N/A'}, "
+            f"R={recall if recall is not None else 'N/A'}"
+        )
+
+        # 查找 best.pt 并复制到模型目录
+        if hasattr(results, "save_dir") and results.save_dir:
+            best_pt = Path(results.save_dir) / "weights" / "best.pt"
+        else:
+            runs_dir = Path.cwd() / "runs" / "detect"
+            train_dirs = sorted(runs_dir.glob("train*"), key=lambda p: p.stat().st_mtime, reverse=True)
+            best_pt = train_dirs[0] / "weights" / "best.pt" if train_dirs else None
+
+        if best_pt and best_pt.exists():
+            dst = Path(save_dir) / "yolo_model.pt"
+            shutil.copy2(str(best_pt), str(dst))
+            self._add_log(task_id, f"[YOLO] Model saved: {dst} ({elapsed:.1f}s)")
+        else:
+            self._add_log(task_id, "[YOLO] WARNING: best.pt not found after training")
+
+    def _do_train_yolo_only(
+        self,
+        task_id: str,
+        dataset_dir: str,
+        config: dict,
+        path_id: str,
+        base_model_dir: str,
+    ):
+        """纯 FN 重训：复制基础 Dinomaly 模型 + 训练 YOLO 检测器。"""
+        self._add_log(task_id, f"YOLO-only training started for path_id={path_id}")
+        self._update_task_status(task_id, status="preparing", progress=10)
+
+        with self._status_lock:
+            save_dir = self.training_status[task_id]["save_dir"]
+        os.makedirs(save_dir, exist_ok=True)
+
+        # 1. 复制基础 Dinomaly 模型文件
+        self._add_log(task_id, "Stage 1/2: Copying base Dinomaly model...")
+        base_dir = Path(base_model_dir)
+        copied = []
+        for fname in ["model.ckpt", "dinomaly_model.pt", "config.json", "threshold.json"]:
+            src = base_dir / fname
+            if src.exists():
+                dst = Path(save_dir) / fname
+                shutil.copy2(str(src), str(dst))
+                copied.append(fname)
+
+        # 复制 yolo_model.pt（如果基础模型也有）
+        src_yolo = base_dir / "yolo_model.pt"
+        if src_yolo.exists():
+            shutil.copy2(str(src_yolo), str(Path(save_dir) / "yolo_model.pt"))
+            copied.append("yolo_model.pt")
+
+        # 复制 template_variants
+        src_variants = base_dir / "template_variants"
+        if src_variants.exists() and src_variants.is_dir():
+            dst_variants = Path(save_dir) / "template_variants"
+            if dst_variants.exists():
+                shutil.rmtree(str(dst_variants))
+            shutil.copytree(str(src_variants), str(dst_variants))
+            self._add_log(task_id, "Copied template_variants")
+
+        self._add_log(task_id, f"Copied base model files: {copied}")
+
+        # 2. 训练 YOLO 检测器
+        self._update_task_status(task_id, status="training", progress=30, stage="YOLO")
+        self._add_log(task_id, "Stage 2/2: Preparing YOLO detection dataset...")
+
+        fn_images_dir = Path(save_dir) / "fn_images"
+        normal_roi_dir = Path(dataset_dir) / "roi" / str(path_id)
+
+        if fn_images_dir.exists() and list(fn_images_dir.rglob("fn_*.jpg")):
+            yolo_dataset_dir = Path(save_dir) / "_yolo_dataset"
+            count = self._prepare_yolo_dataset(
+                task_id=task_id,
+                normal_roi_dir=str(normal_roi_dir),
+                fn_images_dir=str(fn_images_dir),
+                output_dir=yolo_dataset_dir,
+                config=config,
+            )
+            if count > 0:
+                self._add_log(task_id, "Stage 2/2: Training YOLO detector on FN images...")
+                self._train_yolo_detector(task_id, yolo_dataset_dir, save_dir, config, progress_range=(40, 98))
+                self._add_log(task_id, f"[YOLO] Dataset kept: {yolo_dataset_dir}")
+                self._add_log(task_id, f"YOLO detector training done ({count} defect samples)")
+            else:
+                self._add_log(task_id, "YOLO training skipped (insufficient FN images or missing normal ROI)")
+        else:
+            self._add_log(task_id, "No FN images found, skipping YOLO training")
+
+        self._update_task_status(task_id, status="completed", progress=100, stage="completed", end_time=time.time())
+        self._persist_state_if_due(force=True)
+        self._add_log(task_id, f"YOLO-only training completed for path_id={path_id}")
 
     def _cleanup_training_resources(self, model, engine: Engine = None, datamodule=None):
         """清理训练资源 - 彻底释放显存"""

@@ -56,301 +56,6 @@ logger = logging.getLogger(__name__)
 # 初始化模型训练器（使用环境变量配置的output路径）
 trainer = ModelTrainer(output_dir=str(get_output_dir()), max_concurrent=3)
 
-# SSIM 预处理配置（与推理时一致）
-SSIM_INPUT_SIZE = (224, 224)  # 模型输入尺寸 (W, H)
-
-
-def letterbox_resize_pil(
-    img: Image.Image,
-    target_size: Tuple[int, int],
-    fill_color: Tuple[int, int, int] = (0, 0, 0),
-) -> Tuple[Image.Image, np.ndarray]:
-    """
-    保持宽高比地将图片 padding 到 target_size，并返回有效区域的 mask。
-    与推理服务中的 letterbox_resize 保持一致。
-
-    Returns:
-        img_padded: PIL Image，尺寸为 target_size
-        mask: np.ndarray bool (H, W)，True 表示原始像素，False 表示填充像素
-    """
-    tw, th = target_size
-    ow, oh = img.size
-
-    # 防止除零错误
-    if ow == 0 or oh == 0:
-        logger.warning(f"Invalid image size: {ow}x{oh}, returning blank image")
-        return Image.new("RGB", (tw, th), fill_color), np.zeros((th, tw), dtype=bool)
-
-    scale = min(tw / ow, th / oh)
-    new_w = max(1, int(ow * scale))
-    new_h = max(1, int(oh * scale))
-
-    img_resized = img.resize((new_w, new_h), Image.BILINEAR)
-
-    pad_left = (tw - new_w) // 2
-    pad_top = (th - new_h) // 2
-
-    img_padded = Image.new("RGB", (tw, th), fill_color)
-    img_padded.paste(img_resized, (pad_left, pad_top))
-
-    # 创建有效区域的 mask
-    mask = np.zeros((th, tw), dtype=bool)
-    mask[pad_top:pad_top + new_h, pad_left:pad_left + new_w] = True
-
-    return img_padded, mask
-
-
-def preprocess_fn_image_for_ssim(fn_img: Image.Image, target_size: Tuple[int, int] = None) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    对 FN 图片进行与推理时相同的预处理，用于 SSIM 比对。
-
-    Args:
-        fn_img: PIL Image (RGB)
-        target_size: 目标尺寸 (W, H)，默认 224x224
-
-    Returns:
-        (roi_bgr, mask): 预处理后的 BGR 格式 numpy 数组和有效区域 mask
-    """
-    try:
-        if target_size is None:
-            target_size = SSIM_INPUT_SIZE
-
-        # 确保图片是 RGB 模式
-        if fn_img.mode != 'RGB':
-            fn_img = fn_img.convert('RGB')
-
-        # letterbox_resize 保持宽高比并 padding 到目标尺寸
-        # 注意：letterbox_resize 已经将图片 resize 到 target_size，不需要再次 resize
-        img_padded, mask = letterbox_resize_pil(fn_img, target_size)
-
-        # 转换为 numpy 数组 (RGB)
-        roi_np = np.array(img_padded)
-
-        # 转换为灰度图（与推理时 SSIM 计算一致，直接保存为 numpy 数组）
-        roi_gray = cv2.cvtColor(roi_np, cv2.COLOR_RGB2GRAY)
-
-        return roi_gray, mask
-    except Exception as e:
-        logger.error(f"Error in preprocess_fn_image_for_ssim: {e}, img_size={fn_img.size if fn_img else 'None'}", exc_info=True)
-        # 返回一个空白图片和全 False mask 作为 fallback
-        blank = np.zeros((SSIM_INPUT_SIZE[1], SSIM_INPUT_SIZE[0], 3), dtype=np.uint8)
-        blank_mask = np.zeros((SSIM_INPUT_SIZE[1], SSIM_INPUT_SIZE[0]), dtype=bool)
-        return blank, blank_mask
-
-
-def merge_fn_images_from_base(base_model_dir: Path, new_model_dir: Path) -> Dict[str, int]:
-    """
-    将旧模型的 FN 图片和 mask 合并到新模型目录。
-    返回 {pos_id: 已有文件数} 供后续保存新 FN 时递增索引。
-
-    Args:
-        base_model_dir: 旧模型目录（包含 fn_images/ 和 masks/fn/）
-        new_model_dir: 新模型目录
-
-    Returns:
-        pos_counters: {pos_id: 已有 npy 文件数量}
-    """
-    pos_counters: Dict[str, int] = {}
-
-    base_fn_dir = base_model_dir / "fn_images"
-    if not base_fn_dir.exists() or not base_fn_dir.is_dir():
-        return pos_counters
-
-    base_fn_masks_dir = base_model_dir / "masks" / "fn"
-    new_fn_dir = new_model_dir / "fn_images"
-    new_fn_masks_dir = new_model_dir / "masks" / "fn"
-    new_fn_dir.mkdir(parents=True, exist_ok=True)
-    new_fn_masks_dir.mkdir(parents=True, exist_ok=True)
-
-    for pos_dir in base_fn_dir.iterdir():
-        if not pos_dir.is_dir():
-            continue
-        pos_id = pos_dir.name
-
-        new_pos_dir = new_fn_dir / pos_id
-        new_pos_mask_dir = new_fn_masks_dir / pos_id
-        new_pos_dir.mkdir(parents=True, exist_ok=True)
-        new_pos_mask_dir.mkdir(parents=True, exist_ok=True)
-
-        # 复制 .npy FN 图片文件
-        npy_files = list(pos_dir.glob("*.npy"))
-        for npy_file in npy_files:
-            dst = new_pos_dir / npy_file.name
-            if not dst.exists():
-                shutil.copy2(str(npy_file), str(dst))
-
-        # 复制对应的 mask 文件
-        base_pos_mask_dir = base_fn_masks_dir / pos_id
-        if base_pos_mask_dir.exists():
-            for mask_file in base_pos_mask_dir.glob("*.npy"):
-                dst = new_pos_mask_dir / mask_file.name
-                if not dst.exists():
-                    shutil.copy2(str(mask_file), str(dst))
-
-        # 记录该 pos_id 已有的文件数量
-        pos_counters[pos_id] = len(list(new_pos_dir.glob("*.npy")))
-
-    return pos_counters
-
-
-def create_fn_only_simulated_task(
-    trainer: ModelTrainer,
-    project_id: str,
-    task_uuid: str,
-    path_id: str,
-    fn_images: List[Tuple[Image.Image, str]],  # (image, pos_id)
-    base_model_path: str,
-    base_config: dict,
-) -> str:
-    """
-    为纯 FN 场景创建模拟训练任务。
-    不实际训练模型，只复制基础模型并保存 FN 图片（按 pos_id 分文件夹），同时创建任务状态供前端轮询。
-
-    Args:
-        trainer: 模型训练器实例
-        project_id: 项目ID
-        task_uuid: 任务UUID
-        path_id: path_id
-        fn_images: FN 图片列表，每项为 (PIL Image, pos_id)
-        base_model_path: 基础模型路径
-        base_config: 基础模型配置
-
-    Returns:
-        task_id: 模拟任务ID
-    """
-    import random
-    import time
-    import threading
-
-    model_name = "Dinomaly"
-    safe_group_id = str(path_id).replace("/", "_").replace("\\", "_")
-    task_id = f"{model_name.lower()}_fn_only_{int(time.time())}_{safe_group_id}_{random.randint(1000, 9999)}"
-
-    save_dir = os.path.join(
-        str(get_output_dir()),
-        project_id,
-        task_uuid,
-        str(path_id),
-    )
-    os.makedirs(save_dir, exist_ok=True)
-
-    # 创建任务状态
-    trainer.training_status[task_id] = {
-        "status": "starting",
-        "progress": 0,
-        "group_id": f"fn_only_{path_id}",
-        "internal_group_id": path_id,
-        "task_uuid": task_uuid,
-        "logs": [f"Task {task_id} initialized for FN-only processing (SSIM mode)."],
-        "metrics": [],
-        "total_epochs": 1,
-        "start_time": time.time(),
-        "dataset_dir": save_dir,
-        "save_dir": save_dir,
-        "config": {
-            "model_name": model_name,
-            "project_id": project_id,
-            "task_uuid": task_uuid,
-            "path_id": path_id,
-            "train_mode": base_config.get("train_mode", "by_category"),
-            "category": base_config.get("category", ""),
-            "category_label": base_config.get("category_label", "unknown"),
-        },
-        "task_key": f"fn_only_{project_id}_{task_uuid}_{path_id}",
-        "group_annotations": [],
-        "is_simulated": True,  # 标记为模拟任务
-    }
-
-    # 启动模拟训练线程
-    def _simulate_fn_training():
-        try:
-            # Stage 1: 准备中
-            trainer._update_task_status(task_id, status="preparing", progress=10)
-            trainer._add_log(task_id, "Stage 1/3: Preparing FN images for SSIM comparison...")
-            time.sleep(0.5)
-
-            # Stage 2: 保存 FN 图片和 mask（按 pos_id 分文件夹）
-            trainer._update_task_status(task_id, status="training", progress=30)
-            trainer._add_log(task_id, f"Stage 2/3: Saving {len(fn_images)} FN images (organized by pos_id)...")
-
-            fn_images_dir = Path(save_dir) / "fn_images"
-            fn_masks_dir = Path(save_dir) / "masks" / "fn"
-
-            # 先合并旧模型的 FN 图片，保证重训链上的 FN 不丢失
-            base_model_dir = Path(base_model_path).parent
-            pos_counters = merge_fn_images_from_base(base_model_dir, Path(save_dir))
-            # 用 defaultdict 包装，确保新 pos_id 从 0 开始计数
-            from collections import defaultdict
-            _pos_counters: Dict[str, int] = defaultdict(int, pos_counters)
-
-            for fn_img, fn_pos_id in fn_images:
-                try:
-                    fn_img_processed, fn_mask = preprocess_fn_image_for_ssim(fn_img)
-
-                    # 按 pos_id 分文件夹
-                    pos_dir = fn_images_dir / str(fn_pos_id)
-                    pos_mask_dir = fn_masks_dir / str(fn_pos_id)
-                    pos_dir.mkdir(parents=True, exist_ok=True)
-                    pos_mask_dir.mkdir(parents=True, exist_ok=True)
-
-                    idx = _pos_counters[fn_pos_id]
-                    _pos_counters[fn_pos_id] += 1
-
-                    # 保存 FN 图片（灰度 numpy 数组，避免 JPEG 压缩伪影）
-                    fn_img_path = pos_dir / f"fn_{idx:04d}.npy"
-                    np.save(str(fn_img_path), fn_img_processed)
-
-                    # 保存 FN mask
-                    fn_mask_path = pos_mask_dir / f"fn_{idx:04d}.npy"
-                    np.save(str(fn_mask_path), fn_mask)
-
-                    trainer._add_log(task_id, f"Saved FN image (pos_id={fn_pos_id}): {fn_img_path.name} (mask: {fn_mask_path.name})")
-                except Exception as e:
-                    trainer._add_log(task_id, f"Failed to save FN image: {e}")
-
-            time.sleep(0.5)
-
-            # Stage 3: 复制基础模型
-            trainer._update_task_status(task_id, status="training", progress=60)
-            trainer._add_log(task_id, "Stage 3/3: Copying base model...")
-
-            base_model_dir = Path(base_model_path).parent
-            for file_name in ["model.ckpt", "dinomaly_model.pt", "config.json"]:
-                src_file = base_model_dir / file_name
-                if src_file.exists():
-                    shutil.copy2(str(src_file), str(Path(save_dir) / file_name))
-                    trainer._add_log(task_id, f"Copied {file_name}")
-
-            # 复制 template_variants
-            template_variants_src = base_model_dir / "template_variants"
-            if template_variants_src.exists() and template_variants_src.is_dir():
-                template_variants_dst = Path(save_dir) / "template_variants"
-                if template_variants_dst.exists():
-                    shutil.rmtree(str(template_variants_dst))
-                shutil.copytree(str(template_variants_src), str(template_variants_dst))
-                trainer._add_log(task_id, "Copied template_variants")
-
-            time.sleep(0.5)
-
-            # 完成
-            trainer._update_task_status(task_id, status="completed", progress=100)
-            trainer._add_log(task_id, "FN-only processing completed. Model ready for SSIM-based inference.")
-            trainer._persist_state_if_due(force=True)
-
-        except Exception as e:
-            logger.error(f"Simulated FN training failed: {e}", exc_info=True)
-            trainer._update_task_status(task_id, status="failed", error=str(e))
-            trainer._add_log(task_id, f"Error: {e}")
-            trainer._persist_state_if_due(force=True)
-
-    t = threading.Thread(target=_simulate_fn_training, daemon=True)
-    trainer.threads[task_id] = t
-    t.start()
-
-    logger.info(f"Created simulated FN-only task: {task_id} for path_id={path_id}")
-    return task_id
-
-
 app = FastAPI(title="One2All Paddle API")
 
 # 配置 CORS
@@ -895,7 +600,7 @@ class FeedbackGroup(BaseModel):
     path_id: str  # 位置/类别 ID
     false_positive_images: List[str] = []  # base64 编码的正常样本（被误检为异常）
     false_negative_images: List[str] = []  # base64 编码的异常样本 ROI（被漏检）
-    false_negative_pos_ids: List[str] = []  # 每个 FN 图片对应的 pos_id，用于按位置组织 SSIM 比对
+    false_negative_pos_ids: List[str] = []  # 每个 FN 图片对应的 pos_id，用于按位置组织 YOLO 训练
 
 
 class RetrainRequest(BaseModel):
@@ -981,10 +686,11 @@ async def incremental_retrain(request: RetrainRequest):
                 shutil.copytree(str(template_variants_src), str(template_variants_dst))
                 logger.info(f"path_id={path_id}: Copied template_variants directory")
 
-            # 复制 fn_images 目录（SSIM 比对的 FN 样本）
-            fn_merged = merge_fn_images_from_base(base_model_dir, new_model_dir)
-            if fn_merged:
-                logger.info(f"path_id={path_id}: Merged {sum(fn_merged.values())} FN images from base version")
+            # 复制 yolo_model.pt（如果基础模型有 YOLO 分类器）
+            yolo_src = base_model_dir / "yolo_model.pt"
+            if yolo_src.exists():
+                shutil.copy2(str(yolo_src), str(new_model_dir / "yolo_model.pt"))
+                logger.info(f"path_id={path_id}: Copied yolo_model.pt from base version")
 
             # 如果没有找到任何模型文件，记录警告
             if not copied_files:
@@ -1070,6 +776,19 @@ async def incremental_retrain(request: RetrainRequest):
                 shutil.copy2(str(base_annotations_path), str(new_annotations_path))
                 logger.info(f"Copied annotations.json from base model to {new_annotations_path}")
 
+            # 复制基础 ROI 目录（用于 YOLO 训练的 normal 类数据源）
+            # 排除 fp_* 文件（这些是 FP 重训时加入的异常样本）
+            base_roi_dir = base_product_train_dir / "roi" / str(path_id)
+            new_roi_dir = train_base_dir / "roi" / str(path_id)
+            if base_roi_dir.exists() and base_roi_dir.is_dir() and not new_roi_dir.exists():
+                new_roi_dir.mkdir(parents=True, exist_ok=True)
+                roi_copied = 0
+                for f in base_roi_dir.iterdir():
+                    if f.is_file() and not f.name.startswith("fp_"):
+                        shutil.copy2(str(f), str(new_roi_dir / f.name))
+                        roi_copied += 1
+                logger.info(f"path_id={path_id}: Copied {roi_copied} normal ROI images from base to {new_roi_dir}")
+
             # 解码 False Positive 图片
             # FP 图片已经是 ROI，直接保存到 roi/{path_id}/ 目录
             fp_images: List[np.ndarray] = []
@@ -1102,20 +821,28 @@ async def incremental_retrain(request: RetrainRequest):
                 except Exception as e:
                     logger.error(f"Failed to decode FN image[{idx}] for path_id={path_id}: {e}")
 
-            path_task_ids = []
-            fn_already_saved = False  # 标记 FN 是否已由 create_fn_only_simulated_task 保存
+            # ========== 保存 FN 图像到模型目录（用于 YOLO 训练） ==========
+            if fn_images:
+                fn_images_dir = new_model_dir / "fn_images"
+                for fn_img, fn_pos_id in fn_images:
+                    pos_dir = fn_images_dir / str(fn_pos_id)
+                    pos_dir.mkdir(parents=True, exist_ok=True)
+                    existing = len(list(pos_dir.glob("fn_*.jpg")))
+                    try:
+                        fn_img.save(str(pos_dir / f"fn_{existing:04d}.jpg"), "JPEG", quality=95)
+                    except Exception as e:
+                        logger.error(f"Failed to save FN image for pos_id={fn_pos_id}: {e}")
+                logger.info(f"path_id={path_id}: Saved {len(fn_images)} FN images to {fn_images_dir}")
 
             # ========== 处理 False Positives：微调 Dinomaly ==========
             if fp_images:
                 num_fp = len(fp_images)
-                
+
                 # FP 重训策略：基础 ROI 原样复制，FP 图做 30 张增强
-                # 从头训练（checkpoint_path 会在 trainer 中被清空）
                 num_fp_augmentations = 30
                 finetune_epochs = request.epochs or base_config.get("epochs", 12)
                 logger.info(f"path_id={path_id}: Processing {num_fp} FP for retraining ({num_fp_augmentations}x augmentation, {finetune_epochs} epochs)")
 
-                # 训练配置
                 # 基础模型的 ROI 目录
                 base_roi_dir = base_product_train_dir / "roi" / str(path_id)
 
@@ -1144,7 +871,6 @@ async def incremental_retrain(request: RetrainRequest):
 
                 # 重训练时不需要group_annotations，ROI图片已直接保存
                 path_group_id = f"retrain_{int(time.time())}_{path_id}"
-                # 使用 train_base_dir 作为数据集根目录，与基础模型结构一致
                 path_task_ids, _ = trainer.run_batch_training_async(
                     str(train_base_dir),
                     train_config,
@@ -1153,82 +879,50 @@ async def incremental_retrain(request: RetrainRequest):
                 )
                 all_task_ids.extend(path_task_ids)
                 total_fp += num_fp
+            elif fn_images:
+                # 没有 FP 数据，但存在 FN 数据 → 创建纯 YOLO 训练任务
+                logger.info(f"path_id={path_id}: No FP data, but {len(fn_images)} FN images found. Launching YOLO-only training task.")
+                yolo_task_id = trainer._create_yolo_only_training_task(
+                    dataset_dir=str(train_base_dir),
+                    config={
+                        "model_name": "Dinomaly",
+                        "project_id": request.project_id,
+                        "task_uuid": new_task_uuid,
+                        "path_id": path_id,
+                        "train_mode": base_config.get("train_mode", "by_category"),
+                        "category": base_config.get("category", ""),
+                        "category_label": base_config.get("category_label", "unknown"),
+                        "yolo_batch": request.batch_size or base_config.get("batch_size", 8),
+                    },
+                    path_id=str(path_id),
+                    base_model_dir=str(base_model_dir),
+                )
+                path_task_ids = [yolo_task_id]
+                all_task_ids.append(yolo_task_id)
+                path_group_id = f"yolo_only_{int(time.time())}_{path_id}"
             else:
-                # 没有 FP 数据，但有 FN 数据时，创建模拟训练任务
-                if fn_images:
-                    logger.info(f"path_id={path_id}: No FP data, but {len(fn_images)} FN images found. Creating simulated training task.")
-                    fn_task_id = create_fn_only_simulated_task(
-                        trainer=trainer,
-                        project_id=request.project_id,
-                        task_uuid=new_task_uuid,
-                        path_id=path_id,
-                        fn_images=fn_images,
-                        base_model_path=str(base_model_path),
-                        base_config=base_config,
-                    )
-                    path_task_ids = [fn_task_id]
-                    all_task_ids.append(fn_task_id)
-                    path_group_id = f"fn_only_{int(time.time())}_{path_id}"
-                    fn_already_saved = True  # create_fn_only_simulated_task 已保存 FN，避免重复
-                else:
-                    # 既没有 FP 也没有 FN，直接复制原模型
-                    logger.info(f"path_id={path_id}: No FP/FN data, copying model from base version")
-                    for file_name in ["model.ckpt", "dinomaly_model.pt", "config.json"]:
-                        src_file = base_model_dir / file_name
-                        if src_file.exists():
-                            shutil.copy2(str(src_file), str(new_model_dir / file_name))
+                # 既没有 FP 也没有 FN，直接复制原模型
+                logger.info(f"path_id={path_id}: No FP/FN data, copying model from base version")
+                path_task_ids = []
+                for file_name in ["model.ckpt", "dinomaly_model.pt", "config.json"]:
+                    src_file = base_model_dir / file_name
+                    if src_file.exists():
+                        shutil.copy2(str(src_file), str(new_model_dir / file_name))
 
-                    # 复制 template_variants 目录
-                    template_variants_src = base_model_dir / "template_variants"
-                    if template_variants_src.exists() and template_variants_src.is_dir():
-                        template_variants_dst = new_model_dir / "template_variants"
-                        if template_variants_dst.exists():
-                            shutil.rmtree(str(template_variants_dst))
-                        shutil.copytree(str(template_variants_src), str(template_variants_dst))
+                # 复制 yolo_model.pt（如果基础模型有）
+                yolo_src = base_model_dir / "yolo_model.pt"
+                if yolo_src.exists():
+                    shutil.copy2(str(yolo_src), str(new_model_dir / "yolo_model.pt"))
 
-                    # 复制 fn_images 目录（SSIM 比对 FN 样本）
-                    fn_merged = merge_fn_images_from_base(base_model_dir, new_model_dir)
-                    if fn_merged:
-                        logger.info(f"path_id={path_id}: Merged {sum(fn_merged.values())} FN images from base version")
+                # 复制 template_variants 目录
+                template_variants_src = base_model_dir / "template_variants"
+                if template_variants_src.exists() and template_variants_src.is_dir():
+                    template_variants_dst = new_model_dir / "template_variants"
+                    if template_variants_dst.exists():
+                        shutil.rmtree(str(template_variants_dst))
+                    shutil.copytree(str(template_variants_src), str(template_variants_dst))
 
-            # 保存 FN 图片到模型目录，用于 SSIM 比对
-            # 按 pos_id 分文件夹组织，确保推理时只与同位置的 FN 图片比较
-            if fn_images and not fn_already_saved:
-                fn_images_dir = new_model_dir / "fn_images"
-                fn_masks_dir = new_model_dir / "masks" / "fn"
-
-                # 先合并旧模型的 FN 图片，保证重训链上的历史 FN 不丢失
-                pos_counters = merge_fn_images_from_base(base_model_dir, new_model_dir)
-                from collections import defaultdict
-                _pos_counters: Dict[str, int] = defaultdict(int, pos_counters)
-                logger.info(f"Starting to save {len(fn_images)} new FN images to {fn_images_dir} (merged {sum(pos_counters.values())} from base)")
-
-                for fn_img, fn_pos_id in fn_images:
-                    try:
-                        logger.info(f"Processing FN image for pos_id={fn_pos_id}, size={fn_img.size}")
-                        fn_img_processed, fn_mask = preprocess_fn_image_for_ssim(fn_img)
-
-                        # 按 pos_id 分文件夹
-                        pos_dir = fn_images_dir / str(fn_pos_id)
-                        pos_mask_dir = fn_masks_dir / str(fn_pos_id)
-                        pos_dir.mkdir(parents=True, exist_ok=True)
-                        pos_mask_dir.mkdir(parents=True, exist_ok=True)
-
-                        idx = _pos_counters[fn_pos_id]
-                        _pos_counters[fn_pos_id] += 1
-
-                        fn_img_path = pos_dir / f"fn_{idx:04d}.npy"
-                        np.save(str(fn_img_path), fn_img_processed)
-
-                        fn_mask_path = pos_mask_dir / f"fn_{idx:04d}.npy"
-                        np.save(str(fn_mask_path), fn_mask)
-
-                        logger.info(f"Saved FN image to {fn_img_path} (pos_id={fn_pos_id}, shape={fn_img_processed.shape})")
-                    except Exception as e:
-                        logger.error(f"Failed to save FN image for pos_id={fn_pos_id}: {e}", exc_info=True)
-
-                logger.info(f"path_id={path_id}: Saved {len(fn_images)} new FN images across {len(_pos_counters)} positions to {fn_images_dir}")
-                total_fn += len(fn_images)
+            total_fn += len(fn_images)
 
             # 构建 group_ids 列表（用于前端轮询组状态）
             path_group_ids = []
