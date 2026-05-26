@@ -1502,6 +1502,23 @@ class ModelTrainer:
             # Stage 4/4: 如果存在 FN 图像，训练 YOLO 检测器
             fn_images_dir = Path(save_dir) / "fn_images"
             if fn_images_dir.exists() and list(fn_images_dir.rglob("fn_*.jpg")):
+                # 累积历史 FN 图像（从基础模型目录合并，保留历史批次的学习成果）
+                checkpoint_path = config.get("checkpoint_path")
+                if checkpoint_path:
+                    base_model_dir = Path(checkpoint_path).parent
+                    base_fn_dir = base_model_dir / "fn_images"
+                    if base_fn_dir.exists():
+                        merged = 0
+                        for fn_file in base_fn_dir.rglob("fn_*.jpg"):
+                            rel_path = fn_file.relative_to(base_fn_dir)
+                            dst = fn_images_dir / rel_path
+                            if not dst.exists():
+                                dst.parent.mkdir(parents=True, exist_ok=True)
+                                shutil.copy2(str(fn_file), str(dst))
+                                merged += 1
+                        if merged > 0:
+                            self._add_log(task_id, f"[YOLO] Merged {merged} historical FN images from {base_fn_dir}")
+
                 self._update_task_status(task_id, progress=92, stage="YOLO")
                 self._add_log(task_id, "Stage 4/4: Preparing YOLO detection dataset...")
 
@@ -1976,6 +1993,9 @@ class ModelTrainer:
         n_orig = len(fn_originals)
         self._add_log(task_id, f"[YOLO] Found {n_orig} original FN images, target={target_total}")
 
+        # 清理旧数据，避免上次运行的残留文件污染数据集
+        if output_dir.exists():
+            shutil.rmtree(str(output_dir))
         output_dir.mkdir(parents=True, exist_ok=True)
 
         # 先对 FN 原图做预处理（与 Dinomaly 训练时 extract_roi_images 一致），再保存
@@ -1986,9 +2006,11 @@ class ModelTrainer:
                 img = Image.open(p).convert("RGB")
                 # letterbox_resize 保持宽高比，自适应填充色，与训练预处理一致
                 img_padded, _ = letterbox_resize(img, input_size)
-                dst = output_dir / p.name
+                # 用相对路径作为文件名，避免不同 pos_id 下同名文件互相覆盖
+                rel_name = str(p.relative_to(fn_dir)).replace("/", "_").replace("\\", "_")
+                dst = output_dir / rel_name
                 img_padded.save(str(dst), quality=95)
-                preprocessed_originals.append((p, img_padded))
+                preprocessed_originals.append((dst, img_padded))
             except Exception as e:
                 self._add_log(task_id, f"[YOLO] Failed to preprocess FN image {p}: {e}")
 
@@ -2077,8 +2099,8 @@ class ModelTrainer:
                 self._add_log(task_id, f"[YOLO] WARNING: normal_roi_dir not found in current or any ancestor train dir: {normal_roi_dir}")
                 return 0
 
-        normal_paths = self._sample_normal_images(normal_roi_path, defect_count)
-        self._add_log(task_id, f"[YOLO] Sampled {len(normal_paths)} normal images from {normal_roi_path}")
+        normal_paths = list(normal_roi_path.glob("*.png")) + list(normal_roi_path.glob("*.jpg"))
+        self._add_log(task_id, f"[YOLO] Using all {len(normal_paths)} normal images from {normal_roi_path}")
 
         # 3. 收集所有图片列表并拆分 train/val (80/20)
         defect_paths = sorted(defect_aug_dir.iterdir())
@@ -2302,6 +2324,20 @@ names:
 
         fn_images_dir = Path(save_dir) / "fn_images"
         normal_roi_dir = Path(dataset_dir) / "roi" / str(path_id)
+
+        # 累积历史 FN 图像（从基础模型目录合并，保留历史批次的学习成果）
+        base_fn_dir = base_dir / "fn_images"
+        if base_fn_dir.exists():
+            merged = 0
+            for fn_file in base_fn_dir.rglob("fn_*.jpg"):
+                rel_path = fn_file.relative_to(base_fn_dir)
+                dst = fn_images_dir / rel_path
+                if not dst.exists():
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(str(fn_file), str(dst))
+                    merged += 1
+            if merged > 0:
+                self._add_log(task_id, f"[YOLO] Merged {merged} historical FN images from {base_fn_dir}")
 
         if fn_images_dir.exists() and list(fn_images_dir.rglob("fn_*.jpg")):
             yolo_dataset_dir = Path(save_dir) / "_yolo_dataset"

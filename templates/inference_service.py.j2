@@ -29,7 +29,7 @@ INFERENCE_TIMEOUT_SEC = 60
 
 # 推理批次大小，控制每批送入 GPU 的 ROI 数量，避免显存溢出
 # 根据 GPU 显存调整，16GB 显存建议 16-32，8GB 显存建议 8-16
-INFERENCE_BATCH_SIZE = int(os.environ.get("INFERENCE_BATCH_SIZE", 8))
+INFERENCE_BATCH_SIZE = int(os.environ.get("INFERENCE_BATCH_SIZE", 16))
 
 REFERENCE_WORKPIECE_SIZE = (1988, 683)
 REFERENCE_IMAGE_SIZE = (3200, 2100)
@@ -172,7 +172,6 @@ def _save_roi_to_temp_sync(roi: np.ndarray, pos_id: str, category_name: str, wp_
         filename = f"roi_{timestamp}.jpg"
         save_path = temp_dir / filename
         cv2.imwrite(str(save_path), roi)
-        logger.info(f"[ROI_TEMP] Saved ROI to {save_path} (category: {category_name})")
         return save_path
     except Exception as e:
         logger.warning(f"[ROI_TEMP] Failed to save ROI to temp: {e}")
@@ -363,7 +362,7 @@ class DinomalyWrapper:
     """Dinomaly 推理包装器"""
 
     # YOLO 检测置信度阈值（bbox confidence）
-    YOLO_CONFIDENCE_THRESHOLD = 0.5
+    YOLO_CONFIDENCE_THRESHOLD = 0.9
 
     def __init__(self, device: str = "cuda"):
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
@@ -560,21 +559,30 @@ class DinomalyWrapper:
         results = [{"error": 0.0, "infer_failed": True, "yolo_score": 0.0} for _ in range(len(rois))]
 
         # 首先使用 Dinomaly 对所有 ROI 进行批量推理
+        t_total = time.time()
         try:
-            # 直接预处理为 tensor batch，跳过磁盘 I/O
+            # Phase A: 预处理
+            t_pre = time.time()
             image_batch, masks = self._preprocess_rois_to_batch(
                 rois, target_size, normalize_brightness, normalize_contrast
             )
+            t_pre = time.time() - t_pre
 
             if image_batch is None:
                 raise RuntimeError("_preprocess_rois_to_batch returned None")
 
-            # 直接调用 torch model（与 predict_step 一致，不经过 post_processor）
+            # Phase B: GPU 推理（含惰性 anomaly_map 计算）
+            t_gpu = time.time()
             with torch.no_grad():
                 output = self.model.model(image_batch)
+            # 立即提取 anomaly_map tensor，触发可能存在的惰性 GPU 计算
+            anomaly_maps = self._get_anomaly_maps(output)
+            t_gpu = time.time() - t_gpu
 
-            # 提取分数
-            scores = self._extract_scores_with_masks([output], masks)
+            # Phase C: 分数提取（纯 tensor 操作，已在 GPU）
+            t_post = time.time()
+            scores = self._extract_scores_from_tensor(anomaly_maps, masks[:len(rois)])
+            t_post = time.time() - t_post
 
             # 填充 Dinomaly 推理结果
             for i in range(len(rois)):
@@ -591,21 +599,22 @@ class DinomalyWrapper:
             logger.error(f"[DinomalyWrapper] batch inference failed: {e}")
             return results
 
-        # 对 Dinomaly 判定为正常的 ROI，再使用 YOLO 检测二次确认
-        # 收集所有需要 YOLO 检查的 ROI，批量推理
+        # Phase D: YOLO 二次确认（批量推理）
         yolo_check_indices: List[int] = []
         yolo_check_rois: List[np.ndarray] = []
         for i, roi in enumerate(rois):
             if results[i].get("infer_failed", True):
                 continue
             if results[i]["error"] > self.threshold:
-                logger.debug(f"[Dinomaly] ROI[{i}] anomaly detected, skip YOLO: score={results[i]['error']:.4f} > {self.threshold:.4f}")
                 continue
             yolo_check_indices.append(i)
             yolo_check_rois.append(roi)
 
+        t_yolo = 0.0
         if yolo_check_rois:
+            t_yolo = time.time()
             yolo_batch_results = self.check_yolo_anomaly_batch(yolo_check_rois)
+            t_yolo = time.time() - t_yolo
             for idx, (is_yolo_anomaly, yolo_conf) in zip(yolo_check_indices, yolo_batch_results):
                 dinomaly_score = results[idx]["dinomaly_score"]
                 results[idx]["yolo_score"] = float(yolo_conf)
@@ -621,6 +630,22 @@ class DinomalyWrapper:
 
             yolo_anomaly_count = sum(1 for r in results if r.get("yolo_anomaly", False))
             logger.info(f"[YOLO] Batch checked {len(yolo_check_rois)} Dinomaly-normal ROIs, {yolo_anomaly_count} YOLO anomalies found")
+
+        t_total = time.time() - t_total
+        amap_shape = "N/A"
+        try:
+            if hasattr(output, 'anomaly_map'):
+                amap_shape = str(list(output.anomaly_map.shape))
+            elif hasattr(output, 'anomaly_maps'):
+                amap_shape = str(list(output.anomaly_maps.shape))
+            elif isinstance(output, torch.Tensor):
+                amap_shape = str(list(output.shape))
+        except Exception:
+            pass
+        logger.info(f"[TIMING] infer_batch n={len(rois)} amap={amap_shape} | "
+                    f"pre={t_pre*1000:.0f}ms gpu={t_gpu*1000:.0f}ms "
+                    f"post={t_post*1000:.0f}ms yolo={t_yolo*1000:.0f}ms "
+                    f"total={t_total*1000:.0f}ms")
 
         return results
 
@@ -816,10 +841,10 @@ class DinomalyWrapper:
                     # 取第一个样本的 anomaly_map
                     amap = val[0].squeeze().detach().cpu().numpy()
                     mask_resized = cv2.resize(
-                        mask.astype(np.float32),
+                        mask.astype(np.uint8),
                         (amap.shape[1], amap.shape[0]),
-                        interpolation=cv2.INTER_LINEAR
-                    ) > 0.5
+                        interpolation=cv2.INTER_NEAREST
+                    ).astype(bool)
                     # 将 mask 外的区域清零
                     amap_masked = np.where(mask_resized, amap, 0.0)
                     # 使用有效区域的 top-1% 均值作为分数
@@ -842,64 +867,96 @@ class DinomalyWrapper:
         
         return 0.0
 
-    def _extract_scores_with_masks(self, predictions, masks: List[np.ndarray]) -> List[float]:
-        """
-        从预测结果中提取批量分数，使用 mask 处理 anomaly_map。
-        """
-        scores = []
-        score_keys = ['pred_score', 'anomaly_score', 'pred_scores', 'anomaly_scores']
-        anomaly_map_keys = ['anomaly_map', 'anomaly_maps']
+    @staticmethod
+    def _get_anomaly_maps(output) -> Optional[torch.Tensor]:
+        """从模型输出中提取 anomaly_map tensor（触发可能的惰性计算）。"""
+        for key in ('anomaly_map', 'anomaly_maps'):
+            val = getattr(output, key, None)
+            if val is None and isinstance(output, dict):
+                val = output.get(key)
+            if val is not None and isinstance(val, torch.Tensor):
+                return val
+        return None
 
-        mask_idx = 0
+    def _extract_scores_from_tensor(
+        self, anomaly_maps: torch.Tensor, masks: List[np.ndarray]
+    ) -> List[float]:
+        """从 anomaly_map tensor 批量提取分数。全部在 GPU 上完成。"""
+        batch_size = anomaly_maps.shape[0]
+        device = anomaly_maps.device
+        amap_h, amap_w = anomaly_maps.shape[-2:]
+        n_actual = min(batch_size, len(masks))
+
+        # Step 1: 构建 mask batch (CPU)
+        t1 = time.time()
+        mask_list = []
+        for i in range(n_actual):
+            m = torch.from_numpy(masks[i].astype(np.float32))
+            m = m.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+            mask_list.append(m)
+        mask_batch = torch.cat(mask_list, dim=0)
+        t1 = time.time() - t1
+
+        # Step 2: 上传 GPU + resize（先同步排除隐式等待）
+        t2_start = time.time()
+        if device.type == 'cuda':
+            torch.cuda.synchronize(device)
+        t2_sync_done = time.time()
+        mask_batch = mask_batch.to(device, non_blocking=True)
+        t2_copy_done = time.time()
+        mask_batch = F_torch.interpolate(
+            mask_batch, size=(amap_h, amap_w), mode='nearest'
+        )
+        t2_interp_done = time.time()
+
+        # Step 3: mask fill + reshape
+        t3 = time.time()
+        masked = anomaly_maps[:n_actual].masked_fill(mask_batch == 0, float('-inf'))
+        masked_flat = masked.reshape(n_actual, -1)
+        t3 = time.time() - t3
+
+        # Step 4: topk
+        t4 = time.time()
+        n = amap_h * amap_w
+        k_top = max(1, n - int(n * 0.99))
+        top_vals, _ = torch.topk(masked_flat, k_top, dim=1)
+        t4 = time.time() - t4
+
+        # Step 5: CPU 取回结果
+        t5 = time.time()
+        result = top_vals[:, -1].cpu().tolist()
+        t5 = time.time() - t5
+
+        logger.info(f"[TIMING] extract_scores n={n_actual} amap={amap_h}x{amap_w} "
+                    f"mask={list(masks[0].shape)} | "
+                    f"t1_build={t1*1000:.0f}ms "
+                    f"t2_sync={(t2_sync_done-t2_start)*1000:.0f}ms "
+                    f"t2_copy={(t2_copy_done-t2_sync_done)*1000:.0f}ms "
+                    f"t2_interp={(t2_interp_done-t2_copy_done)*1000:.0f}ms "
+                    f"t3_fill={t3*1000:.0f}ms t4_topk={t4*1000:.0f}ms "
+                    f"t5_back={t5*1000:.0f}ms")
+        return result
+
+    def _extract_scores_with_masks(self, predictions, masks: List[np.ndarray]) -> List[float]:
+        """向后兼容：从 predictions 列表中提取分数。"""
+        anomaly_maps = None
         for batch in predictions:
-            # 尝试获取 anomaly_map
-            anomaly_maps = None
-            for key in anomaly_map_keys:
+            anomaly_maps = self._get_anomaly_maps(batch)
+            if anomaly_maps is not None:
+                return self._extract_scores_from_tensor(anomaly_maps, masks)
+
+        # 回退到 pred_score
+        for batch in predictions:
+            for key in ('pred_score', 'anomaly_score', 'pred_scores', 'anomaly_scores'):
                 val = getattr(batch, key, None)
                 if val is None and isinstance(batch, dict):
                     val = batch.get(key)
-                if val is not None and isinstance(val, torch.Tensor):
-                    anomaly_maps = val
-                    break
-            
-            if anomaly_maps is not None:
-                # 处理 batch 中的每个样本
-                batch_size = anomaly_maps.shape[0]
-                for i in range(batch_size):
-                    if mask_idx >= len(masks):
-                        break
-                    mask = masks[mask_idx]
-                    amap = anomaly_maps[i].squeeze().detach().cpu().numpy()
-                    mask_resized = cv2.resize(
-                        mask.astype(np.float32),
-                        (amap.shape[1], amap.shape[0]),
-                        interpolation=cv2.INTER_LINEAR
-                    ) > 0.5
-                    # 将 mask 外的区域清零
-                    amap_masked = np.where(mask_resized, amap, 0.0)
-                    # 使用有效区域的 top-1% 均值作为分数
-                    valid_values = amap_masked[mask_resized]
-                    if len(valid_values) > 0:
-                        score = float(np.percentile(valid_values, 99))
+                if val is not None:
+                    if isinstance(val, torch.Tensor):
+                        return val.detach().cpu().numpy().flatten().tolist()
                     else:
-                        score = float(amap_masked.max())
-                    scores.append(score)
-                    mask_idx += 1
-            else:
-                # 如果没有 anomaly_map，使用 pred_score
-                for key in score_keys:
-                    val = getattr(batch, key, None)
-                    if val is None and isinstance(batch, dict):
-                        val = batch.get(key)
-                    if val is not None:
-                        if isinstance(val, torch.Tensor):
-                            batch_scores = val.detach().cpu().numpy().flatten().tolist()
-                            scores.extend(batch_scores)
-                        else:
-                            scores.append(float(val))
-                        break
-        
-        return scores
+                        return [float(val)]
+        return []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1102,6 +1159,7 @@ class MultiModelDetector:
         if total_rois == 0:
             return []
 
+        t_start = time.time()
         logger.info(f"[detect_by_pos_id] TRAIN_MODE: {TRAIN_MODE}, category: {category}, total_rois: {total_rois}")
 
         result_pairs: List[Optional[tuple]] = [None] * total_rois
@@ -1142,6 +1200,9 @@ class MultiModelDetector:
             if total_rois > 10:
                 _cleanup(f"{category} done", force=False)
 
+        t_elapsed = time.time() - t_start
+        logger.info(f"[TIMING] detect_by_pos_id category={category} "
+                    f"n={total_rois} total={t_elapsed*1000:.0f}ms")
         return [
             r[0] if r is not None else
             {"is_anomaly": False, "anomaly_score": 0.0, "error": 0.0, "threshold": 0.0, "infer_failed": True}
@@ -1155,6 +1216,7 @@ class MultiModelDetector:
         request_id: str,
         total_rois: int,
     ) -> List[Optional[tuple]]:
+        t_start = time.time()
         result_pairs: List[Optional[tuple]] = [None] * total_rois
 
         for pos_id, group in pos_id_groups.items():
@@ -1235,6 +1297,9 @@ class MultiModelDetector:
                         logger.error(f"[{request_id}] [{category}] Error ROI {idx+1} pos_id={pos_id}: {e2}")
                         result_pairs[idx] = (make_result(0.0, True), True)
 
+        t_elapsed = time.time() - t_start
+        logger.info(f"[TIMING] _detect_by_pos_id_original category={category} "
+                    f"n={total_rois} total={t_elapsed*1000:.0f}ms")
         return result_pairs
 
     async def detect_category(
@@ -2289,26 +2354,20 @@ def _transform_template_pts_to_roi(
     return pts_out.reshape(-1, 2)
 
 
-async def process_single_workpiece_roi(
-    detector: MultiModelDetector,
+def _prepare_workpiece_rois(
     roi_image: np.ndarray,
     roi_info: Dict,
-    A_template_to_scene: np.ndarray,
-    A_scene_to_roi: np.ndarray,          # 场景→roi_image 的仿射变换
-    A_template_to_roi_image: np.ndarray, # 直接计算的模板→roi_image 仿射变换矩阵
+    A_template_to_roi_image: np.ndarray,
     template_annotations: List[Dict],
-    template_image: np.ndarray = None,
+    detector: MultiModelDetector,
     request_id: str = "",
     wp_idx: int = 1,
-) -> Dict[str, Any]:
+) -> Optional[Dict[str, Any]]:
     """
-    对单个工件的矫正 ROI 图像进行异常检测，并将结果坐标映射回原图。
+    从一个矫正后的工件 ROI 图像中提取所有零件的子 ROI（纯 CPU，无推理）。
 
-    关键修复：
-    - 原代码用 `pts + padding` 近似将模板坐标映射到 roi_image，
-      这在存在旋转、透视变形或 subject 不在模板左上角时会产生严重偏移。
-    - 正确做法：使用直接计算的 A_template_to_roi_image，避免中间累积误差。
-    - 使用仿射变换替代透视变换，更适合刚体工件。
+    Returns:
+        wp_data dict 供后续批量推理和结果构建使用；无可推理 ROI 时返回 None。
     """
     padding = roi_info.get("padding", 20)
 
@@ -2321,7 +2380,6 @@ async def process_single_workpiece_roi(
             logger.info(f"[ROI_TEMP] Cleaned temp directory: {workpiece_temp_dir}")
 
     def _transform_bbox_to_roi(bbox: List[float]) -> Tuple[int, int, int, int]:
-        """将模板 bbox 的四角点仿射变换到 roi_image，返回轴对齐外接矩形 (x,y,w,h)。"""
         x, y, w, h = bbox
         corners = np.array([[x, y], [x + w, y], [x + w, y + h], [x, y + h]], dtype=np.float32)
         corners_roi = _transform_template_pts_to_roi(corners, A_template_to_roi_image)
@@ -2330,7 +2388,6 @@ async def process_single_workpiece_roi(
         return int(x_min), int(y_min), int(x_max - x_min), int(y_max - y_min)
 
     def _transform_segmentation_to_roi(segmentation: List[List[float]]) -> List[List[float]]:
-        """将模板 segmentation 多边形点仿射变换到 roi_image 坐标系。"""
         seg_roi = []
         for seg in segmentation:
             pts = np.array(seg).reshape(-1, 2).astype(np.float32)
@@ -2338,47 +2395,38 @@ async def process_single_workpiece_roi(
             seg_roi.append(pts_roi.flatten().tolist())
         return seg_roi
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # 准备该工件的所有 ROI 列表
-    # ──────────────────────────────────────────────────────────────────────────
-    rois_for_inference = []
-    anns_for_inference = []
-    categories = []
+    rois_for_inference: List[np.ndarray] = []
+    anns_for_inference: List[Dict] = []
+    categories: List[str] = []
+    ann_to_local_idx: Dict[int, int] = {}
 
     loaded_categories = detector.get_loaded_categories()
-    logger.info(f"[process_single_workpiece_roi] TRAIN_MODE: {TRAIN_MODE}, loaded_categories: {loaded_categories}")
+    logger.info(f"[_prepare_workpiece_rois] wp={wp_idx} TRAIN_MODE: {TRAIN_MODE}, loaded_categories: {loaded_categories}")
 
     for ann in template_annotations:
         if TRAIN_MODE == "by_category":
-            # by_category 模式：直接使用 category_id 匹配模型目录名
             category = ann.get("category_id")
         else:
-            # by_pos_id 模式：用 pos_id 匹配模型目录名
             category = ann.get("pos_id")
 
-        # 转换为字符串进行比较
         category_str = str(category) if category is not None else ""
         loaded_categories_str = [str(c) for c in loaded_categories]
 
         if not category_str or category_str not in loaded_categories_str:
-            logger.warning(f"[process_single_workpiece_roi] 跳过 annotation: category_id={ann.get('category_id')}, pos_id={ann.get('pos_id')}, loaded_categories={loaded_categories_str}")
+            logger.warning(f"[_prepare_workpiece_rois] wp={wp_idx} 跳过 annotation: category_id={ann.get('category_id')}, pos_id={ann.get('pos_id')}")
             continue
 
         segmentation = ann.get("segmentation", [])
         bbox = ann.get("bbox", [0, 0, 0, 0])
 
         roi_sub = None
-        roi_sub_raw = None  # 原始ROI，用于保存到temp目录（不做letterbox）
+        roi_sub_raw = None
 
-        # FIX: 用透视变换后的 segmentation 提取 ROI（替换原来的 pts + padding）
         if segmentation and len(segmentation) > 0:
             seg_roi_transformed = _transform_segmentation_to_roi(segmentation)
-            # 先提取原始ROI用于保存
-            roi_sub_raw = _extract_roi_from_segmentation(roi_image, seg_roi_transformed, target_size=None)
-            # 再提取letterbox后的ROI用于推理
-            roi_sub = _extract_roi_from_segmentation(roi_image, seg_roi_transformed)
+            roi_sub = _extract_roi_from_segmentation(roi_image, seg_roi_transformed, target_size=None)
+            roi_sub_raw = roi_sub
 
-        # FIX: fallback 用透视变换后的 bbox 提取 ROI（替换原来的 x += padding）
         if roi_sub is None or roi_sub.size == 0:
             if bbox and len(bbox) >= 4:
                 rx, ry, rw, rh = _transform_bbox_to_roi(bbox)
@@ -2395,9 +2443,10 @@ async def process_single_workpiece_roi(
         if roi_sub is not None and roi_sub.size > 0:
             rois_for_inference.append(roi_sub)
             anns_for_inference.append(ann)
-            categories.append(category_str)  # 使用字符串版本
+            categories.append(category_str)
+            ann_to_local_idx[id(ann)] = len(rois_for_inference) - 1
 
-            # 异步保存ROI到临时目录（跳过工件主体）- 使用原始ROI，不做letterbox
+            # 异步保存 ROI 到临时目录（跳过工件主体）
             category_name = ann.get("category_name", ann.get("label", ""))
             if SAVE_ROI_TO_TEMP and category_name != "工件主体":
                 pos_id_str = str(ann.get("pos_id", category_str))
@@ -2407,37 +2456,48 @@ async def process_single_workpiece_roi(
                 ))
 
     if not rois_for_inference:
-        return {
-            "workpiece_id": wp_idx,
-            "bbox": list(roi_info.get("bbox", (0, 0, 0, 0))),
-            "results": [],
-            "anomaly_count": 0,
-            "strategy": "lightglue",
-            "roi_info": roi_info,
-        }
+        return None
 
-    # 按类别分组推理
-    results_by_ann = {}
-    for cat in set(categories):
-        indices = [i for i, c in enumerate(categories) if c == cat]
-        cat_rois = [rois_for_inference[i] for i in indices]
-        cat_anns = [anns_for_inference[i] for i in indices]
-        det_results = await detector.detect_category(cat_rois, cat, f"{request_id}_wp{wp_idx}", annotations=cat_anns)
+    return {
+        "wp_idx": wp_idx,
+        "roi_info": roi_info,
+        "roi_image": roi_image,
+        "A_template_to_roi_image": A_template_to_roi_image,
+        "rois_for_inference": rois_for_inference,
+        "anns_for_inference": anns_for_inference,
+        "categories": categories,
+        "ann_to_local_idx": ann_to_local_idx,
+    }
 
-        for idx, det_res in zip(indices, det_results):
-            ann = anns_for_inference[idx]
-            results_by_ann[id(ann)] = det_res
 
-    # 构建最终结果，并将坐标映射回原图
+def _build_workpiece_result(
+    wp_data: Dict[str, Any],
+    det_results_by_local_idx: Dict[int, Dict[str, Any]],
+    A_template_to_scene: np.ndarray,
+    template_annotations: List[Dict],
+    template_image: np.ndarray = None,
+) -> Dict[str, Any]:
+    """
+    根据推理结果构建单个工件的最终输出（纯 CPU：坐标变换、模板 ROI 提取）。
+    """
+    wp_idx = wp_data["wp_idx"]
+    roi_info = wp_data["roi_info"]
+    roi_image = wp_data["roi_image"]
+    A_template_to_roi_image = wp_data["A_template_to_roi_image"]
+    ann_to_local_idx = wp_data["ann_to_local_idx"]
+
+    default_result = {
+        "is_anomaly": False,
+        "anomaly_score": 0.0,
+        "error": 0.0,
+        "threshold": 0.0,
+        "infer_failed": True,
+    }
+
     final_results = []
     for ann in template_annotations:
-        det_res = results_by_ann.get(id(ann), {
-            "is_anomaly": False,
-            "anomaly_score": 0.0,
-            "error": 0.0,
-            "threshold": 0.0,
-            "infer_failed": True,
-        })
+        local_idx = ann_to_local_idx.get(id(ann))
+        det_res = det_results_by_local_idx.get(local_idx, default_result) if local_idx is not None else default_result
 
         bbox = ann.get("bbox", [0, 0, 0, 0])
         segm = ann.get("segmentation", [])
@@ -2447,7 +2507,6 @@ async def process_single_workpiece_roi(
         if bbox and len(bbox) >= 4:
             x, y, w, h = bbox
             corners = np.array([[x, y], [x+w, y], [x+w, y+h], [x, y+h]], dtype=np.float32).reshape(-1, 1, 2)
-            # 使用仿射变换替代透视变换
             tc = cv2.transform(corners, A_template_to_scene[:2]).reshape(-1, 2)
             bbox_in_pred = [
                 float(np.min(tc[:, 0])), float(np.min(tc[:, 1])),
@@ -2455,12 +2514,11 @@ async def process_single_workpiece_roi(
                 float(np.max(tc[:, 1]) - np.min(tc[:, 1]))
             ]
 
-        # 转换 bbox 四角点到原图（用于绘制旋转多边形）
+        # 转换 bbox 四角点到原图
         poly_in_pred = []
         if bbox and len(bbox) >= 4:
             x, y, w, h = bbox
             corners = np.array([[x, y], [x+w, y], [x+w, y+h], [x, y+h]], dtype=np.float32)
-            # 使用仿射变换替代透视变换
             tc = cv2.transform(corners.reshape(1, -1, 2), A_template_to_scene[:2]).reshape(-1, 2)
             poly_in_pred = tc.flatten().tolist()
 
@@ -2469,12 +2527,10 @@ async def process_single_workpiece_roi(
         if segm and len(segm) > 0 and len(segm[0]) >= 8:
             pts = np.array([[segm[0][i], segm[0][i+1]] for i in range(0, len(segm[0]), 2)],
                            dtype=np.float32).reshape(-1, 1, 2)
-            # 使用仿射变换替代透视变换
             tp = cv2.transform(pts, A_template_to_scene[:2]).reshape(-1, 2)
             segm_in_pred = [float(v) for v in tp.flatten()]
             poly_in_pred = segm_in_pred
 
-        # 构建结果
         result_item = {
             "category": ann.get("category_name", ann.get("category", "unknown")),
             "pos_id": ann.get("pos_id"),
@@ -2490,7 +2546,6 @@ async def process_single_workpiece_roi(
             "infer_failed": det_res.get("infer_failed", False),
             "anomaly_type": "real_defect" if det_res.get("is_anomaly", False) else "normal",
         }
-
         final_results.append(result_item)
 
     anomaly_count = sum(1 for r in final_results if r.get("is_anomaly", False))
@@ -2522,6 +2577,61 @@ async def process_single_workpiece_roi(
         "aligned_roi": roi_image,
         "A_template_to_roi_image": A_template_to_roi_image.tolist(),
     }
+
+
+async def process_single_workpiece_roi(
+    detector: MultiModelDetector,
+    roi_image: np.ndarray,
+    roi_info: Dict,
+    A_template_to_scene: np.ndarray,
+    A_scene_to_roi: np.ndarray,          # 场景→roi_image 的仿射变换
+    A_template_to_roi_image: np.ndarray, # 直接计算的模板→roi_image 仿射变换矩阵
+    template_annotations: List[Dict],
+    template_image: np.ndarray = None,
+    request_id: str = "",
+    wp_idx: int = 1,
+) -> Dict[str, Any]:
+    """
+    对单个工件的矫正 ROI 图像进行异常检测，并将结果坐标映射回原图。
+    委托给 _prepare_workpiece_rois + _build_workpiece_result，保持向后兼容。
+    """
+    # Phase 1: 提取 ROI（纯 CPU）
+    wp_data = _prepare_workpiece_rois(
+        roi_image, roi_info, A_template_to_roi_image,
+        template_annotations, detector, request_id, wp_idx
+    )
+
+    if wp_data is None:
+        return {
+            "workpiece_id": wp_idx,
+            "bbox": list(roi_info.get("bbox", (0, 0, 0, 0))),
+            "results": [],
+            "anomaly_count": 0,
+            "strategy": "lightglue",
+            "roi_info": roi_info,
+        }
+
+    # Phase 2: 按类别分组推理
+    categories = wp_data["categories"]
+    rois_for_inference = wp_data["rois_for_inference"]
+    anns_for_inference = wp_data["anns_for_inference"]
+    det_results_by_local_idx: Dict[int, Dict[str, Any]] = {}
+
+    for cat in set(categories):
+        indices = [i for i, c in enumerate(categories) if c == cat]
+        cat_rois = [rois_for_inference[i] for i in indices]
+        cat_anns = [anns_for_inference[i] for i in indices]
+        det_results = await detector.detect_category(
+            cat_rois, cat, f"{request_id}_wp{wp_idx}", annotations=cat_anns
+        )
+        for idx, det_res in zip(indices, det_results):
+            det_results_by_local_idx[idx] = det_res
+
+    # Phase 3: 构建最终结果
+    return _build_workpiece_result(
+        wp_data, det_results_by_local_idx, A_template_to_scene,
+        template_annotations, template_image
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2577,37 +2687,65 @@ async def detect_multiple_workpieces(
             "total_anomalies": 0,
         }
 
-    # 3. 对每个工件并行执行异常检测
+    # 3. 跨工件批量推理
+    #    Phase 3a: 提取所有工件的 ROI（纯 CPU）
+    #    Phase 3b: 合并同类模型 ROI，每个模型只调用一次 batch inference
+    #    Phase 3c: 分发结果回各工件并构建输出
     local_monitor.start_step("per_workpiece_inference")
     num_wp = len(detections)
-    logger.info(f"[{request_id}] 并行处理 {num_wp} 个工件")
+    logger.info(f"[{request_id}] 跨工件批量推理 {num_wp} 个工件")
     t_parallel = time.time()
 
-    # 使用 asyncio.gather 并行处理所有工件
-    tasks = []
+    # Phase 3a: 提取每个工件的 ROI（纯 CPU，顺序执行即可）
+    wp_data_list: List[Dict] = []
     for i, (roi, info, _, A_template, A_scene_to_roi, A_template_to_roi_image) in enumerate(detections):
-        task = process_single_workpiece_roi(
-            detector,
-            roi,
-            info,
-            A_template,       # A_template_to_scene
-            A_scene_to_roi,   # 场景→roi_image 仿射变换
-            A_template_to_roi_image,  # 直接计算的模板→roi_image 仿射变换矩阵
-            annotations,
-            template_image,
-            f"{request_id}_wp{i+1}",
-            i + 1
+        wp_data = _prepare_workpiece_rois(
+            roi, info, A_template_to_roi_image,
+            annotations, detector, f"{request_id}_wp{i+1}", i + 1
         )
-        tasks.append(task)
+        if wp_data is not None:
+            wp_data["A_template_to_scene"] = A_template
+            wp_data["A_scene_to_roi"] = A_scene_to_roi
+        wp_data_list.append(wp_data)
 
-    # 并行执行所有任务
-    wp_results_list = await asyncio.gather(*tasks, return_exceptions=True)
+    # Phase 3b: 按 category 跨工件合并所有 ROI
+    # merged[cat] = [(wp_idx, local_idx, roi, ann), ...]
+    merged_by_category: Dict[str, List[Tuple[int, int, np.ndarray, Dict]]] = {}
+    for wp_data in wp_data_list:
+        if wp_data is None:
+            continue
+        for local_idx in range(len(wp_data["categories"])):
+            cat = wp_data["categories"][local_idx]
+            roi = wp_data["rois_for_inference"][local_idx]
+            ann = wp_data["anns_for_inference"][local_idx]
+            merged_by_category.setdefault(cat, []).append(
+                (wp_data["wp_idx"], local_idx, roi, ann)
+            )
 
-    # 处理结果
+    # Phase 3c: 每个模型只调用一次 batch inference（跨工件合并）
+    all_det_results: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    for cat, items in merged_by_category.items():
+        cat_rois = [item[2] for item in items]
+        cat_anns = [item[3] for item in items]
+        try:
+            det_results = await detector.detect_category(
+                cat_rois, cat, request_id, annotations=cat_anns
+            )
+            for j, (wp_idx, local_idx, _, _) in enumerate(items):
+                if j < len(det_results):
+                    all_det_results[(wp_idx, local_idx)] = det_results[j]
+        except Exception as e:
+            logger.error(f"[{request_id}] 批量推理失败 category={cat}: {e}")
+            for wp_idx, local_idx, _, _ in items:
+                all_det_results[(wp_idx, local_idx)] = {
+                    "is_anomaly": False, "anomaly_score": 0.0,
+                    "error": 0.0, "threshold": 0.0, "infer_failed": True,
+                }
+
+    # Phase 3d: 每个工件独立构建最终结果
     wp_results: List[Dict] = []
-    for i, result in enumerate(wp_results_list):
-        if isinstance(result, Exception):
-            logger.error(f"[{request_id}] 工件 {i+1} 推理异常: {result}")
+    for i, wp_data in enumerate(wp_data_list):
+        if wp_data is None:
             _, info, _, _, _, _ = detections[i]
             wp_results.append({
                 "workpiece_id": i + 1,
@@ -2616,12 +2754,24 @@ async def detect_multiple_workpieces(
                 "anomaly_count": 0,
                 "strategy": "lightglue",
                 "roi_info": info,
-                "error": str(result),
             })
-        else:
-            wp_results.append(result)
+            continue
 
-    logger.info(f"[{request_id}] 并行处理完成，总耗时 {time.time()-t_parallel:.3f}s")
+        # 收集该工件的推理结果
+        wp_det_results: Dict[int, Dict[str, Any]] = {}
+        for local_idx in range(len(wp_data["categories"])):
+            key = (wp_data["wp_idx"], local_idx)
+            if key in all_det_results:
+                wp_det_results[local_idx] = all_det_results[key]
+
+        result = _build_workpiece_result(
+            wp_data, wp_det_results,
+            wp_data["A_template_to_scene"],
+            annotations, template_image
+        )
+        wp_results.append(result)
+
+    logger.info(f"[{request_id}] 跨工件批量推理完成，总耗时 {time.time()-t_parallel:.3f}s")
     local_monitor.end_step("per_workpiece_inference")
 
     wp_results = [r for r in wp_results if r is not None]
@@ -3169,14 +3319,29 @@ def load_models():
         logger.warning("[LightGlue] 未找到工件主体标注，跳过预提取模板变体特征")
 
     if DINORMALY_DETECTOR and torch.cuda.is_available():
-        dummy = np.zeros((224, 224, 3), dtype=np.uint8)
-        for model_wrapper in DINORMALY_DETECTOR.models.values():
-            try:
-                model_wrapper.infer_batch_direct([dummy])
-                logger.info(f"[warmup] {type(model_wrapper).__name__} GPU 预热完成")
-            except Exception as e:
-                logger.warning(f"[warmup] {type(model_wrapper).__name__} 预热失败: {e}")
-        logger.info("[warmup] GPU 预热完成")
+        # 强制加载所有模型并预热 GPU（懒加载模式下 models 为空，需遍历 _model_metadata）
+        all_ids = DINORMALY_DETECTOR.get_loaded_categories()
+        if all_ids:
+            logger.info(f"[warmup] 开始加载并预热 {len(all_ids)} 个模型...")
+            dummy = np.zeros((224, 224, 3), dtype=np.uint8)
+            for pos_id in all_ids:
+                # 同步加载模型（在线程池外执行，确保 warmup 在正确的 CUDA context 中）
+                if pos_id not in DINORMALY_DETECTOR.models:
+                    metadata = DINORMALY_DETECTOR._model_metadata.get(pos_id)
+                    if metadata:
+                        result = _load_single_model(Path(metadata["model_path"]).parent)
+                        if result:
+                            _, wrapper, config = result
+                            DINORMALY_DETECTOR.models[pos_id] = wrapper
+                            DINORMALY_DETECTOR.configs[pos_id] = config
+                wrapper = DINORMALY_DETECTOR.models.get(pos_id)
+                if wrapper:
+                    try:
+                        wrapper.infer_batch_direct([dummy])
+                        logger.info(f"[warmup] {pos_id} GPU 预热完成")
+                    except Exception as e:
+                        logger.warning(f"[warmup] {pos_id} 预热失败: {e}")
+            logger.info("[warmup] 全部模型 GPU 预热完成")
 
 
 @app.on_event("startup")
