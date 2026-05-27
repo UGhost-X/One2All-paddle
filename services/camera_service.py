@@ -318,6 +318,9 @@ class CameraService:
                 nodemap.GetNode("GevSCPSPacketSize").SetValue(self._config.packet_size)
 
                 scpd = max(5000, int(payload_mb * 3000))
+                scpd_max = int(nodemap.GetNode("GevSCPD").GetMax())
+                if scpd > scpd_max:
+                    scpd = scpd_max
                 nodemap.GetNode("GevSCPD").SetValue(scpd)
                 nodemap.GetNode("GevSCFTD").SetValue(0)
 

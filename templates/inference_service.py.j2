@@ -571,17 +571,23 @@ class DinomalyWrapper:
             if image_batch is None:
                 raise RuntimeError("_preprocess_rois_to_batch returned None")
 
-            # Phase B: GPU 推理（含惰性 anomaly_map 计算）
+            # Phase B: GPU 推理
             t_gpu = time.time()
             with torch.no_grad():
                 output = self.model.model(image_batch)
-            # 立即提取 anomaly_map tensor，触发可能存在的惰性 GPU 计算
-            anomaly_maps = self._get_anomaly_maps(output)
             t_gpu = time.time() - t_gpu
 
-            # Phase C: 分数提取（纯 tensor 操作，已在 GPU）
+            # Phase C: 使用模型内置 pred_score（与训练时一致：GaussianBlur → 256×256 → top-1% mean）
             t_post = time.time()
-            scores = self._extract_scores_from_tensor(anomaly_maps, masks[:len(rois)])
+            pred_score = getattr(output, 'pred_score', None)
+            if pred_score is None and isinstance(output, dict):
+                pred_score = output.get('pred_score')
+            if pred_score is not None:
+                scores = pred_score.detach().cpu().numpy().flatten().tolist()
+            else:
+                # 回退：手动从 anomaly_map 提取（兼容旧版模型输出）
+                anomaly_maps = self._get_anomaly_maps(output)
+                scores = self._extract_scores_from_tensor(anomaly_maps, masks[:len(rois)])
             t_post = time.time() - t_post
 
             # 填充 Dinomaly 推理结果
@@ -1234,13 +1240,14 @@ class MultiModelDetector:
             # 获取阈值：Dinomaly 模型从 wrapper 获取
             threshold = model.threshold
 
-            def make_result(error: float, infer_failed: bool = False) -> Dict[str, Any]:
+            def make_result(error: float, infer_failed: bool = False, yolo_anomaly: bool = False) -> Dict[str, Any]:
                 return {
                     "is_anomaly": (not infer_failed) and (error > threshold),
                     "anomaly_score": error,
                     "error": error,
                     "threshold": threshold,
                     "infer_failed": infer_failed,
+                    "yolo_anomaly": yolo_anomaly,
                 }
 
             rois_for_model = [roi for _, roi, _ in group]
@@ -1260,19 +1267,26 @@ class MultiModelDetector:
                     if all(r.get("infer_failed", False) for r in batch_results):
                         raise RuntimeError("infer_batch_direct all failed, falling back to infer_single")
 
-                    for idx, result in zip(batch_indices, batch_results):
+                    batch_items = group[start:end]
+                    for (idx, roi, ann), result in zip(batch_items, batch_results):
                         score = result["error"]
                         dinomaly_score = result.get("dinomaly_score", score)
                         yolo_score = result.get("yolo_score", 0.0)
                         is_yolo_anomaly = result.get("yolo_anomaly", False)
                         dinomaly_info = f" dinomaly={dinomaly_score:.4f}"
-                        yolo_info = f" yolo={yolo_score:.4f}({'anomaly' if is_yolo_anomaly else 'normal'})"
+                        if dinomaly_score > threshold:
+                            yolo_info = " yolo=-(skipped)"
+                        elif is_yolo_anomaly:
+                            yolo_info = f" yolo={yolo_score:.4f}(anomaly)"
+                        else:
+                            yolo_info = " yolo=-(no_detect)"
+                        real_pos_id = str(ann.get('pos_id', pos_id))
                         logger.info(
                             f"[{request_id}] [{category}] ROI {idx+1}/{total_rois} "
-                            f"pos_id={pos_id} roi_size={rois_for_model[start].shape[1]}x{rois_for_model[start].shape[0]} "
+                            f"pos_id={real_pos_id} roi_size={roi.shape[1]}x{roi.shape[0]} "
                             f"score={score:.4f} threshold={threshold:.4f}{dinomaly_info}{yolo_info} (batch)"
                         )
-                        result_pairs[idx] = (make_result(score, result["infer_failed"]), False)
+                        result_pairs[idx] = (make_result(score, result["infer_failed"], is_yolo_anomaly), False)
 
             except Exception as e:
                 logger.error(f"[{request_id}] [{category}] Batch inference error pos_id={pos_id}: {e}")
@@ -1286,13 +1300,18 @@ class MultiModelDetector:
                         yolo_score = result.get("yolo_score", 0.0)
                         is_yolo_anomaly = result.get("yolo_anomaly", False)
                         dinomaly_info = f" dinomaly={dinomaly_score:.4f}"
-                        yolo_info = f" yolo={yolo_score:.4f}({'anomaly' if is_yolo_anomaly else 'normal'})"
+                        if dinomaly_score > threshold:
+                            yolo_info = " yolo=-(skipped)"
+                        elif is_yolo_anomaly:
+                            yolo_info = f" yolo={yolo_score:.4f}(anomaly)"
+                        else:
+                            yolo_info = " yolo=-(no_detect)"
                         logger.info(
                             f"[{request_id}] [{category}] ROI {idx+1}/{total_rois} "
                             f"pos_id={real_pos_id} roi_size={roi.shape[1]}x{roi.shape[0]} "
                             f"score={score:.4f} threshold={threshold:.4f}{dinomaly_info}{yolo_info} (single)"
                         )
-                        result_pairs[idx] = (make_result(score, result["infer_failed"]), False)
+                        result_pairs[idx] = (make_result(score, result["infer_failed"], is_yolo_anomaly), False)
                     except Exception as e2:
                         logger.error(f"[{request_id}] [{category}] Error ROI {idx+1} pos_id={pos_id}: {e2}")
                         result_pairs[idx] = (make_result(0.0, True), True)
@@ -2544,7 +2563,11 @@ def _build_workpiece_result(
             "error": det_res.get("error", 0.0),
             "threshold": det_res.get("threshold", 0.0),
             "infer_failed": det_res.get("infer_failed", False),
-            "anomaly_type": "real_defect" if det_res.get("is_anomaly", False) else "normal",
+            "anomaly_type": (
+                "yolo_defect" if det_res.get("yolo_anomaly", False)
+                else "dinomaly_defect" if det_res.get("is_anomaly", False)
+                else "normal"
+            ),
         }
         final_results.append(result_item)
 

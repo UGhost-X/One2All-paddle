@@ -663,9 +663,13 @@ class ModelTrainer:
                     str(path_id),
                 )
                 external_group_id = config.get("external_group_id")
+                # 判断任务类型：有 base_roi_dir 说明是 FP 重训，否则是首次训练
+                is_retrain = bool(config.get("base_roi_dir"))
+                task_type = "dinomaly_fp_retrain" if is_retrain else "dinomaly_initial"
                 self.training_status[task_id] = {
                     "status": "starting",
                     "progress": 0,
+                    "task_type": task_type,
                     "group_id": external_group_id or group_id,
                     "internal_group_id": group_id,
                     "task_uuid": task_uuid,
@@ -717,6 +721,7 @@ class ModelTrainer:
         self.training_status[task_id] = {
             "status": "starting",
             "progress": 0,
+            "task_type": "yolo_only_retrain",
             "group_id": external_group_id or f"yolo_only_{path_id}",
             "internal_group_id": path_id,
             "task_uuid": task_uuid,
@@ -761,7 +766,11 @@ class ModelTrainer:
             self._update_task_status(task_id, status="cancelled")
         except Exception as e:
             logger.exception(f"YOLO training failed for {task_id}")
-            self._update_task_status(task_id, status="failed", error=str(e))
+            error_msg = str(e)
+            if self._is_oom_error(e):
+                error_msg = f"[GPU 显存不足] {error_msg}"
+                self._add_log(task_id, f"YOLO 训练失败：GPU 显存不足 (OOM)。建议释放 GPU 资源后重试。")
+            self._update_task_status(task_id, status="failed", error=error_msg)
             self._add_log(task_id, f"Error: {e}")
         finally:
             with self._active_lock:
@@ -807,7 +816,11 @@ class ModelTrainer:
             self._update_task_status(task_id, status="cancelled")
         except Exception as e:
             logger.exception(f"Training failed for {task_id}")
-            self._update_task_status(task_id, status="failed", error=str(e))
+            error_msg = str(e)
+            if self._is_oom_error(e):
+                error_msg = f"[GPU 显存不足] {error_msg}"
+                self._add_log(task_id, f"训练失败：GPU 显存不足 (OOM)。建议减小 batch_size 或释放 GPU 资源。")
+            self._update_task_status(task_id, status="failed", error=error_msg)
             self._add_log(task_id, f"Error: {e}")
         finally:
             with self._active_lock:
@@ -1092,6 +1105,22 @@ class ModelTrainer:
         self._add_log(task_id, f"Training with {num_samples} annotations for group '{group_id}' (label: {category_label})")
         self._add_log(task_id, f"Encoder: {encoder_name}, Decoder depth: {decoder_depth}, Epochs: {epochs}")
 
+        # 检查 GPU 显存状态
+        gpu_info = self._get_gpu_memory_info()
+        if gpu_info.get("available"):
+            self._add_log(
+                task_id,
+                f"GPU memory: {gpu_info['free_mb']:.0f}MB free / {gpu_info['total_mb']:.0f}MB total "
+                f"({gpu_info['free_pct']:.0f}%), used={gpu_info['used_mb']:.0f}MB"
+            )
+            min_free_mb = 2000  # Dinomaly + DINOv2 至少需要 ~2GB
+            if gpu_info['free_mb'] < min_free_mb:
+                self._add_log(
+                    task_id,
+                    f"WARNING: GPU 显存不足 ({gpu_info['free_mb']:.0f}MB < {min_free_mb}MB)，"
+                    f"训练可能会因 OOM 失败"
+                )
+
         if not DINORMALY_AVAILABLE:
             raise RuntimeError("Dinomaly model is not available")
 
@@ -1286,48 +1315,35 @@ class ModelTrainer:
 
             self._add_log(task_id, f"Training directory: {roi_save_dir} ({len(image_paths)} images)")
 
-            # Stage 2: 创建 Anomalib datamodule 和模型
+            # Stage 2: 创建 Anomalib datamodule 和模型（支持 OOM 自动降级重试）
             self._update_task_status(task_id, status="training", progress=30, stage="2/3")
             self._add_log(task_id, "Stage 2/3: Creating model and datamodule...")
 
             accelerator = 'gpu' if torch.cuda.is_available() else 'cpu'
-            model = None
 
-            # 从不加载 checkpoint，始终从头训练新模型
-            self._add_log(task_id, f"Training new model from scratch: epochs={actual_epochs}")
-            if model is None:
-                try:
-                    model = Dinomaly(
-                        encoder_name=encoder_name,
-                        decoder_depth=decoder_depth,
-                        bottleneck_dropout=bottleneck_dropout,
-                    )
-                    # 注意：即使是新模型，在重训练场景下也应该使用 finetune_epochs
-                    # 因为用户期望的是微调而不是从头训练
-                    self._add_log(task_id, f"Training new model (retrain mode): using {actual_epochs} epochs")
-                except (OSError, IOError, Exception) as e:
-                    if 'dinov2' in str(e).lower() or 'download' in str(e).lower():
-                        raise RuntimeError(f"DINOv2 预训练权重下载失败: {e}")
-                    raise
+            # --- 以下配置与 batch_size 无关，只需计算一次 ---
+            import tempfile
+            anomalib_temp_dir = tempfile.mkdtemp(prefix="anomalib_")
+            temp_root = Path(save_dir) / "temp_anomalib"
+            temp_root.mkdir(parents=True, exist_ok=True)
+            safe_num_workers = 0
+            self._add_log(task_id, f"DataLoader num_workers forced to 0 (threading mode)")
 
-            # 冻结编码器并启用 inference_mode 以释放激活值显存
-            if freeze_encoder:
-                encoder = None
-                if hasattr(model, 'model') and hasattr(model.model, 'encoder'):
-                    encoder = model.model.encoder
-                elif hasattr(model, 'encoder'):
-                    encoder = model.encoder
+            num_images = len(image_paths)
+            min_val_samples = 3
+            val_split_ratio_actual = 0.2
+            check_val_every_n_epoch = actual_epochs
 
-                if encoder is not None:
-                    for param in encoder.parameters():
-                        param.requires_grad = False
-                    # 使用 inference_mode 包裹 encoder forward，释放中间激活值显存
-                    _orig_fwd = encoder.forward
-                    def _no_grad_fwd(*a, **kw):
-                        with torch.inference_mode():
-                            return _orig_fwd(*a, **kw)
-                    encoder.forward = _no_grad_fwd
-                    self._add_log(task_id, "Encoder frozen with inference_mode for faster training and lower memory")
+            val_samples = int(num_images * val_split_ratio_actual)
+            if val_samples < min_val_samples:
+                val_split_ratio_actual = 0.0
+                val_split_mode = ValSplitMode.SAME_AS_TEST
+                check_val_every_n_epoch = epochs
+                self._add_log(task_id, f"WARNING: Only {num_images} samples, skipping val split (need >= {int(min_val_samples / 0.2)} images)")
+            else:
+                val_split_mode = ValSplitMode.FROM_TEST
+                check_val_every_n_epoch = 1
+                self._add_log(task_id, f"Using val_split_ratio=0.2 ({val_samples} val samples)")
 
             # ✅ 自定义 Callback，每个 epoch 结束更新进度和日志
             class EpochProgressCallback(Callback):
@@ -1338,7 +1354,6 @@ class ModelTrainer:
 
                 def on_train_epoch_end(self, trainer, pl_module):
                     current = trainer.current_epoch + 1
-                    # 进度从 50 到 80 之间分配给训练阶段
                     progress = 50 + int((current / self.total_epochs) * 30)
                     self.trainer_ref._update_task_status(self.task_id, progress=progress)
                     self.trainer_ref._add_log(
@@ -1348,123 +1363,165 @@ class ModelTrainer:
 
             epoch_cb = EpochProgressCallback(self, task_id, actual_epochs)
 
-            # 使用临时目录作为 anomalib 日志目录，训练结束后自动清理
-            import tempfile
-            anomalib_temp_dir = tempfile.mkdtemp(prefix="anomalib_")
+            # --- OOM 自动降级重试循环 ---
+            batch_size_current = batch_size
+            model = None
+            engine = None
+            datamodule = None
+            oom_retry = 0
 
-            # 创建 Folder datamodule - 直接使用 roi_save_dir
-            # 创建一个临时根目录，roi_save_dir 作为 normal 子目录
-            temp_root = Path(save_dir) / "temp_anomalib"
-            temp_root.mkdir(parents=True, exist_ok=True)
-
-            # ✅ 修复：线程内强制 num_workers=0，避免 DataLoader fork 死锁
-            safe_num_workers = 0
-            self._add_log(task_id, f"DataLoader num_workers forced to 0 (threading mode)")
-
-            # 根据样本数量动态决定是否分割验证集
-            num_images = len(image_paths)
-            min_val_samples = 3  # 验证集最少需要的样本数
-            val_split_ratio_actual = 0.2
-            check_val_every_n_epoch = actual_epochs  # 默认只在最后验证
-
-            # 计算验证集样本数
-            val_samples = int(num_images * val_split_ratio_actual)
-
-            if val_samples < min_val_samples:
-                # 样本太少，不分割验证集
-                val_split_ratio_actual = 0.0
-                val_split_mode = ValSplitMode.SAME_AS_TEST
-                check_val_every_n_epoch = epochs
-                callbacks = [epoch_cb]
-                self._add_log(task_id, f"WARNING: Only {num_images} samples, skipping val split (need >= {int(min_val_samples / 0.2)} images)")
-            else:
-                # 样本足够，分割 20% 作为验证集
-                val_split_mode = ValSplitMode.FROM_TEST
-                check_val_every_n_epoch = 1  # 每个 epoch 都验证
-                # 添加 Early Stopping（样本数 > 50 时启用）
-                # 注意：使用 train_loss 而不是 val_loss，因为验证集可能只有正常样本
-                if num_images > 50:
-                    early_stop_cb = EarlyStopping(
-                        monitor="train_loss",
-                        patience=3,  # 从 5 改为 3，encoder 冻结时收敛更快
-                        mode="min",
-                        verbose=False,
-                    )
-                    callbacks = [epoch_cb, early_stop_cb]
-                    self._add_log(task_id, f"Using val_split_ratio=0.2 ({val_samples} val samples) with EarlyStopping(patience=3, monitor=train_loss)")
-                else:
-                    callbacks = [epoch_cb]
-                    self._add_log(task_id, f"Using val_split_ratio=0.2 ({val_samples} val samples), EarlyStopping disabled (samples <= 50)")
-
-            engine = Engine(
-                max_epochs=actual_epochs,
-                accelerator=accelerator,
-                devices=1,
-                enable_progress_bar=False,   # ✅ 关掉 tqdm，避免多线程输出混乱
-                enable_model_summary=False,
-                check_val_every_n_epoch=check_val_every_n_epoch,
-                callbacks=callbacks,        # ✅ 加入 callbacks
-                default_root_dir=anomalib_temp_dir,  # ✅ 使用临时目录，不保留日志
-                deterministic=False,        # ✅ AMP (BF16) 必须关闭确定性
-                precision="bf16-mixed",     # ✅ BF16 混合精度，显存 -35%，速度 +20~30%
-                logger=False,               # ✅ 关闭 logger 减少磁盘 I/O
-            )
-
-            # 创建符号链接或直接使用 - 这里使用 . 作为 root，roi_save_dir 作为 normal_dir 的绝对路径
-            datamodule = Folder(
-                name="train",
-                root=temp_root,
-                normal_dir=str(roi_save_dir),  # 直接使用 ROI 保存目录
-                normal_test_dir=str(roi_save_dir),
-                train_batch_size=batch_size,
-                eval_batch_size=batch_size,
-                num_workers=safe_num_workers,  # ✅ 强制使用 0
-                test_split_mode=TestSplitMode.FROM_DIR,
-                val_split_mode=val_split_mode,
-                val_split_ratio=val_split_ratio_actual,
-            )
-            datamodule.setup()
-
-            # ✅ 验证数据集分割结果
-            try:
-                train_size = len(datamodule.train_dataloader().dataset)
-                val_size = len(datamodule.val_dataloader().dataset)
-                test_size = len(datamodule.test_dataloader().dataset)
-                self._add_log(task_id, f"Dataset split: train={train_size}, val={val_size}, test={test_size}")
-            except Exception as e:
-                self._add_log(task_id, f"Warning: Could not log dataset split: {e}")
-
-            # Stage 3: 训练模型
-            self._update_task_status(task_id, progress=50, stage="3/3")
-            self._add_log(task_id, f"{'='*20} Task {task_id[-8:]} Stage3 fit() START {'='*20}")
-            self._add_log(task_id, "Stage 3/3: Training model...")
-
-            train_start = time.time()
-
-            # ✅ 加超时检测，防止永久卡死
-            fit_exception = [None]
-
-            def run_fit():
+            while True:
                 try:
-                    engine.fit(model=model, datamodule=datamodule)
+                    # --- 创建模型（每次重试都重新创建，避免部分训练状态污染） ---
+                    if model is None:
+                        self._add_log(task_id, f"Creating Dinomaly model: encoder={encoder_name}, decoder_depth={decoder_depth}, batch_size={batch_size_current}")
+                        try:
+                            model = Dinomaly(
+                                encoder_name=encoder_name,
+                                decoder_depth=decoder_depth,
+                                bottleneck_dropout=bottleneck_dropout,
+                            )
+                        except (OSError, IOError, Exception) as e:
+                            if 'dinov2' in str(e).lower() or 'download' in str(e).lower():
+                                raise RuntimeError(f"DINOv2 预训练权重下载失败: {e}")
+                            raise
+
+
+                    # --- 冻结编码器并启用 inference_mode 以释放激活值显存 ---
+                    if freeze_encoder:
+                        encoder = None
+                        if hasattr(model, 'model') and hasattr(model.model, 'encoder'):
+                            encoder = model.model.encoder
+                        elif hasattr(model, 'encoder'):
+                            encoder = model.encoder
+                        if encoder is not None:
+                            for param in encoder.parameters():
+                                param.requires_grad = False
+                            _orig_fwd = encoder.forward
+                            def _no_grad_fwd(*a, **kw):
+                                with torch.inference_mode():
+                                    return _orig_fwd(*a, **kw)
+                            encoder.forward = _no_grad_fwd
+                            if oom_retry == 0:
+                                self._add_log(task_id, "Encoder frozen with inference_mode for faster training and lower memory")
+
+                    # --- 构建 callbacks（EarlyStopping 每次重试需新建） ---
+                    if num_images > 50 and val_split_ratio_actual > 0:
+                        early_stop_cb = EarlyStopping(
+                            monitor="train_loss",
+                            patience=3,
+                            mode="min",
+                            verbose=False,
+                        )
+                        callbacks = [epoch_cb, early_stop_cb]
+                        if oom_retry == 0:
+                            self._add_log(task_id, f"EarlyStopping enabled (patience=3, monitor=train_loss)")
+                    else:
+                        callbacks = [epoch_cb]
+
+                    # --- 创建 Engine ---
+                    engine = Engine(
+                        max_epochs=actual_epochs,
+                        accelerator=accelerator,
+                        devices=1,
+                        enable_progress_bar=False,
+                        enable_model_summary=False,
+                        check_val_every_n_epoch=check_val_every_n_epoch,
+                        callbacks=callbacks,
+                        default_root_dir=anomalib_temp_dir,
+                        deterministic=False,
+                        precision="bf16-mixed",
+                        logger=False,
+                    )
+
+                    # --- 创建 Datamodule ---
+                    datamodule = Folder(
+                        name="train",
+                        root=temp_root,
+                        normal_dir=str(roi_save_dir),
+                        normal_test_dir=str(roi_save_dir),
+                        train_batch_size=batch_size_current,
+                        eval_batch_size=batch_size_current,
+                        num_workers=safe_num_workers,
+                        test_split_mode=TestSplitMode.FROM_DIR,
+                        val_split_mode=val_split_mode,
+                        val_split_ratio=val_split_ratio_actual,
+                    )
+                    datamodule.setup()
+
+                    # 验证数据集分割结果
+                    try:
+                        train_size = len(datamodule.train_dataloader().dataset)
+                        val_size = len(datamodule.val_dataloader().dataset)
+                        test_size = len(datamodule.test_dataloader().dataset)
+                        self._add_log(task_id, f"Dataset split: train={train_size}, val={val_size}, test={test_size}")
+                    except Exception as e:
+                        self._add_log(task_id, f"Warning: Could not log dataset split: {e}")
+
+                    # Stage 3: 训练模型
+                    self._update_task_status(task_id, progress=50, stage="3/3")
+                    self._add_log(task_id, f"{'='*20} Task {task_id[-8:]} Stage3 fit() START {'='*20}")
+                    self._add_log(task_id, "Stage 3/3: Training model...")
+
+                    train_start = time.time()
+                    fit_exception = [None]
+
+                    def run_fit():
+                        try:
+                            engine.fit(model=model, datamodule=datamodule)
+                        except Exception as e:
+                            fit_exception[0] = e
+
+                    fit_thread = threading.Thread(target=run_fit, daemon=True)
+                    fit_thread.start()
+
+                    timeout_seconds = actual_epochs * 600
+                    fit_thread.join(timeout=timeout_seconds)
+
+                    if fit_thread.is_alive():
+                        raise RuntimeError(f"engine.fit() timed out after {timeout_seconds}s (stuck in stage 3)")
+                    if fit_exception[0]:
+                        raise fit_exception[0]
+
+                    train_time = time.time() - train_start
+                    self._add_log(task_id, f"{'='*20} Task {task_id[-8:]} Stage3 fit() END {'='*20}")
+                    self._add_log(task_id, f"Training completed in {train_time:.2f}s")
+
+                    break  # 训练成功，退出重试循环
+
                 except Exception as e:
-                    fit_exception[0] = e
+                    if not self._is_oom_error(e):
+                        raise  # 非 OOM 错误直接抛出
 
-            fit_thread = threading.Thread(target=run_fit, daemon=True)
-            fit_thread.start()
+                    # --- OOM 错误处理：清理资源并降级 batch_size ---
+                    oom_retry += 1
+                    self._add_log(task_id, f"GPU OOM detected: {str(e)[:200]}")
+                    self._add_log(task_id, f"GPU memory after OOM: {torch.cuda.memory_allocated()/1024**2:.0f}MB allocated, {torch.cuda.memory_reserved()/1024**2:.0f}MB reserved")
 
-            # 每 epoch 最多 10 分钟，可按需调整
-            timeout_seconds = epochs * 600
-            fit_thread.join(timeout=timeout_seconds)
+                    # 清理当前资源
+                    self._cleanup_training_resources(model, engine, datamodule)
+                    model = None
+                    engine = None
+                    datamodule = None
+                    fit_thread = None
+                    import gc
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        self._add_log(task_id, f"GPU memory after OOM cleanup: {torch.cuda.memory_allocated()/1024**2:.0f}MB allocated")
 
-            if fit_thread.is_alive():
-                raise RuntimeError(f"engine.fit() timed out after {timeout_seconds}s (stuck in stage 3)")
-            if fit_exception[0]:
-                raise fit_exception[0]
+                    if batch_size_current <= 1:
+                        raise RuntimeError(
+                            f"GPU 显存不足，batch_size=1 仍无法完成训练。"
+                            f"请关闭其他 GPU 进程或使用更大显存的设备后重试。"
+                        ) from e
 
-            train_time = time.time() - train_start
-            self._add_log(task_id, f"{'='*20} Task {task_id[-8:]} Stage3 fit() END {'='*20}")
-            self._add_log(task_id, f"Training completed in {train_time:.2f}s")
+                    old_bs = batch_size_current
+                    batch_size_current = max(1, batch_size_current // 2)
+                    self._add_log(
+                        task_id,
+                        f"自动降级: batch_size {old_bs} → {batch_size_current}，开始第 {oom_retry} 次重试..."
+                    )
 
             # 计算阈值（在验证集上推理，如果验证集存在；否则使用测试集）
             self._update_task_status(task_id, progress=80)
@@ -1479,7 +1536,15 @@ class ModelTrainer:
                 eval_dataloader = datamodule.test_dataloader()
                 eval_source = "test"
 
-            predictions = engine.predict(model=model, dataloaders=eval_dataloader)
+            try:
+                predictions = engine.predict(model=model, dataloaders=eval_dataloader)
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                if self._is_oom_error(e):
+                    raise RuntimeError(
+                        f"GPU 显存不足，模型推理时 OOM（batch_size={batch_size_current}）。"
+                        f"请释放 GPU 显存后重试。"
+                    ) from e
+                raise
             scores = self._extract_dinomaly_scores(predictions)
 
             # 仅有正常样本时，使用统计方法计算阈值（anomalib 的 F1AdaptiveThreshold 需要正负样本）
@@ -1499,26 +1564,51 @@ class ModelTrainer:
             self._update_task_status(task_id, progress=90)
             self._save_dinomaly_model(task_id, save_dir, dataset_dir, model, engine, config, threshold, scores, group_annotations)
 
-            # Stage 4/4: 如果存在 FN 图像，训练 YOLO 检测器
+            # Stage 4/4: 如果存在 FN 或 YOLO FP 图像，训练 YOLO 检测器
             fn_images_dir = Path(save_dir) / "fn_images"
-            if fn_images_dir.exists() and list(fn_images_dir.rglob("fn_*.jpg")):
-                # 累积历史 FN 图像（从基础模型目录合并，保留历史批次的学习成果）
-                checkpoint_path = config.get("checkpoint_path")
-                if checkpoint_path:
-                    base_model_dir = Path(checkpoint_path).parent
-                    base_fn_dir = base_model_dir / "fn_images"
-                    if base_fn_dir.exists():
-                        merged = 0
-                        for fn_file in base_fn_dir.rglob("fn_*.jpg"):
-                            rel_path = fn_file.relative_to(base_fn_dir)
-                            dst = fn_images_dir / rel_path
-                            if not dst.exists():
-                                dst.parent.mkdir(parents=True, exist_ok=True)
-                                shutil.copy2(str(fn_file), str(dst))
-                                merged += 1
-                        if merged > 0:
-                            self._add_log(task_id, f"[YOLO] Merged {merged} historical FN images from {base_fn_dir}")
+            yolo_fp_dir = Path(save_dir) / "yolo_fp_images"
 
+            historical_fn_dirs: List[str] = []
+            historical_yolo_fp_dirs: List[str] = []
+
+            # 仅在重训时收集历史 FN/YOLO FP 数据，初次训练不回溯历史
+            if is_fp_retrain:
+                project_dir = Path(save_dir).parent.parent  # output/{project_id}/
+                current_path_id = Path(save_dir).name
+                current_task_uuid = Path(save_dir).parent.name
+
+                for task_dir in sorted(project_dir.iterdir()):
+                    if not task_dir.is_dir() or task_dir.name == current_task_uuid:
+                        continue
+                    hist_dir = task_dir / current_path_id
+
+                    hist_fn_dir = hist_dir / "fn_images"
+                    if hist_fn_dir.exists() and list(hist_fn_dir.rglob("*fn_*.jpg")):
+                        historical_fn_dirs.append(str(hist_fn_dir))
+
+                    hist_yolo_fp_dir = hist_dir / "yolo_fp_images"
+                    if hist_yolo_fp_dir.exists() and (
+                        list(hist_yolo_fp_dir.rglob("yolo_fp_*.jpg")) or list(hist_yolo_fp_dir.rglob("yolo_fp_*.png"))
+                    ):
+                        historical_yolo_fp_dirs.append(str(hist_yolo_fp_dir))
+
+                if historical_fn_dirs:
+                    self._add_log(task_id, f"[YOLO] Found {len(historical_fn_dirs)} historical FN dirs: {historical_fn_dirs}")
+                if historical_yolo_fp_dirs:
+                    self._add_log(task_id, f"[YOLO] Found {len(historical_yolo_fp_dirs)} historical YOLO FP dirs: {historical_yolo_fp_dirs}")
+
+            has_fn = (
+                (fn_images_dir.exists() and list(fn_images_dir.rglob("*fn_*.jpg")))
+                or len(historical_fn_dirs) > 0
+            )
+            has_yolo_fp = (
+                (yolo_fp_dir.exists() and (
+                    list(yolo_fp_dir.glob("yolo_fp_*.jpg")) or list(yolo_fp_dir.glob("yolo_fp_*.png"))
+                ))
+                or len(historical_yolo_fp_dirs) > 0
+            )
+
+            if has_fn or has_yolo_fp:
                 self._update_task_status(task_id, progress=92, stage="YOLO")
                 self._add_log(task_id, "Stage 4/4: Preparing YOLO detection dataset...")
 
@@ -1530,6 +1620,9 @@ class ModelTrainer:
                     fn_images_dir=str(fn_images_dir),
                     output_dir=yolo_dataset_dir,
                     config=config,
+                    yolo_fp_dir=str(yolo_fp_dir) if has_yolo_fp else None,
+                    historical_fn_dirs=historical_fn_dirs or None,
+                    historical_yolo_fp_dirs=historical_yolo_fp_dirs or None,
                 )
                 if count > 0:
                     self._add_log(task_id, "Stage 4/4: Training YOLO detector on FN images...")
@@ -1546,7 +1639,7 @@ class ModelTrainer:
                 else:
                     self._add_log(task_id, "YOLO training skipped (insufficient FN images or missing normal ROI)")
             else:
-                self._add_log(task_id, "No FN images found, skipping YOLO training")
+                self._add_log(task_id, "No FN or YOLO FP images found, skipping YOLO training")
 
             self._update_task_status(
                 task_id,
@@ -1984,13 +2077,12 @@ class ModelTrainer:
     def _augment_fn_images(
         self,
         task_id: str,
-        fn_dir: Path,
+        fn_files: List[Path],
         output_dir: Path,
         target_total: int = 200,
     ) -> int:
         """对 FN 原图预处理 (letterbox_resize) 后应用轻度增强，使总数接近 target_total。返回最终总数。"""
-        fn_originals = sorted(list(fn_dir.rglob("fn_*.jpg")))
-        n_orig = len(fn_originals)
+        n_orig = len(fn_files)
         self._add_log(task_id, f"[YOLO] Found {n_orig} original FN images, target={target_total}")
 
         # 清理旧数据，避免上次运行的残留文件污染数据集
@@ -2001,13 +2093,13 @@ class ModelTrainer:
         # 先对 FN 原图做预处理（与 Dinomaly 训练时 extract_roi_images 一致），再保存
         input_size = (224, 224)
         preprocessed_originals = []
-        for p in fn_originals:
+        for p in fn_files:
             try:
                 img = Image.open(p).convert("RGB")
                 # letterbox_resize 保持宽高比，自适应填充色，与训练预处理一致
                 img_padded, _ = letterbox_resize(img, input_size)
-                # 用相对路径作为文件名，避免不同 pos_id 下同名文件互相覆盖
-                rel_name = str(p.relative_to(fn_dir)).replace("/", "_").replace("\\", "_")
+                # 用父目录+文件名作为唯一标识，避免不同来源的同名文件冲突
+                rel_name = f"{p.parent.name}_{p.name}"
                 dst = output_dir / rel_name
                 img_padded.save(str(dst), quality=95)
                 preprocessed_originals.append((dst, img_padded))
@@ -2046,6 +2138,68 @@ class ModelTrainer:
         self._add_log(task_id, f"[YOLO] FN augmentation done: {n_valid} preprocessed + {total - n_valid} augmented = {total}")
         return total
 
+    def _augment_yolo_fp_images(
+        self,
+        task_id: str,
+        yolo_fp_files: List[Path],
+        output_dir: Path,
+        target_total: int = 30,
+    ) -> List[Path]:
+        """对 YOLO FP 原图预处理 (letterbox_resize) 后应用轻度增强，返回处理后的图片路径列表。"""
+        if not yolo_fp_files:
+            return []
+
+        n_orig = len(yolo_fp_files)
+        self._add_log(task_id, f"[YOLO] Found {n_orig} original YOLO FP images, target={target_total}")
+
+        if output_dir.exists():
+            shutil.rmtree(str(output_dir))
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        input_size = (224, 224)
+        processed_paths = []
+
+        # 对每张原图做 letterbox_resize 预处理
+        preprocessed = []
+        for p in yolo_fp_files:
+            try:
+                img = Image.open(p).convert("RGB")
+                img_padded, _ = letterbox_resize(img, input_size)
+                dst = output_dir / p.name
+                img_padded.save(str(dst), quality=95)
+                processed_paths.append(dst)
+                preprocessed.append((dst, img_padded))
+            except Exception as e:
+                self._add_log(task_id, f"[YOLO] Failed to preprocess YOLO FP image {p}: {e}")
+
+        n_valid = len(preprocessed)
+        if n_valid == 0 or n_valid >= target_total:
+            self._add_log(task_id, f"[YOLO] YOLO FP: {n_valid} valid images, skip augmentation")
+            return processed_paths
+
+        aug_per_image = max(1, (target_total - n_valid) // n_valid)
+        self._add_log(task_id, f"[YOLO] Augmenting YOLO FP {aug_per_image}x per image ({(target_total - n_valid)} needed)")
+
+        yolo_fp_aug_config = PROJECT_ROOT / "configs" / "augmentations_fn.yaml"
+        transform = load_augmentation_transform(str(yolo_fp_aug_config))
+
+        total = n_valid
+        for img_path, img_padded in preprocessed:
+            for j in range(aug_per_image):
+                if total >= target_total:
+                    break
+                try:
+                    aug_img = apply_augmentation(img_padded, transform) if transform else img_padded
+                except Exception:
+                    aug_img = img_padded
+                aug_path = output_dir / f"{img_path.stem}_aug{j:04d}.jpg"
+                aug_img.save(str(aug_path), quality=95)
+                processed_paths.append(aug_path)
+                total += 1
+
+        self._add_log(task_id, f"[YOLO] YOLO FP augmentation done: {n_valid} preprocessed + {total - n_valid} augmented = {total}")
+        return processed_paths
+
     def _prepare_yolo_dataset(
         self,
         task_id: str,
@@ -2053,21 +2207,34 @@ class ModelTrainer:
         fn_images_dir: str,
         output_dir: Path,
         config: dict,
+        yolo_fp_dir: str = None,
+        historical_fn_dirs: List[str] = None,
+        historical_yolo_fp_dirs: List[str] = None,
     ) -> int:
         """
         构建 YOLO 检测二分类数据集（detection 格式）。
-        - normal 图 → 空 label（无目标）
+        - normal 图 → 空 label（无目标）+ YOLO FP 图片（如果提供）
         - defect 图 → 整图 bbox（class 0 = defect）
+        historical_fn_dirs: 历史任务中的 fn_images 目录列表，直接从中收集 FN 文件（不复制）
+        historical_yolo_fp_dirs: 历史任务中的 yolo_fp_images 目录列表
         返回 defect 类样本数；返回 0 表示跳过训练。
         """
+        # 从当前目录 + 历史目录收集所有 FN 文件
+        all_fn_files: List[Path] = []
         fn_dir = Path(fn_images_dir)
-        fn_originals = list(fn_dir.rglob("fn_*.jpg"))
+        if fn_dir.exists():
+            all_fn_files.extend(fn_dir.rglob("*fn_*.jpg"))
+        for hist_dir_str in (historical_fn_dirs or []):
+            hist_dir = Path(hist_dir_str)
+            if hist_dir.exists():
+                all_fn_files.extend(hist_dir.rglob("*fn_*.jpg"))
+
         min_samples = config.get("yolo_min_samples", 1)
+        hist_info = f" + {len(historical_fn_dirs)} historical dirs" if historical_fn_dirs else ""
+        self._add_log(task_id, f"[YOLO] Preparing detection dataset: normal={normal_roi_dir}, fn={fn_images_dir}{hist_info}, min_samples={min_samples}")
 
-        self._add_log(task_id, f"[YOLO] Preparing detection dataset: normal={normal_roi_dir}, fn={fn_images_dir}, min_samples={min_samples}")
-
-        if len(fn_originals) < min_samples:
-            self._add_log(task_id, f"[YOLO] Insufficient FN images ({len(fn_originals)} < {min_samples}), skipping")
+        if len(all_fn_files) < min_samples:
+            self._add_log(task_id, f"[YOLO] Insufficient FN images ({len(all_fn_files)} < {min_samples}), skipping")
             return 0
 
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -2082,7 +2249,7 @@ class ModelTrainer:
 
         # 1. defect 类：FN 原图 + 增强（目标 200），整图作为 bbox
         defect_aug_dir = output_dir / "_defect_aug"
-        defect_count = self._augment_fn_images(task_id, fn_dir, defect_aug_dir, target_total=200)
+        defect_count = self._augment_fn_images(task_id, all_fn_files, defect_aug_dir, target_total=200)
 
         # 2. normal 类：从 Dinomaly 训练数据随机采样（不增强），与 defect 数量匹配
         normal_roi_path = Path(normal_roi_dir)
@@ -2101,6 +2268,31 @@ class ModelTrainer:
 
         normal_paths = list(normal_roi_path.glob("*.png")) + list(normal_roi_path.glob("*.jpg"))
         self._add_log(task_id, f"[YOLO] Using all {len(normal_paths)} normal images from {normal_roi_path}")
+
+        # 2b. YOLO FP 图片 → 加入 normal 类，先预处理 (letterbox_resize) 再增强
+        # 从当前目录 + 历史目录收集原图
+        yolo_fp_raw: List[Path] = []
+        if yolo_fp_dir:
+            yolo_fp_path = Path(yolo_fp_dir)
+            if yolo_fp_path.exists():
+                yolo_fp_raw.extend(yolo_fp_path.glob("yolo_fp_*.jpg"))
+                yolo_fp_raw.extend(yolo_fp_path.glob("yolo_fp_*.png"))
+        for hist_dir_str in (historical_yolo_fp_dirs or []):
+            hist_dir = Path(hist_dir_str)
+            if hist_dir.exists():
+                yolo_fp_raw.extend(hist_dir.glob("yolo_fp_*.jpg"))
+                yolo_fp_raw.extend(hist_dir.glob("yolo_fp_*.png"))
+
+        if yolo_fp_raw:
+            yolo_fp_aug_dir = output_dir / "_yolo_fp_aug"
+            yolo_fp_aug_target = min(50, max(10, len(normal_paths) // 5))
+            yolo_fp_processed = self._augment_yolo_fp_images(
+                task_id, yolo_fp_raw, yolo_fp_aug_dir, target_total=yolo_fp_aug_target,
+            )
+            if yolo_fp_processed:
+                self._add_log(task_id, f"[YOLO] Adding {len(yolo_fp_processed)} preprocessed YOLO FP images to normal class "
+                               f"(from {len(yolo_fp_raw)} raw, current + {len(historical_yolo_fp_dirs or [])} historical)")
+                normal_paths = normal_paths + yolo_fp_processed
 
         # 3. 收集所有图片列表并拆分 train/val (80/20)
         defect_paths = sorted(defect_aug_dir.iterdir())
@@ -2155,6 +2347,8 @@ names:
 
         # 清理临时目录
         shutil.rmtree(defect_aug_dir, ignore_errors=True)
+        if yolo_fp_raw:
+            shutil.rmtree(yolo_fp_aug_dir, ignore_errors=True)
 
         return defect_count
 
@@ -2323,23 +2517,48 @@ names:
         self._add_log(task_id, "Stage 2/2: Preparing YOLO detection dataset...")
 
         fn_images_dir = Path(save_dir) / "fn_images"
+        yolo_fp_dir = Path(save_dir) / "yolo_fp_images"
         normal_roi_dir = Path(dataset_dir) / "roi" / str(path_id)
 
-        # 累积历史 FN 图像（从基础模型目录合并，保留历史批次的学习成果）
-        base_fn_dir = base_dir / "fn_images"
-        if base_fn_dir.exists():
-            merged = 0
-            for fn_file in base_fn_dir.rglob("fn_*.jpg"):
-                rel_path = fn_file.relative_to(base_fn_dir)
-                dst = fn_images_dir / rel_path
-                if not dst.exists():
-                    dst.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(str(fn_file), str(dst))
-                    merged += 1
-            if merged > 0:
-                self._add_log(task_id, f"[YOLO] Merged {merged} historical FN images from {base_fn_dir}")
+        # 找出所有历史训练任务的 FN 和 YOLO FP 目录（不复制，直接传路径给 _prepare_yolo_dataset 收集）
+        project_dir = Path(save_dir).parent.parent  # output/{project_id}/
+        current_path_id = Path(save_dir).name
+        current_task_uuid = Path(save_dir).parent.name
 
-        if fn_images_dir.exists() and list(fn_images_dir.rglob("fn_*.jpg")):
+        historical_fn_dirs: List[str] = []
+        historical_yolo_fp_dirs: List[str] = []
+        for task_dir in sorted(project_dir.iterdir()):
+            if not task_dir.is_dir() or task_dir.name == current_task_uuid:
+                continue
+            hist_dir = task_dir / current_path_id
+
+            hist_fn_dir = hist_dir / "fn_images"
+            if hist_fn_dir.exists() and list(hist_fn_dir.rglob("*fn_*.jpg")):
+                historical_fn_dirs.append(str(hist_fn_dir))
+
+            hist_yolo_fp_dir = hist_dir / "yolo_fp_images"
+            if hist_yolo_fp_dir.exists() and (
+                list(hist_yolo_fp_dir.rglob("yolo_fp_*.jpg")) or list(hist_yolo_fp_dir.rglob("yolo_fp_*.png"))
+            ):
+                historical_yolo_fp_dirs.append(str(hist_yolo_fp_dir))
+
+        if historical_fn_dirs:
+            self._add_log(task_id, f"[YOLO] Found {len(historical_fn_dirs)} historical FN dirs: {historical_fn_dirs}")
+        if historical_yolo_fp_dirs:
+            self._add_log(task_id, f"[YOLO] Found {len(historical_yolo_fp_dirs)} historical YOLO FP dirs: {historical_yolo_fp_dirs}")
+
+        has_fn = (
+            (fn_images_dir.exists() and list(fn_images_dir.rglob("*fn_*.jpg")))
+            or len(historical_fn_dirs) > 0
+        )
+        has_yolo_fp = (
+            (yolo_fp_dir.exists() and (
+                list(yolo_fp_dir.glob("yolo_fp_*.jpg")) or list(yolo_fp_dir.glob("yolo_fp_*.png"))
+            ))
+            or len(historical_yolo_fp_dirs) > 0
+        )
+
+        if has_fn or has_yolo_fp:
             yolo_dataset_dir = Path(save_dir) / "_yolo_dataset"
             count = self._prepare_yolo_dataset(
                 task_id=task_id,
@@ -2347,6 +2566,9 @@ names:
                 fn_images_dir=str(fn_images_dir),
                 output_dir=yolo_dataset_dir,
                 config=config,
+                yolo_fp_dir=str(yolo_fp_dir) if has_yolo_fp else None,
+                historical_fn_dirs=historical_fn_dirs or None,
+                historical_yolo_fp_dirs=historical_yolo_fp_dirs or None,
             )
             if count > 0:
                 self._add_log(task_id, "Stage 2/2: Training YOLO detector on FN images...")
@@ -2356,7 +2578,7 @@ names:
             else:
                 self._add_log(task_id, "YOLO training skipped (insufficient FN images or missing normal ROI)")
         else:
-            self._add_log(task_id, "No FN images found, skipping YOLO training")
+            self._add_log(task_id, "No FN or YOLO FP images found, skipping YOLO training")
 
         self._update_task_status(task_id, status="completed", progress=100, stage="completed", end_time=time.time())
         self._persist_state_if_due(force=True)
@@ -2418,6 +2640,41 @@ names:
                 logger.info(f"GPU memory after cleanup: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
         except Exception as e:
             logger.warning(f"Error during cleanup: {e}")
+
+    # ==================== GPU 显存管理 ====================
+
+    def _get_gpu_memory_info(self) -> Dict[str, Any]:
+        """获取 GPU 显存信息 (MB)"""
+        if not torch.cuda.is_available():
+            return {"available": False}
+        try:
+            free_bytes, total_bytes = torch.cuda.mem_get_info()
+            free_mb = free_bytes / 1024**2
+            total_mb = total_bytes / 1024**2
+            used_mb = total_mb - free_mb
+            return {
+                "available": True,
+                "free_mb": round(free_mb, 1),
+                "used_mb": round(used_mb, 1),
+                "total_mb": round(total_mb, 1),
+                "free_pct": round(free_mb / total_mb * 100, 1),
+            }
+        except Exception:
+            return {"available": False}
+
+    def _is_oom_error(self, error: Exception) -> bool:
+        """检查是否为 GPU 显存不足错误 (支持 PyTorch 2.0+ OOM 异常和旧版 RuntimeError)"""
+        error_str = str(error).lower()
+        if "out of memory" in error_str:
+            return True
+        if "cuda" in error_str and "memory" in error_str:
+            return True
+        try:
+            if isinstance(error, torch.cuda.OutOfMemoryError):
+                return True
+        except AttributeError:
+            pass
+        return False
 
     # ==================== 任务管理接口 ====================
 

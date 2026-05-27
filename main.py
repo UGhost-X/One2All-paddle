@@ -144,8 +144,8 @@ class TrainRequest(BaseModel):
     encoder_name: str = "dinov2_vit_base_14"
     decoder_depth: int = 8
     bottleneck_dropout: float = 0.2
-    epochs: int = 10
-    batch_size: int = 8
+    epochs: int = 12
+    batch_size: int = 2
     freeze_encoder: bool = True
 
     # 通用参数
@@ -478,6 +478,7 @@ async def train_events(task_id: str, include_history: bool = True):
             data = {
                 "status": status.get("status"),
                 "progress": status.get("progress", 0),
+                "task_type": status.get("task_type"),
                 "label": status.get("label"),
                 "stage": status.get("stage"),
                 "threshold": status.get("threshold"),
@@ -598,9 +599,10 @@ class FeedbackGroup(BaseModel):
     每个 path_id 对应一个位置/类别，包含该位置收集的 FP 和 FN 样本
     """
     path_id: str  # 位置/类别 ID
-    false_positive_images: List[str] = []  # base64 编码的正常样本（被误检为异常）
+    false_positive_images: List[str] = []  # base64 编码的正常样本（被 Dinomaly 误检为异常）
     false_negative_images: List[str] = []  # base64 编码的异常样本 ROI（被漏检）
     false_negative_pos_ids: List[str] = []  # 每个 FN 图片对应的 pos_id，用于按位置组织 YOLO 训练
+    yolo_false_positive_images: List[str] = []  # base64 编码的正常样本（被 YOLO 误检为异常，Dinomaly 判定正确）
 
 
 class RetrainRequest(BaseModel):
@@ -660,6 +662,7 @@ async def incremental_retrain(request: RetrainRequest):
     all_task_ids = []
     total_fp = 0
     total_fn = 0
+    total_yolo_fp = 0
 
     # ========== 第一步：复制无反馈的 path_id ==========
     for path_id in copy_path_ids:
@@ -824,15 +827,33 @@ async def incremental_retrain(request: RetrainRequest):
             # ========== 保存 FN 图像到模型目录（用于 YOLO 训练） ==========
             if fn_images:
                 fn_images_dir = new_model_dir / "fn_images"
-                for fn_img, fn_pos_id in fn_images:
+                batch_ts = int(time.time() * 1000) % 1000000  # 批次时间戳，避免多轮重训命名冲突
+                for idx, (fn_img, fn_pos_id) in enumerate(fn_images):
                     pos_dir = fn_images_dir / str(fn_pos_id)
                     pos_dir.mkdir(parents=True, exist_ok=True)
-                    existing = len(list(pos_dir.glob("fn_*.jpg")))
                     try:
-                        fn_img.save(str(pos_dir / f"fn_{existing:04d}.jpg"), "JPEG", quality=95)
+                        fn_img.save(str(pos_dir / f"fn_{batch_ts}_{idx:04d}.jpg"), "JPEG", quality=95)
                     except Exception as e:
                         logger.error(f"Failed to save FN image for pos_id={fn_pos_id}: {e}")
                 logger.info(f"path_id={path_id}: Saved {len(fn_images)} FN images to {fn_images_dir}")
+
+            # ========== 保存 YOLO FP 图像到模型目录（用于 YOLO normal 类训练） ==========
+            yolo_fp_images: List[np.ndarray] = []
+            if group.yolo_false_positive_images:
+                yolo_fp_dir = new_model_dir / "yolo_fp_images"
+                batch_ts = int(time.time() * 1000) % 1000000
+                for idx, img_b64 in enumerate(group.yolo_false_positive_images):
+                    try:
+                        img_data = base64.b64decode(img_b64)
+                        nparr = np.frombuffer(img_data, np.uint8)
+                        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                        if img is not None:
+                            yolo_fp_images.append(img)
+                            yolo_fp_dir.mkdir(parents=True, exist_ok=True)
+                            cv2.imwrite(str(yolo_fp_dir / f"yolo_fp_{batch_ts}_{idx:04d}.jpg"), img)
+                    except Exception as e:
+                        logger.error(f"Failed to decode YOLO FP image[{idx}] for path_id={path_id}: {e}")
+                logger.info(f"path_id={path_id}: Saved {len(yolo_fp_images)} YOLO FP images to {yolo_fp_dir}")
 
             # ========== 处理 False Positives：微调 Dinomaly ==========
             if fp_images:
@@ -879,9 +900,9 @@ async def incremental_retrain(request: RetrainRequest):
                 )
                 all_task_ids.extend(path_task_ids)
                 total_fp += num_fp
-            elif fn_images:
-                # 没有 FP 数据，但存在 FN 数据 → 创建纯 YOLO 训练任务
-                logger.info(f"path_id={path_id}: No FP data, but {len(fn_images)} FN images found. Launching YOLO-only training task.")
+            elif fn_images or yolo_fp_images:
+                # 没有 FP 数据，但存在 FN 或 YOLO FP 数据 → 创建纯 YOLO 训练任务
+                logger.info(f"path_id={path_id}: No FP data, but {len(fn_images)} FN + {len(yolo_fp_images)} YOLO FP images found. Launching YOLO-only training task.")
                 yolo_task_id = trainer._create_yolo_only_training_task(
                     dataset_dir=str(train_base_dir),
                     config={
@@ -923,6 +944,7 @@ async def incremental_retrain(request: RetrainRequest):
                     shutil.copytree(str(template_variants_src), str(template_variants_dst))
 
             total_fn += len(fn_images)
+            total_yolo_fp += len(yolo_fp_images)
 
             # 构建 group_ids 列表（用于前端轮询组状态）
             path_group_ids = []
@@ -934,6 +956,7 @@ async def incremental_retrain(request: RetrainRequest):
                 "status": "success",
                 "num_fp": len(fp_images),
                 "num_fn": len(fn_images),
+                "num_yolo_fp": len(yolo_fp_images),
                 "fp_task_ids": path_task_ids,
                 "task_ids": path_task_ids,
                 "group_ids": path_group_ids,
@@ -954,9 +977,10 @@ async def incremental_retrain(request: RetrainRequest):
         "new_task_uuid": new_task_uuid,
         "total_fp": total_fp,
         "total_fn": total_fn,
+        "total_yolo_fp": total_yolo_fp,
         "task_ids": all_task_ids,
         "results": results,
-        "message": f"Retraining completed. Total path_ids: {len(results)}, FP: {total_fp}, FN: {total_fn}",
+        "message": f"Retraining completed. Total path_ids: {len(results)}, FP: {total_fp}, FN: {total_fn}, YOLO_FP: {total_yolo_fp}",
     }
 
 
