@@ -132,8 +132,7 @@ class ModelDeployer:
     def _find_models(self, project_id: str, task_uuid: str) -> Dict[str, str]:
         """
         查找模型路径
-        支持 PatchCore 模型 (memory_bank.npz 或 patchcore_model.pt)
-        支持 Dinomaly 模型 (model.ckpt)
+        支持 YOLO 模型 (yolo_model.pt)，兼容旧版 Dinomaly (model.ckpt)
         """
         models = {}
         base_path = Path(self.output_dir) / str(project_id) / task_uuid
@@ -144,72 +143,35 @@ class ModelDeployer:
         labels_file = base_path / "labels.txt"
         is_unified = labels_file.exists()
 
+        def _has_model(model_dir: Path) -> Optional[str]:
+            """检查目录下是否有模型文件，返回模型路径或 None"""
+            for name in ["yolo_model.pt", "model.ckpt"]:
+                p = model_dir / name
+                if p.exists():
+                    return str(p)
+            return None
+
         if is_unified:
-            # 检查 Dinomaly 模型格式
-            dinomaly_model_path = base_path / "model.ckpt"
-            has_dinomaly_model = dinomaly_model_path.exists()
-            # 检查新的 anomalib PatchCore 模型格式
-            patchcore_model_path = base_path / "patchcore_model.pt"
-            has_patchcore_model = patchcore_model_path.exists()
-            # 检查旧的 memory_bank 格式
-            memory_bank_path = base_path / "memory_bank.npz"
-            has_memory_bank = memory_bank_path.exists()
             config_path = base_path / "config.json"
-            has_config = config_path.exists()
-
-            if has_dinomaly_model and has_config:
+            if _has_model(base_path) and config_path.exists():
                 labels = []
                 try:
                     with open(labels_file, "r") as f:
                         labels = [line.strip() for line in f if line.strip()]
-                except:
+                except Exception:
                     pass
-
                 models["multi_position"] = str(base_path)
                 models["_labels"] = labels
-                models["_model_type"] = "dinomaly"
-            elif (has_patchcore_model or has_memory_bank) and has_config:
-                labels = []
-                try:
-                    with open(labels_file, "r") as f:
-                        labels = [line.strip() for line in f if line.strip()]
-                except:
-                    pass
-
-                models["multi_position"] = str(base_path)
-                models["_labels"] = labels
-                models["_model_type"] = "patchcore"
+                models["_model_type"] = "yolo"
         else:
-            train_mode = "by_pos_id"  # 默认值
+            train_mode = "by_pos_id"
             for label_dir in base_path.iterdir():
                 if not label_dir.is_dir():
                     continue
-
-                # 检查 Dinomaly 模型格式
-                has_dinomaly_model = (label_dir / "model.ckpt").exists()
-                # 检查新的 anomalib PatchCore 模型格式
-                has_patchcore_model = (label_dir / "patchcore_model.pt").exists()
-                # 检查旧的 memory_bank 格式
-                has_memory_bank = (label_dir / "memory_bank.npz").exists()
                 has_config = (label_dir / "config.json").exists()
-
-                if has_dinomaly_model and has_config:
+                if _has_model(label_dir) and has_config:
                     models[label_dir.name] = str(label_dir)
-                    models[f"{label_dir.name}_type"] = "dinomaly"
-
-                    # 从 config.json 读取 train_mode（读第一个即可）
-                    if train_mode == "by_pos_id":
-                        try:
-                            with open(label_dir / "config.json", "r", encoding="utf-8") as f:
-                                cfg = json.load(f)
-                                train_mode = cfg.get("train_mode", "by_pos_id")
-                        except Exception:
-                            pass
-                elif (has_patchcore_model or has_memory_bank) and has_config:
-                    models[label_dir.name] = str(label_dir)
-                    models[f"{label_dir.name}_type"] = "patchcore"
-
-                    # 从 config.json 读取 train_mode（读第一个即可）
+                    models[f"{label_dir.name}_type"] = "yolo"
                     if train_mode == "by_pos_id":
                         try:
                             with open(label_dir / "config.json", "r", encoding="utf-8") as f:

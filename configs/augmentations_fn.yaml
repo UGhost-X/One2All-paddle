@@ -1,5 +1,5 @@
-# FN 图像专用轻度增强配置
-# 用于 YOLO 检测训练中扩充 defect 类样本
+# FN/Normal 图像增强配置
+# YOLO 内置增强已关闭，所有增强由此接管
 
 __version__: 1.4.0
 transform:
@@ -12,6 +12,14 @@ transform:
     # 水平翻转
     - __class_fullname__: HorizontalFlip
       p: 0.5
+
+    # 垂直翻转
+    - __class_fullname__: VerticalFlip
+      p: 0.5
+
+    # 90° 旋转（转置翻转）
+    - __class_fullname__: Transpose
+      p: 0.3
 
     # 轻微旋转 (±10°)
     - __class_fullname__: Rotate
@@ -47,7 +55,4 @@ transform:
           p: 1.0
 
     # 轻微亮度/对比度调整
-    - __class_fullname__: RandomBrightnessContrast
-      brightness_limit: 0.2
-      contrast_limit: 0.2
-      p: 0.5
+    # 亮度/对比度由代码中 AdaptiveBrightnessContrast 接管（暗图不更暗，亮图不更亮）

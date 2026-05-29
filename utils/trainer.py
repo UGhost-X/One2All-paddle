@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-异常检测模型训练器
-仅支持 Dinomaly 算法
+YOLO 检测模型训练器
 """
 
 import os
@@ -11,12 +10,12 @@ import time
 import random
 import logging
 import traceback
+import math
 import threading
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 import numpy as np
 from PIL import Image, ImageDraw
-import torch
 import yaml
 import shutil
 import tempfile
@@ -25,50 +24,13 @@ from utils.config import get_output_dir
 from tqdm import tqdm
 from collections import defaultdict
 
-# 设置 timm 模型缓存目录为本地路径（必须在导入 timm/anomalib 之前设置）
-PROJECT_ROOT = Path(__file__).parent.parent
-PRETRAINED_DIR = PROJECT_ROOT / "models" / "pretrained"
-HUB_DIR = PRETRAINED_DIR / "hub"
-os.environ["TIMM_HOME"] = str(PRETRAINED_DIR)
-os.environ["HF_HOME"] = str(PRETRAINED_DIR)
-os.environ["TRANSFORMERS_CACHE"] = str(PRETRAINED_DIR / "transformers")
-os.environ["HUGGINGFACE_HUB_CACHE"] = str(HUB_DIR)
-# 设置 anomalib 预训练模型缓存目录为本地路径
-os.environ["ANOMALIB_CACHE_DIR"] = str(PRETRAINED_DIR)
-# 使用 Hugging Face 镜像站
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-# 允许联网下载
-os.environ["HF_HUB_OFFLINE"] = "0"
-os.environ["TRANSFORMERS_OFFLINE"] = "0"
-
 sys.path.insert(0, '/home/software/One2All-paddle')
 
-# Anomalib 导入
-from anomalib.data import Folder
-from anomalib.data.utils import TestSplitMode, ValSplitMode
-from anomalib.engine import Engine
+PROJECT_ROOT = Path(__file__).parent.parent
+PRETRAINED_DIR = PROJECT_ROOT / "models" / "pretrained"
 
-
-try:
-    from anomalib.models.components.dinov2.dinov2_loader import DinoV2Loader as _DinoV2Loader
-except ImportError:
-    from anomalib.models.image.dinomaly.components.dinov2_loader import DinoV2Loader as _DinoV2Loader
-_original_dinov2loader_init = _DinoV2Loader.__init__
-def _patched_dinov2loader_init(self, cache_dir=None, vit_factory=None):
-    if cache_dir is None:
-        cache_dir = str(PRETRAINED_DIR / "dinov2")
-    _original_dinov2loader_init(self, cache_dir, vit_factory)
-_DinoV2Loader.__init__ = _patched_dinov2loader_init
-
-# PyTorch Lightning Callback
-from pytorch_lightning.callbacks import Callback, EarlyStopping
-
-try:
-    from anomalib.models import Dinomaly
-    DINORMALY_AVAILABLE = True
-except ImportError:
-    DINORMALY_AVAILABLE = False
-    logging.warning("Dinomaly model not available")
+from utils.synthetic_defect_generator import SyntheticDefectGenerator, load_synthetic_config
+import cv2
 
 # Albumentations 导入
 try:
@@ -324,6 +286,7 @@ def extract_roi_images(
     num_augmentations: int = 1,
     train_mode: str = "by_pos_id",
     augmentation_config: Optional[str] = None,
+    target_size: Tuple[int, int] = (320, 320),
 ) -> List[Path]:
     """
     从annotations中提取ROI图片并保存到output_dir，同时保存mask到mask_output_dir
@@ -379,7 +342,7 @@ def extract_roi_images(
             continue
 
         try:
-            roi_image, roi_mask = extract_polygon_region(image_path, segmentation)
+            roi_image, roi_mask = extract_polygon_region(image_path, segmentation, target_size=target_size)
 
             if normalize_brightness:
                 roi_image = normalize_brightness(roi_image)
@@ -606,7 +569,7 @@ class ModelTrainer:
     ) -> str:
         """创建单个组的训练任务"""
         safe_group_id = str(group_id).replace("/", "_").replace("\\", "_")
-        model_name = config.get("model_name", "PatchCore")
+        model_name = config.get("model_name", "YOLO")
 
         # 为当前 group 设置 category（使用 category_id 而不是 label 避免中文路径问题）
         config = dict(config)
@@ -624,7 +587,7 @@ class ModelTrainer:
         else:
             path_id = safe_group_id
         
-        # 将 path_id 保存到 config，确保 _do_train_dinomaly 使用相同的值
+        # 将 path_id 保存到 config，确保 _do_train_yolo 使用相同的值
         config["path_id"] = path_id
 
         task_key = self._make_task_key(dataset_dir, config, safe_group_id)
@@ -663,9 +626,9 @@ class ModelTrainer:
                     str(path_id),
                 )
                 external_group_id = config.get("external_group_id")
-                # 判断任务类型：有 base_roi_dir 说明是 FP 重训，否则是首次训练
-                is_retrain = bool(config.get("base_roi_dir"))
-                task_type = "dinomaly_fp_retrain" if is_retrain else "dinomaly_initial"
+                # 判断任务类型：有 base_model_dir 说明是重训，否则是首次训练
+                is_retrain = bool(config.get("base_model_dir"))
+                task_type = "yolo_retrain" if is_retrain else "yolo_initial"
                 self.training_status[task_id] = {
                     "status": "starting",
                     "progress": 0,
@@ -702,8 +665,8 @@ class ModelTrainer:
         path_id: str,
         base_model_dir: str,
     ) -> str:
-        """创建纯 YOLO 训练任务（无 FP，仅 FN 图像）。复制基础 Dinomaly 模型 + 训练 YOLO 检测器。"""
-        model_name = config.get("model_name", "Dinomaly")
+        """创建纯 YOLO 训练任务（无 FP，仅 FN 图像）。复制基础 YOLO 模型 + 训练 YOLO 检测器。"""
+        model_name = config.get("model_name", "YOLO")
         safe_path_id = str(path_id).replace("/", "_").replace("\\", "_")
         task_id = f"{model_name.lower()}_yolo_{int(time.time())}_{safe_path_id}_{random.randint(1000, 9999)}"
 
@@ -762,14 +725,14 @@ class ModelTrainer:
         try:
             self._do_train_yolo_only(task_id, dataset_dir, config, path_id, base_model_dir)
         except SystemExit:
-            self._add_log(task_id, "YOLO training cancelled")
+            self._add_log(task_id, "Training cancelled")
             self._update_task_status(task_id, status="cancelled")
         except Exception as e:
-            logger.exception(f"YOLO training failed for {task_id}")
+            logger.exception(f"Training failed for {task_id}")
             error_msg = str(e)
-            if self._is_oom_error(e):
+            if "out of memory" in str(e).lower():
                 error_msg = f"[GPU 显存不足] {error_msg}"
-                self._add_log(task_id, f"YOLO 训练失败：GPU 显存不足 (OOM)。建议释放 GPU 资源后重试。")
+                self._add_log(task_id, f"训练失败：GPU 显存不足 (OOM)。建议释放 GPU 资源后重试。")
             self._update_task_status(task_id, status="failed", error=error_msg)
             self._add_log(task_id, f"Error: {e}")
         finally:
@@ -805,19 +768,19 @@ class ModelTrainer:
         group_id: Any,
         group_annotations: List[Dict],
     ):
-        """训练进程入口（仅支持 Dinomaly）"""
+        """训练进程入口（YOLO）"""
         self._semaphore.acquire()
         with self._active_lock:
             self._active_tasks += 1
         try:
-            self._do_train_dinomaly(task_id, dataset_dir, config, group_id, group_annotations)
+            self._do_train_yolo(task_id, dataset_dir, config, group_id, group_annotations)
         except SystemExit:
             self._add_log(task_id, "Training cancelled")
             self._update_task_status(task_id, status="cancelled")
         except Exception as e:
             logger.exception(f"Training failed for {task_id}")
             error_msg = str(e)
-            if self._is_oom_error(e):
+            if "out of memory" in str(e).lower():
                 error_msg = f"[GPU 显存不足] {error_msg}"
                 self._add_log(task_id, f"训练失败：GPU 显存不足 (OOM)。建议减小 batch_size 或释放 GPU 资源。")
             self._update_task_status(task_id, status="failed", error=error_msg)
@@ -828,235 +791,9 @@ class ModelTrainer:
             self._semaphore.release()
             self._persist_state_if_due(force=True)
 
-    def _prepare_fp_combined_dataset(
-        self,
-        task_id: str,
-        base_roi_dir: Path,
-        fp_group_annotations: List[Dict],
-        dataset_dir: str,
-        output_dir: Path,
-        mask_output_dir: Path,
-        num_fp_augmentations: int = 30,
-        normalize_brightness_flag: bool = False,
-        normalize_contrast_flag: bool = False,
-        augmentation_config: Optional[str] = None,
-        fp_image_dir: Optional[Path] = None,
-    ) -> List[Path]:
-        """
-        合并基础模型 ROI 图 + 增强后的 FP 图。
+    # ==================== YOLO 训练 ====================
 
-        策略：
-          - 原始 ROI 图：直接复制，不做额外增强
-          - FP 图：提取 ROI 后做 num_fp_augmentations 张增强（含原图本身）
-          - 如果 fp_group_annotations 为空，可从 fp_image_dir 读取预存的 FP 图片
-
-        Returns:
-            合并后所有图片的路径列表
-        """
-        output_dir.mkdir(parents=True, exist_ok=True)
-        mask_output_dir.mkdir(parents=True, exist_ok=True)
-        combined_paths: List[Path] = []
-
-        base_images = sorted(
-            list(base_roi_dir.glob("base_*.png")) + list(base_roi_dir.glob("base_*.jpg"))
-        )
-        if not base_images:
-            # 回退：如果没有 base_ 前缀文件（初次训练的原始数据），读取所有文件
-            base_images = sorted(
-                list(base_roi_dir.glob("*.png")) + list(base_roi_dir.glob("*.jpg"))
-            )
-        if not base_images:
-            self._add_log(task_id, f"WARNING: base_roi_dir is empty: {base_roi_dir}")
-
-        for img_path in base_images:
-            dst = output_dir / f"base_{img_path.name}"
-            if not dst.exists():
-                shutil.copy2(img_path, dst)
-            combined_paths.append(dst)
-
-            base_mask_dir = base_roi_dir.parent.parent / "masks" / base_roi_dir.name
-            mask_src = base_mask_dir / (img_path.stem + ".npy")
-            if mask_src.exists():
-                mask_dst = mask_output_dir / f"base_{img_path.stem}.npy"
-                if not mask_dst.exists():
-                    shutil.copy2(mask_src, mask_dst)
-
-        self._add_log(task_id, f"Copied {len(base_images)} base ROI images from {base_roi_dir}")
-
-        fp_image_paths: List[Path] = []
-        if not fp_group_annotations and fp_image_dir and fp_image_dir.exists():
-            fp_image_paths = sorted(
-                list(fp_image_dir.glob("fp_*.jpg")) + list(fp_image_dir.glob("fp_*.png"))
-            )
-            if fp_image_paths:
-                self._add_log(task_id, f"Found {len(fp_image_paths)} pre-existing FP images in {fp_image_dir}")
-
-        if not fp_group_annotations and not fp_image_paths:
-            self._add_log(task_id, "No FP annotations or pre-existing FP images found, skipping FP augmentation")
-            return combined_paths
-
-        augment_transform = load_augmentation_transform(augmentation_config)
-        if augment_transform is None:
-            self._add_log(task_id, "WARNING: No augmentation transform loaded, FP images will be duplicated without augmentation")
-
-        fp_original_count = 0
-        fp_aug_count = 0
-
-        dataset_path = Path(dataset_dir)
-        raw_images_dir = dataset_path / "raw_images"
-        json_path = dataset_path / "annotations.json"
-
-        image_map: Dict[int, str] = {}
-        if json_path.exists():
-            with open(json_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            image_map = {img["id"]: img["file_name"] for img in data.get("images", [])}
-
-        if fp_group_annotations:
-            for ann in fp_group_annotations:
-                image_id = ann["image_id"]
-                ann_id = ann["id"]
-                file_name = image_map.get(image_id)
-
-                if not file_name:
-                    self._add_log(task_id, f"WARNING: image_id={image_id} not found, skipping")
-                    continue
-
-                image_path = raw_images_dir / file_name
-                if not image_path.exists():
-                    self._add_log(task_id, f"WARNING: FP image not found: {image_path}")
-                    continue
-
-                segmentation = ann.get("segmentation", [])
-                if not segmentation:
-                    self._add_log(task_id, f"WARNING: annotation {ann_id} has no segmentation, skipping")
-                    continue
-
-                try:
-                    roi_image, roi_mask = extract_polygon_region(image_path, segmentation)
-
-                    if normalize_brightness_flag:
-                        roi_image = normalize_brightness(roi_image)
-                    if normalize_contrast_flag:
-                        roi_image = normalize_contrast(roi_image)
-
-                    file_stem = Path(file_name).stem
-
-                    orig_name = f"fp_{file_stem}_ann{ann_id}.png"
-                    orig_path = output_dir / orig_name
-                    roi_image.save(orig_path)
-                    combined_paths.append(orig_path)
-                    np.save(mask_output_dir / f"fp_{file_stem}_ann{ann_id}.npy", roi_mask)
-                    fp_original_count += 1
-
-                    for i in range(num_fp_augmentations - 1):
-                        if augment_transform:
-                            aug_image = apply_augmentation(roi_image, augment_transform)
-                        else:
-                            aug_image = roi_image
-
-                        aug_name = f"fp_{file_stem}_ann{ann_id}_aug{i:04d}.png"
-                        aug_path = output_dir / aug_name
-                        aug_image.save(aug_path)
-                        combined_paths.append(aug_path)
-                        np.save(mask_output_dir / f"fp_{file_stem}_ann{ann_id}_aug{i:04d}.npy", roi_mask)
-                        fp_aug_count += 1
-
-                except Exception as e:
-                    self._add_log(task_id, f"ERROR: Failed to process FP annotation {ann_id}: {e}")
-        else:
-            for img_path in fp_image_paths:
-                try:
-                    roi_image = Image.open(img_path).convert("RGB")
-                    roi_image, roi_mask = letterbox_resize(roi_image, (224, 224))
-
-                    if normalize_brightness_flag:
-                        roi_image = normalize_brightness(roi_image)
-                    if normalize_contrast_flag:
-                        roi_image = normalize_contrast(roi_image)
-
-                    file_stem = img_path.stem
-
-                    orig_name = f"{file_stem}.png"
-                    orig_path = output_dir / orig_name
-                    roi_image.save(orig_path)
-                    combined_paths.append(orig_path)
-                    np.save(mask_output_dir / f"{file_stem}.npy", roi_mask)
-                    fp_original_count += 1
-
-                    for i in range(num_fp_augmentations - 1):
-                        if augment_transform:
-                            aug_image = apply_augmentation(roi_image, augment_transform)
-                        else:
-                            aug_image = roi_image
-
-                        aug_name = f"{file_stem}_aug{i:04d}.png"
-                        aug_path = output_dir / aug_name
-                        aug_image.save(aug_path)
-                        combined_paths.append(aug_path)
-                        np.save(mask_output_dir / f"{file_stem}_aug{i:04d}.npy", roi_mask)
-                        fp_aug_count += 1
-
-                except Exception as e:
-                    self._add_log(task_id, f"ERROR: Failed to process FP image {img_path.name}: {e}")
-
-        self._add_log(
-            task_id,
-            f"FP augmentation done: {fp_original_count} FP × {num_fp_augmentations} = "
-            f"{fp_original_count + fp_aug_count} FP images"
-        )
-        self._add_log(
-            task_id,
-            f"Combined dataset total: {len(base_images)} base + "
-            f"{fp_original_count + fp_aug_count} FP augmented = {len(combined_paths)} images"
-        )
-        return combined_paths
-
-    def _load_annotations_for_path_id(
-        self,
-        task_id: str,
-        dataset_dir: str,
-        path_id: str,
-        train_mode: str = "by_pos_id",
-    ) -> List[Dict]:
-        """
-        从 dataset_dir/annotations.json 中筛选匹配指定 path_id 的标注。
-
-        用于重训时 base_roi_dir 缺失的回退场景：
-        根据 train_mode 选择匹配字段（by_category → category_id, by_pos_id → pos_id）。
-        """
-        annotations_path = Path(dataset_dir) / "annotations.json"
-        if not annotations_path.exists():
-            self._add_log(task_id, f"annotations.json not found in {dataset_dir}")
-            return []
-
-        try:
-            with open(annotations_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception as e:
-            self._add_log(task_id, f"Failed to read annotations.json: {e}")
-            return []
-
-        all_annotations = data.get("annotations", [])
-        filtered = []
-        for ann in all_annotations:
-            if train_mode == "by_category":
-                if str(ann.get("category_id", 0)) == str(path_id):
-                    filtered.append(ann)
-            else:  # by_pos_id or default
-                if str(ann.get("pos_id", "")) == str(path_id):
-                    filtered.append(ann)
-
-        self._add_log(
-            task_id,
-            f"Loaded {len(filtered)} annotations for path_id={path_id} "
-            f"(train_mode={train_mode}, total={len(all_annotations)})"
-        )
-        return filtered
-
-    # ==================== Dinomaly 训练 ====================
-
-    def _do_train_dinomaly(
+    def _do_train_yolo(
         self,
         task_id: str,
         dataset_dir: str,
@@ -1064,657 +801,178 @@ class ModelTrainer:
         group_id: Any,
         group_annotations: List[Dict],
     ):
-        """执行 Dinomaly 训练（支持从检查点恢复进行微调）"""
-        self._add_log(task_id, f"Dinomaly training started for group '{group_id}'")
+        """执行 YOLO 训练"""
+        self._add_log(task_id, f"YOLO training started for group '{group_id}'")
         self._update_task_status(task_id, status="preparing", progress=5)
 
         with self._status_lock:
             save_dir = self.training_status[task_id]["save_dir"]
         os.makedirs(save_dir, exist_ok=True)
 
-        # ✅ 固定随机种子，保证可复现性
         seed = config.get("seed", 42)
         random.seed(seed)
         np.random.seed(seed)
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed(seed)
-            torch.cuda.manual_seed_all(seed)
-            torch.backends.cudnn.deterministic = True
-            torch.backends.cudnn.benchmark = False  # benchmark=True 会引入不确定性
-        self._add_log(task_id, f"Random seed fixed: {seed}")
 
-        # 配置参数
-        encoder_name = config.get("encoder_name", "dinov2_vit_base_14")
-        decoder_depth = config.get("decoder_depth", 8)
-        bottleneck_dropout = config.get("bottleneck_dropout", 0.2)
-        epochs = config.get("epochs", 12)
-        batch_size = config.get("batch_size", 2)
-        num_workers = config.get("num_workers", 4)
-        normalize_brightness = config.get("normalize_brightness", False)
-        normalize_contrast = config.get("normalize_contrast", False)
-        freeze_encoder = config.get("freeze_encoder", True)
-        category = config.get("category", "unknown")
+        train_mode = config.get("train_mode", "by_pos_id")
         category_label = config.get("category_label", "unknown")
-        augment = config.get("augment", False)
-        num_augmentations = config.get("num_augmentations", 1)
-        augmentation_config = config.get("augmentation_config", None)
-        num_samples = len(group_annotations)
+        use_synthetic = config.get("synthetic_defects", True)
+        synthetic_per_normal = config.get("synthetic_per_normal", 3)
+        is_retrain = bool(config.get("base_model_dir"))
 
-        self._update_task_status(task_id, num_samples=num_samples)
-        self._add_log(task_id, f"Training with {num_samples} annotations for group '{group_id}' (label: {category_label})")
-        self._add_log(task_id, f"Encoder: {encoder_name}, Decoder depth: {decoder_depth}, Epochs: {epochs}")
+        self._update_task_status(task_id, progress=10)
 
-        # 检查 GPU 显存状态
-        gpu_info = self._get_gpu_memory_info()
-        if gpu_info.get("available"):
-            self._add_log(
-                task_id,
-                f"GPU memory: {gpu_info['free_mb']:.0f}MB free / {gpu_info['total_mb']:.0f}MB total "
-                f"({gpu_info['free_pct']:.0f}%), used={gpu_info['used_mb']:.0f}MB"
-            )
-            min_free_mb = 2000  # Dinomaly + DINOv2 至少需要 ~2GB
-            if gpu_info['free_mb'] < min_free_mb:
-                self._add_log(
-                    task_id,
-                    f"WARNING: GPU 显存不足 ({gpu_info['free_mb']:.0f}MB < {min_free_mb}MB)，"
-                    f"训练可能会因 OOM 失败"
-                )
-
-        if not DINORMALY_AVAILABLE:
-            raise RuntimeError("Dinomaly model is not available")
-
-        # 初始化变量，用于 finally 中清理
-        model = None
-        engine = None
-        datamodule = None
-        temp_root = None
-        anomalib_temp_dir = None
-        fit_thread = None
-        predictions = None
-        scores = None
-        eval_dataloader = None
-        val_split_ratio_actual = 0.0  # 将在后面根据样本数动态设置
-
-        try:
-            # Stage 1: 准备训练图片
-            self._update_task_status(task_id, status="preparing", progress=10, stage="1/3")
-            self._add_log(task_id, "Stage 1/3: Preparing ROI images...")
-
-            train_mode = config.get("train_mode", "by_pos_id")
-            task_uuid = config.get("task_uuid", "unknown")
-            project_id = config.get("project_id", "default")
-
-            path_id = config.get("path_id")
-            if path_id is None:
-                if group_annotations:
-                    first_ann = group_annotations[0]
-                    path_id = str(first_ann.get("category_id", 0)) if train_mode == "by_category" \
-                              else str(first_ann.get("pos_id", group_id))
-                else:
-                    path_id = str(group_id)
-                self._add_log(task_id, f"Warning: path_id not in config, fallback to {path_id}")
-
-            roi_save_dir = Path(dataset_dir) / "roi" / str(path_id)
-            mask_save_dir = Path(dataset_dir) / "masks" / str(path_id)
-            roi_save_dir.mkdir(parents=True, exist_ok=True)
-            mask_save_dir.mkdir(parents=True, exist_ok=True)
-
-            # 判断是否为 FP 重训模式
-            # 触发条件：提供了 base_roi_dir
-            base_roi_dir_str = config.get("base_roi_dir")
-            is_fp_retrain = bool(base_roi_dir_str)
-
-            if is_fp_retrain:
-                base_roi_dir = Path(base_roi_dir_str)
-                num_fp_augmentations = config.get("num_fp_augmentations", 30)
-
-                self._add_log(task_id, f"[FP Retrain] mode: base_roi_dir={base_roi_dir}, fp_aug={num_fp_augmentations}x")
-
-                # 检查 base_roi_dir 是否存在（可能因上一轮是纯 FN 重训而没有 roi 目录）
-                if not base_roi_dir.exists():
-                    self._add_log(task_id, f"[FP Retrain] base_roi_dir not found, falling back to annotation-based extraction")
-                    # 回退：从 dataset_dir 的 annotations.json 中提取匹配当前 path_id 的 ROI
-                    filtered_anns = self._load_annotations_for_path_id(
-                        task_id=task_id,
-                        dataset_dir=str(dataset_dir),
-                        path_id=str(path_id),
-                        train_mode=train_mode,
-                    )
-                    if filtered_anns:
-                        image_paths = extract_roi_images(
-                            dataset_dir=str(dataset_dir),
-                            output_dir=str(roi_save_dir),
-                            mask_output_dir=str(mask_save_dir),
-                            group_annotations=filtered_anns,
-                            normalize_brightness=normalize_brightness,
-                            normalize_contrast=normalize_contrast,
-                            augment=False,
-                            num_augmentations=1,
-                            train_mode=train_mode,
-                            augmentation_config=augmentation_config,
-                        )
-                        n_base = len(filtered_anns)
-                        self._add_log(task_id, f"[FP Retrain] Extracted {len(image_paths)} base ROI images from annotations (n_base={n_base})")
-                    else:
-                        n_base = 0
-                        image_paths = []
-                        self._add_log(task_id, f"[FP Retrain] WARNING: No annotations found for path_id={path_id}")
-
-                    # 对 FP 图片进行增强（由 retrain 端点预存到 roi_save_dir 的 fp_*.jpg）
-                    fp_images_in_dir = list(roi_save_dir.glob("fp_*.jpg")) + list(roi_save_dir.glob("fp_*.png"))
-                    n_fp_raw = len(fp_images_in_dir)
-                    if n_fp_raw > 0 and n_base > 0:
-                        # 增强 FP 图片：使用 _prepare_fp_combined_dataset 但 base_roi_dir 指向
-                        # 已提取好的 roi_save_dir，且只处理 fp_ 前缀文件
-                        max_fp_aug_total = int(n_base * 0.5)
-                        if n_fp_raw * num_fp_augmentations > max_fp_aug_total:
-                            safe_aug_per_fp = max(1, max_fp_aug_total // n_fp_raw)
-                            self._add_log(task_id, f"[FP Retrain] FP aug capped: {num_fp_augmentations} → {safe_aug_per_fp} per image (base={n_base}, fp_raw={n_fp_raw}, limit={max_fp_aug_total})")
-                            num_fp_augmentations = safe_aug_per_fp
-
-                        augment_transform = load_augmentation_transform(augmentation_config)
-                        for fp_img_path in fp_images_in_dir:
-                            try:
-                                roi_image = Image.open(fp_img_path).convert("RGB")
-                                roi_image, roi_mask = letterbox_resize(roi_image, (224, 224))
-                                file_stem = fp_img_path.stem
-                                # 保存原图
-                                orig_path = roi_save_dir / f"{file_stem}.png"
-                                if not orig_path.exists():
-                                    roi_image.save(orig_path)
-                                image_paths.append(orig_path)
-                                np.save(mask_save_dir / f"{file_stem}.npy", roi_mask)
-                                # 生成增强变体
-                                for i in range(num_fp_augmentations - 1):
-                                    if augment_transform:
-                                        aug_image = apply_augmentation(roi_image, augment_transform)
-                                    else:
-                                        aug_image = roi_image
-                                    aug_path = roi_save_dir / f"{file_stem}_aug{i:04d}.png"
-                                    aug_image.save(aug_path)
-                                    image_paths.append(aug_path)
-                                    np.save(mask_save_dir / f"{file_stem}_aug{i:04d}.npy", roi_mask)
-                            except Exception as e:
-                                self._add_log(task_id, f"ERROR: Failed to augment FP image {fp_img_path.name}: {e}")
-
-                        n_fp_total = n_fp_raw * num_fp_augmentations
-                        self._add_log(task_id, f"[FP Retrain] FP augmentation: {n_fp_raw} × {num_fp_augmentations} = {n_fp_total} images")
-                    elif n_fp_raw == 0:
-                        self._add_log(task_id, f"[FP Retrain] No FP images found in {roi_save_dir}")
-
-                    n_total = len(image_paths)
-                    actual_epochs = epochs
-                    self._add_log(task_id, f"[FP Retrain] Fallback training with {n_total} images, epochs={actual_epochs}")
-
-                else:
-                    # 正常 FP 重训路径：base_roi_dir 存在
-                    # 只统计 base_* 前缀文件（排除上次重训混入的 fp_* 文件）
-                    n_base = len(list(base_roi_dir.glob("base_*.png")) + list(base_roi_dir.glob("base_*.jpg")))
-                    if n_base == 0:
-                        # 回退：初次训练数据没有 base_ 前缀
-                        n_base = len(list(base_roi_dir.glob("*.png")) + list(base_roi_dir.glob("*.jpg")))
-                    n_fp_raw = len(group_annotations)
-
-                    if n_fp_raw == 0:
-                        fp_images_in_dir = list(roi_save_dir.glob("fp_*.jpg")) + list(roi_save_dir.glob("fp_*.png"))
-                        n_fp_raw = len(fp_images_in_dir)
-                        if n_fp_raw > 0:
-                            self._add_log(task_id, f"[FP Retrain] Found {n_fp_raw} pre-existing FP images in {roi_save_dir}")
-
-                    if n_fp_raw > 0:
-                        max_fp_aug_total = int(n_base * 0.5)
-                        if n_fp_raw * num_fp_augmentations > max_fp_aug_total:
-                            safe_aug_per_fp = max(1, max_fp_aug_total // n_fp_raw)
-                            self._add_log(task_id, f"[FP Retrain] FP aug capped: {num_fp_augmentations} → {safe_aug_per_fp} per image (base={n_base}, fp_raw={n_fp_raw}, limit={max_fp_aug_total})")
-                            num_fp_augmentations = safe_aug_per_fp
-
-                    # 1. 先复制基础模型 ROI 到当前 roi 目录
-                    # 2. 然后对 FP 图片进行增强，也保存到 roi 目录
-                    image_paths = self._prepare_fp_combined_dataset(
-                        task_id=task_id,
-                        base_roi_dir=base_roi_dir,
-                        fp_group_annotations=group_annotations,
-                        dataset_dir=dataset_dir,
-                        output_dir=roi_save_dir,
-                        mask_output_dir=mask_save_dir,
-                        num_fp_augmentations=num_fp_augmentations,
-                        normalize_brightness_flag=normalize_brightness,
-                        normalize_contrast_flag=normalize_contrast,
-                        augmentation_config=augmentation_config,
-                        fp_image_dir=roi_save_dir,
-                    )
-
-                    n_total = len(image_paths)
-                    if n_total > n_base * 1.5:
-                        actual_epochs = max(8, epochs - 2)
-                        self._add_log(task_id, f"[FP Retrain] Large dataset ({n_total} imgs), reducing epochs: {epochs} → {actual_epochs}")
-                    else:
-                        actual_epochs = epochs
-
-                    self._add_log(task_id, f"[FP Retrain] Training with {len(image_paths)} images, epochs={actual_epochs}")
-
+        path_id = config.get("path_id")
+        if path_id is None:
+            if group_annotations:
+                first_ann = group_annotations[0]
+                path_id = str(first_ann.get("category_id", 0)) if train_mode == "by_category" \
+                          else str(first_ann.get("pos_id", group_id))
             else:
-                # 初次训练：从 raw_images 提取 ROI
-                image_paths = extract_roi_images(
-                    dataset_dir=dataset_dir,
-                    output_dir=str(roi_save_dir),
-                    mask_output_dir=str(mask_save_dir),
-                    group_annotations=group_annotations,
-                    normalize_brightness=normalize_brightness,
-                    normalize_contrast=normalize_contrast,
-                    augment=augment,
-                    num_augmentations=num_augmentations,
-                    train_mode=train_mode,
-                    augmentation_config=augmentation_config,
-                )
-                actual_epochs = epochs
+                path_id = str(group_id)
 
-            if not image_paths:
-                raise ValueError(f"No ROI images for group {group_id}")
+        # Stage 1: Extract ROI images
+        self._update_task_status(task_id, status="preparing", progress=15, stage="1/5")
+        self._add_log(task_id, f"Stage 1/5: Extracting ROI images ({len(group_annotations)} annotations, label={category_label})...")
 
-            self._add_log(task_id, f"Training directory: {roi_save_dir} ({len(image_paths)} images)")
+        roi_save_dir = Path(dataset_dir) / "roi" / str(path_id)
+        mask_save_dir = Path(dataset_dir) / "masks" / str(path_id)
+        roi_save_dir.mkdir(parents=True, exist_ok=True)
+        mask_save_dir.mkdir(parents=True, exist_ok=True)
 
-            # Stage 2: 创建 Anomalib datamodule 和模型（支持 OOM 自动降级重试）
-            self._update_task_status(task_id, status="training", progress=30, stage="2/3")
-            self._add_log(task_id, "Stage 2/3: Creating model and datamodule...")
+        if is_retrain:
+            base_model_dir = Path(config.get("base_model_dir"))
+            base_roi_dir = Path(dataset_dir) / "roi" / str(path_id)
+            for img_path in sorted(list(base_roi_dir.glob("*.png")) + list(base_roi_dir.glob("*.jpg"))):
+                if img_path.name.startswith("fp_"):
+                    continue
+                dst = roi_save_dir / img_path.name
+                if not dst.exists():
+                    shutil.copy2(img_path, dst)
+            self._add_log(task_id, f"Copied base ROI images from {base_roi_dir}")
 
-            accelerator = 'gpu' if torch.cuda.is_available() else 'cpu'
+        yolo_imgsz = config.get("yolo_imgsz", 320)
+        image_paths = extract_roi_images(
+            dataset_dir=dataset_dir,
+            output_dir=str(roi_save_dir),
+            mask_output_dir=str(mask_save_dir),
+            group_annotations=group_annotations,
+            normalize_brightness=config.get("normalize_brightness", False),
+            normalize_contrast=config.get("normalize_contrast", False),
+            augment=False,
+            num_augmentations=1,
+            train_mode=train_mode,
+            augmentation_config=config.get("augmentation_config"),
+            target_size=(yolo_imgsz, yolo_imgsz),
+        )
 
-            # --- 以下配置与 batch_size 无关，只需计算一次 ---
-            import tempfile
-            anomalib_temp_dir = tempfile.mkdtemp(prefix="anomalib_")
-            temp_root = Path(save_dir) / "temp_anomalib"
-            temp_root.mkdir(parents=True, exist_ok=True)
-            safe_num_workers = 0
-            self._add_log(task_id, f"DataLoader num_workers forced to 0 (threading mode)")
+        normal_roi_paths = sorted(list(roi_save_dir.glob("*.png")) + list(roi_save_dir.glob("*.jpg")))
+        self._add_log(task_id, f"ROI extraction done: {len(normal_roi_paths)} normal ROI images")
 
-            num_images = len(image_paths)
-            min_val_samples = 3
-            val_split_ratio_actual = 0.2
-            check_val_every_n_epoch = actual_epochs
+        # Stage 2: 收集所有真实 FN（当前 + 历史），一次收集、直接传列表
+        self._update_task_status(task_id, progress=25, stage="2/5")
+        fn_images_dir = Path(save_dir) / "fn_images"
 
-            val_samples = int(num_images * val_split_ratio_actual)
-            if val_samples < min_val_samples:
-                val_split_ratio_actual = 0.0
-                val_split_mode = ValSplitMode.SAME_AS_TEST
-                check_val_every_n_epoch = epochs
-                self._add_log(task_id, f"WARNING: Only {num_images} samples, skipping val split (need >= {int(min_val_samples / 0.2)} images)")
-            else:
-                val_split_mode = ValSplitMode.FROM_TEST
-                check_val_every_n_epoch = 1
-                self._add_log(task_id, f"Using val_split_ratio=0.2 ({val_samples} val samples)")
+        all_fn_files: List[Path] = []
+        if fn_images_dir.exists():
+            all_fn_files.extend(fn_images_dir.rglob("*fn_*.jpg"))
+        if is_retrain:
+            project_dir = Path(save_dir).parent.parent
+            current_path_id_val = Path(save_dir).name
+            current_task_uuid = Path(save_dir).parent.name
+            for task_dir in project_dir.iterdir():
+                if not task_dir.is_dir() or task_dir.name == current_task_uuid:
+                    continue
+                hd = task_dir / current_path_id_val / "fn_images"
+                if hd.exists():
+                    all_fn_files.extend(hd.rglob("*fn_*.jpg"))
 
-            # ✅ 自定义 Callback，每个 epoch 结束更新进度和日志
-            class EpochProgressCallback(Callback):
-                def __init__(self, trainer_ref, task_id, total_epochs):
-                    self.trainer_ref = trainer_ref
-                    self.task_id = task_id
-                    self.total_epochs = total_epochs
+        n_real_fn = len(all_fn_files)
+        self._add_log(task_id, f"Stage 2/5: Found {n_real_fn} real FN images (current + historical)")
 
-                def on_train_epoch_end(self, trainer, pl_module):
-                    current = trainer.current_epoch + 1
-                    progress = 50 + int((current / self.total_epochs) * 30)
-                    self.trainer_ref._update_task_status(self.task_id, progress=progress)
-                    self.trainer_ref._add_log(
-                        self.task_id,
-                        f"[task:{self.task_id[-8:]}] Epoch {current}/{self.total_epochs} done"
-                    )
+        # 计算缺陷目标数量
+        max_aug_ratio = config.get("max_augmentation_ratio", 40)
+        max_total = config.get("max_total_samples", 500)
+        min_total = config.get("min_total_samples", 50)
 
-            epoch_cb = EpochProgressCallback(self, task_id, actual_epochs)
-
-            # --- OOM 自动降级重试循环 ---
-            batch_size_current = batch_size
-            model = None
-            engine = None
-            datamodule = None
-            oom_retry = 0
-
-            while True:
-                try:
-                    # --- 创建模型（每次重试都重新创建，避免部分训练状态污染） ---
-                    if model is None:
-                        self._add_log(task_id, f"Creating Dinomaly model: encoder={encoder_name}, decoder_depth={decoder_depth}, batch_size={batch_size_current}")
-                        try:
-                            model = Dinomaly(
-                                encoder_name=encoder_name,
-                                decoder_depth=decoder_depth,
-                                bottleneck_dropout=bottleneck_dropout,
-                            )
-                        except (OSError, IOError, Exception) as e:
-                            if 'dinov2' in str(e).lower() or 'download' in str(e).lower():
-                                raise RuntimeError(f"DINOv2 预训练权重下载失败: {e}")
-                            raise
-
-
-                    # --- 冻结编码器并启用 inference_mode 以释放激活值显存 ---
-                    if freeze_encoder:
-                        encoder = None
-                        if hasattr(model, 'model') and hasattr(model.model, 'encoder'):
-                            encoder = model.model.encoder
-                        elif hasattr(model, 'encoder'):
-                            encoder = model.encoder
-                        if encoder is not None:
-                            for param in encoder.parameters():
-                                param.requires_grad = False
-                            _orig_fwd = encoder.forward
-                            def _no_grad_fwd(*a, **kw):
-                                with torch.inference_mode():
-                                    return _orig_fwd(*a, **kw)
-                            encoder.forward = _no_grad_fwd
-                            if oom_retry == 0:
-                                self._add_log(task_id, "Encoder frozen with inference_mode for faster training and lower memory")
-
-                    # --- 构建 callbacks（EarlyStopping 每次重试需新建） ---
-                    if num_images > 50 and val_split_ratio_actual > 0:
-                        early_stop_cb = EarlyStopping(
-                            monitor="train_loss",
-                            patience=3,
-                            mode="min",
-                            verbose=False,
-                        )
-                        callbacks = [epoch_cb, early_stop_cb]
-                        if oom_retry == 0:
-                            self._add_log(task_id, f"EarlyStopping enabled (patience=3, monitor=train_loss)")
-                    else:
-                        callbacks = [epoch_cb]
-
-                    # --- 创建 Engine ---
-                    engine = Engine(
-                        max_epochs=actual_epochs,
-                        accelerator=accelerator,
-                        devices=1,
-                        enable_progress_bar=False,
-                        enable_model_summary=False,
-                        check_val_every_n_epoch=check_val_every_n_epoch,
-                        callbacks=callbacks,
-                        default_root_dir=anomalib_temp_dir,
-                        deterministic=False,
-                        precision="bf16-mixed",
-                        logger=False,
-                    )
-
-                    # --- 创建 Datamodule ---
-                    datamodule = Folder(
-                        name="train",
-                        root=temp_root,
-                        normal_dir=str(roi_save_dir),
-                        normal_test_dir=str(roi_save_dir),
-                        train_batch_size=batch_size_current,
-                        eval_batch_size=batch_size_current,
-                        num_workers=safe_num_workers,
-                        test_split_mode=TestSplitMode.FROM_DIR,
-                        val_split_mode=val_split_mode,
-                        val_split_ratio=val_split_ratio_actual,
-                    )
-                    datamodule.setup()
-
-                    # 验证数据集分割结果
-                    try:
-                        train_size = len(datamodule.train_dataloader().dataset)
-                        val_size = len(datamodule.val_dataloader().dataset)
-                        test_size = len(datamodule.test_dataloader().dataset)
-                        self._add_log(task_id, f"Dataset split: train={train_size}, val={val_size}, test={test_size}")
-                    except Exception as e:
-                        self._add_log(task_id, f"Warning: Could not log dataset split: {e}")
-
-                    # Stage 3: 训练模型
-                    self._update_task_status(task_id, progress=50, stage="3/3")
-                    self._add_log(task_id, f"{'='*20} Task {task_id[-8:]} Stage3 fit() START {'='*20}")
-                    self._add_log(task_id, "Stage 3/3: Training model...")
-
-                    train_start = time.time()
-                    fit_exception = [None]
-
-                    def run_fit():
-                        try:
-                            engine.fit(model=model, datamodule=datamodule)
-                        except Exception as e:
-                            fit_exception[0] = e
-
-                    fit_thread = threading.Thread(target=run_fit, daemon=True)
-                    fit_thread.start()
-
-                    timeout_seconds = actual_epochs * 600
-                    fit_thread.join(timeout=timeout_seconds)
-
-                    if fit_thread.is_alive():
-                        raise RuntimeError(f"engine.fit() timed out after {timeout_seconds}s (stuck in stage 3)")
-                    if fit_exception[0]:
-                        raise fit_exception[0]
-
-                    train_time = time.time() - train_start
-                    self._add_log(task_id, f"{'='*20} Task {task_id[-8:]} Stage3 fit() END {'='*20}")
-                    self._add_log(task_id, f"Training completed in {train_time:.2f}s")
-
-                    break  # 训练成功，退出重试循环
-
-                except Exception as e:
-                    if not self._is_oom_error(e):
-                        raise  # 非 OOM 错误直接抛出
-
-                    # --- OOM 错误处理：清理资源并降级 batch_size ---
-                    oom_retry += 1
-                    self._add_log(task_id, f"GPU OOM detected: {str(e)[:200]}")
-                    self._add_log(task_id, f"GPU memory after OOM: {torch.cuda.memory_allocated()/1024**2:.0f}MB allocated, {torch.cuda.memory_reserved()/1024**2:.0f}MB reserved")
-
-                    # 清理当前资源
-                    self._cleanup_training_resources(model, engine, datamodule)
-                    model = None
-                    engine = None
-                    datamodule = None
-                    fit_thread = None
-                    import gc
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                        self._add_log(task_id, f"GPU memory after OOM cleanup: {torch.cuda.memory_allocated()/1024**2:.0f}MB allocated")
-
-                    if batch_size_current <= 1:
-                        raise RuntimeError(
-                            f"GPU 显存不足，batch_size=1 仍无法完成训练。"
-                            f"请关闭其他 GPU 进程或使用更大显存的设备后重试。"
-                        ) from e
-
-                    old_bs = batch_size_current
-                    batch_size_current = max(1, batch_size_current // 2)
-                    self._add_log(
-                        task_id,
-                        f"自动降级: batch_size {old_bs} → {batch_size_current}，开始第 {oom_retry} 次重试..."
-                    )
-
-            # 计算阈值（在验证集上推理，如果验证集存在；否则使用测试集）
-            self._update_task_status(task_id, progress=80)
-
-            # 优先使用验证集计算阈值（held-out 数据更具代表性）
-            if val_split_ratio_actual > 0 and hasattr(datamodule, 'val_dataloader'):
-                self._add_log(task_id, "Computing threshold on validation samples (held-out)...")
-                eval_dataloader = datamodule.val_dataloader()
-                eval_source = "validation"
-            else:
-                self._add_log(task_id, "Computing threshold on test samples (no validation split)...")
-                eval_dataloader = datamodule.test_dataloader()
-                eval_source = "test"
-
-            try:
-                predictions = engine.predict(model=model, dataloaders=eval_dataloader)
-            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
-                if self._is_oom_error(e):
-                    raise RuntimeError(
-                        f"GPU 显存不足，模型推理时 OOM（batch_size={batch_size_current}）。"
-                        f"请释放 GPU 显存后重试。"
-                    ) from e
-                raise
-            scores = self._extract_dinomaly_scores(predictions)
-
-            # 仅有正常样本时，使用统计方法计算阈值（anomalib 的 F1AdaptiveThreshold 需要正负样本）
-            threshold = self._compute_threshold_from_normal_scores(
-                task_id=task_id,
-                scores=scores,
-                method=config.get("threshold_method", "percentile"),
-                percentile=config.get("threshold_percentile", 99),
-                n_sigma=config.get("threshold_n_sigma", 3.0),
-                fallback=self._get_dinomaly_threshold(model),
+        # 合成缺陷始终生成，保底 min_total 张，保证"纹理破坏=异常"的泛化概念不退化
+        synthetic_defect_paths: List[Path] = []
+        if use_synthetic:
+            syn_target = max(min_total, min_total)  # 始终至少 50 张合成
+            syn_per_normal = max(1, (syn_target + len(normal_roi_paths) - 1) // len(normal_roi_paths))
+            self._add_log(task_id,
+                f"Stage 2/5: Generating ~{syn_target} synthetic defects for diversity "
+                f"(real FN: {n_real_fn})"
             )
-
-            if len(scores) > 0:
-                self._add_log(task_id, f"Score range ({eval_source}): [{np.min(scores):.4f}, {np.max(scores):.4f}], Threshold: {threshold:.4f}")
-
-            # 保存模型（在清理变量之前，因为需要用到 scores）
-            self._update_task_status(task_id, progress=90)
-            self._save_dinomaly_model(task_id, save_dir, dataset_dir, model, engine, config, threshold, scores, group_annotations)
-
-            # Stage 4/4: 如果存在 FN 或 YOLO FP 图像，训练 YOLO 检测器
-            fn_images_dir = Path(save_dir) / "fn_images"
-            yolo_fp_dir = Path(save_dir) / "yolo_fp_images"
-
-            historical_fn_dirs: List[str] = []
-            historical_yolo_fp_dirs: List[str] = []
-
-            # 仅在重训时收集历史 FN/YOLO FP 数据，初次训练不回溯历史
-            if is_fp_retrain:
-                project_dir = Path(save_dir).parent.parent  # output/{project_id}/
-                current_path_id = Path(save_dir).name
-                current_task_uuid = Path(save_dir).parent.name
-
-                for task_dir in sorted(project_dir.iterdir()):
-                    if not task_dir.is_dir() or task_dir.name == current_task_uuid:
-                        continue
-                    hist_dir = task_dir / current_path_id
-
-                    hist_fn_dir = hist_dir / "fn_images"
-                    if hist_fn_dir.exists() and list(hist_fn_dir.rglob("*fn_*.jpg")):
-                        historical_fn_dirs.append(str(hist_fn_dir))
-
-                    hist_yolo_fp_dir = hist_dir / "yolo_fp_images"
-                    if hist_yolo_fp_dir.exists() and (
-                        list(hist_yolo_fp_dir.rglob("yolo_fp_*.jpg")) or list(hist_yolo_fp_dir.rglob("yolo_fp_*.png"))
-                    ):
-                        historical_yolo_fp_dirs.append(str(hist_yolo_fp_dir))
-
-                if historical_fn_dirs:
-                    self._add_log(task_id, f"[YOLO] Found {len(historical_fn_dirs)} historical FN dirs: {historical_fn_dirs}")
-                if historical_yolo_fp_dirs:
-                    self._add_log(task_id, f"[YOLO] Found {len(historical_yolo_fp_dirs)} historical YOLO FP dirs: {historical_yolo_fp_dirs}")
-
-            has_fn = (
-                (fn_images_dir.exists() and list(fn_images_dir.rglob("*fn_*.jpg")))
-                or len(historical_fn_dirs) > 0
+            synthetic_defect_paths = self._generate_synthetic_defects(
+                task_id, normal_roi_paths, save_dir, syn_per_normal,
             )
-            has_yolo_fp = (
-                (yolo_fp_dir.exists() and (
-                    list(yolo_fp_dir.glob("yolo_fp_*.jpg")) or list(yolo_fp_dir.glob("yolo_fp_*.png"))
-                ))
-                or len(historical_yolo_fp_dirs) > 0
-            )
+            synthetic_defect_paths = synthetic_defect_paths[:syn_target]
+            self._add_log(task_id, f"Stage 2/5: Generated {len(synthetic_defect_paths)} synthetic")
 
-            if has_fn or has_yolo_fp:
-                self._update_task_status(task_id, progress=92, stage="YOLO")
-                self._add_log(task_id, "Stage 4/4: Preparing YOLO detection dataset...")
+        # defect_target 基于真实FN+合成的总数，与正常类平衡
+        total_defect_originals = n_real_fn + len(synthetic_defect_paths)
+        defect_target = min(total_defect_originals * max_aug_ratio, max_total)
+        defect_target = max(defect_target, min_total, total_defect_originals)
 
-                yolo_dataset_dir = Path(save_dir) / "_yolo_dataset"
-                normal_roi_dir = Path(dataset_dir) / "roi" / str(path_id)
-                count = self._prepare_yolo_dataset(
-                    task_id=task_id,
-                    normal_roi_dir=str(normal_roi_dir),
-                    fn_images_dir=str(fn_images_dir),
-                    output_dir=yolo_dataset_dir,
-                    config=config,
-                    yolo_fp_dir=str(yolo_fp_dir) if has_yolo_fp else None,
-                    historical_fn_dirs=historical_fn_dirs or None,
-                    historical_yolo_fp_dirs=historical_yolo_fp_dirs or None,
-                )
-                if count > 0:
-                    self._add_log(task_id, "Stage 4/4: Training YOLO detector on FN images...")
-                    self._train_yolo_detector(task_id, yolo_dataset_dir, save_dir, config, progress_range=(93, 98))
-                    try:
-                        keep = True
-                        if keep:
-                            self._add_log(task_id, f"[YOLO] Dataset kept: {yolo_dataset_dir}")
-                        else:
-                            shutil.rmtree(yolo_dataset_dir, ignore_errors=True)
-                    except Exception:
-                        pass
-                    self._add_log(task_id, f"YOLO detector training done ({count} defect samples)")
-                else:
-                    self._add_log(task_id, "YOLO training skipped (insufficient FN images or missing normal ROI)")
-            else:
-                self._add_log(task_id, "No FN or YOLO FP images found, skipping YOLO training")
+        # Stage 3: Build YOLO dataset（FN 直接传列表，不再重复收集）
+        self._update_task_status(task_id, progress=30, stage="3/5")
+        self._add_log(task_id, "Stage 3/5: Building YOLO detection dataset...")
 
-            self._update_task_status(
-                task_id,
-                status="completed",
-                progress=100,
-                stage="completed",
-                end_time=time.time()
-            )
-            self._persist_state_if_due(force=True)
-            self._add_log(task_id, f"Training completed successfully for group '{group_id}'")
+        yolo_dataset_dir = Path(save_dir) / "_yolo_dataset"
+        historical_yolo_fp_dirs: List[str] = []
 
-        finally:
-            # 无论成功或失败，都执行清理
-            self._add_log(task_id, "Cleaning up training resources...")
+        if is_retrain:
+            project_dir = Path(save_dir).parent.parent
+            current_path_id_val = Path(save_dir).name
+            current_task_uuid = Path(save_dir).parent.name
+            for task_dir in sorted(project_dir.iterdir()):
+                if not task_dir.is_dir() or task_dir.name == current_task_uuid:
+                    continue
+                hist_dir = task_dir / current_path_id_val
+                hist_yolo_fp_dir = hist_dir / "yolo_fp_images"
+                if hist_yolo_fp_dir.exists() and (
+                    list(hist_yolo_fp_dir.rglob("yolo_fp_*.jpg")) or list(hist_yolo_fp_dir.rglob("yolo_fp_*.png"))
+                ):
+                    historical_yolo_fp_dirs.append(str(hist_yolo_fp_dir))
+            if historical_yolo_fp_dirs:
+                self._add_log(task_id, f"[YOLO] Found {len(historical_yolo_fp_dirs)} historical YOLO FP dirs")
 
-            # 清理推理相关变量
-            if predictions is not None:
-                del predictions
-            if scores is not None:
-                del scores
-            if eval_dataloader is not None:
-                del eval_dataloader
+        count = self._prepare_yolo_dataset(
+            task_id=task_id,
+            normal_roi_dir=str(roi_save_dir),
+            output_dir=yolo_dataset_dir,
+            config=config,
+            yolo_fp_dir=str(Path(save_dir) / "yolo_fp_images"),
+            historical_yolo_fp_dirs=historical_yolo_fp_dirs or None,
+            all_fn_files=all_fn_files,
+            synthetic_defect_paths=synthetic_defect_paths if synthetic_defect_paths else None,
+            defect_target=defect_target,
+        )
 
-            # 清理线程对象
-            if fit_thread is not None:
-                del fit_thread
+        if count <= 0:
+            raise ValueError(f"No training samples for YOLO (normal={len(normal_roi_paths)}, synthetic={len(synthetic_defect_paths)})")
 
-            # 清理临时目录
-            if temp_root is not None and temp_root.exists():
-                try:
-                    shutil.rmtree(temp_root)
-                except Exception as e:
-                    logger.warning(f"Failed to remove temp_root: {e}")
-            
-            # 清理 anomalib 临时日志目录
-            if anomalib_temp_dir is not None and os.path.exists(anomalib_temp_dir):
-                try:
-                    shutil.rmtree(anomalib_temp_dir)
-                except Exception as e:
-                    logger.warning(f"Failed to remove anomalib_temp_dir: {e}")
+        # Stage 4: Train YOLO
+        self._update_task_status(task_id, status="training", progress=40, stage="4/5")
+        self._add_log(task_id, "Stage 4/5: Training YOLO detector...")
+        self._train_yolo_detector(task_id, yolo_dataset_dir, save_dir, config, progress_range=(40, 80))
 
-            # 清理模型和显存
-            self._cleanup_training_resources(model, engine, datamodule)
-            self._add_log(task_id, "Cleanup completed")
+        # Stage 5: Compute threshold and save
+        self._update_task_status(task_id, progress=85, stage="5/5")
+        self._add_log(task_id, "Stage 5/5: Computing threshold and saving model...")
 
-    def _extract_dinomaly_scores(self, predictions) -> np.ndarray:
-        """从 Dinomaly 预测结果中提取分数"""
-        scores = []
-        score_keys = ['pred_score', 'anomaly_score', 'pred_scores', 'anomaly_scores']
+        model_path = Path(save_dir) / "yolo_model.pt"
+        threshold, metrics = self._compute_yolo_threshold_and_metrics(
+            task_id, model_path, normal_roi_paths, config, save_dir,
+        )
 
-        for batch in predictions:
-            found = False
-            for key in score_keys:
-                val = getattr(batch, key, None)
-                if val is None and isinstance(batch, dict):
-                    val = batch.get(key)
-                if val is not None:
-                    if isinstance(val, torch.Tensor):
-                        scores.extend(val.detach().cpu().numpy().flatten().tolist())
-                    else:
-                        scores.append(float(val))
-                    found = True
-                    break
+        self._save_yolo_model(task_id, save_dir, dataset_dir, config, threshold, metrics, group_annotations)
 
-        return np.array(scores) if scores else np.array([0.0])
-
-    def _get_dinomaly_threshold(self, model) -> float:
-        """获取 Dinomaly 阈值（anomalib 自动计算的兜底值）"""
-        for attr in ('image_threshold', 'threshold'):
-            obj = getattr(model, attr, None)
-            if obj is not None:
-                val = getattr(obj, 'value', None)
-                if val is not None:
-                    return float(val)
-        return 0.50
+        self._update_task_status(
+            task_id, status="completed", progress=100, stage="completed", end_time=time.time(),
+        )
+        self._persist_state_if_due(force=True)
+        self._add_log(task_id, f"YOLO training completed for group '{group_id}'")
 
     def _compute_threshold_from_normal_scores(
         self,
@@ -1763,316 +1021,29 @@ class ModelTrainer:
             self._add_log(task_id, f"Threshold (mean + {n_sigma}σ): {threshold:.4f}")
 
         elif method == "max":
-            threshold = s_max
-            self._add_log(task_id, f"Threshold (max normal score): {threshold:.4f}")
+            # 安全余量 = 3σ 或 s_max 的 30%，取大者（与正常得分分布成比例）
+            safety_margin = max(3.0 * s_std, s_max * 0.3)
+            threshold = s_max + safety_margin
+            self._add_log(task_id, f"Threshold (max={s_max:.4f} + margin={safety_margin:.4f}): {threshold:.4f}")
 
         else:
             self._add_log(task_id, f"Unknown method '{method}', using fallback={fallback:.4f}")
             threshold = fallback
 
-        # 合理性检查：阈值不能低于均值（否则一半正常样本都会报警）
+        # 不低于 mean（否则一半正常样本误报）
         if threshold < s_mean:
-            self._add_log(
-                task_id,
-                f"WARNING: threshold {threshold:.4f} < mean {s_mean:.4f}, "
-                f"clamping to mean + 0.5σ"
-            )
             threshold = s_mean + 0.5 * s_std
+            self._add_log(task_id, f"WARNING: threshold below mean, clamping to {threshold:.4f}")
+
+        # 钳位到 [0.5, 0.95]，确保阈值在 YOLO 置信度有效范围内
+        if threshold < 0.5:
+            self._add_log(task_id, f"[YOLO] Threshold {threshold:.4f} below minimum 0.5, clamping")
+            threshold = 0.5
+        if threshold > 0.95:
+            self._add_log(task_id, f"[YOLO] Threshold {threshold:.4f} above maximum 0.95, clamping")
+            threshold = 0.95
 
         return threshold
-
-    def _save_dinomaly_model(
-        self,
-        task_id: str,
-        save_dir: str,
-        dataset_dir: str,
-        model,
-        engine: Engine,
-        config: dict,
-        threshold: float,
-        scores: np.ndarray,
-        group_annotations: List[Dict]
-    ):
-        """保存 Dinomaly 模型"""
-        model_path = Path(save_dir) / "model.ckpt"
-        config_path = Path(save_dir) / "config.json"
-        threshold_path = Path(save_dir) / "threshold.json"
-
-        # 保存 checkpoint
-        if hasattr(engine, 'trainer') and engine.trainer is not None:
-            engine.trainer.save_checkpoint(str(model_path))
-            self._add_log(task_id, f"Checkpoint saved to: {model_path}")
-        else:
-            # 直接保存模型状态
-            torch.save({
-                'state_dict': model.state_dict(),
-                'model_type': 'dinomaly',
-            }, model_path)
-            self._add_log(task_id, f"Model state saved to: {model_path}")
-
-        # 计算ROI尺寸统计
-        roi_sizes = []
-        padding = 10
-        for ann in group_annotations:
-            segmentation = ann.get('segmentation', [])
-            if segmentation and len(segmentation) > 0:
-                coords = segmentation[0]
-                if len(coords) >= 8:
-                    xs = coords[0::2]
-                    ys = coords[1::2]
-                    x_min, x_max = min(xs), max(xs)
-                    y_min, y_max = min(ys), max(ys)
-                    w = int(x_max - x_min + 2 * padding)
-                    h = int(y_max - y_min + 2 * padding)
-                    roi_sizes.append({'width': w, 'height': h})
-
-        if roi_sizes:
-            avg_width = sum(s['width'] for s in roi_sizes) / len(roi_sizes)
-            avg_height = sum(s['height'] for s in roi_sizes) / len(roi_sizes)
-            target_size = (int(avg_width), int(avg_height))
-        else:
-            target_size = (224, 224)
-            avg_width = avg_height = 224
-
-        config_data = {
-            'model_type': 'dinomaly',
-            'encoder_name': config.get("encoder_name", "dinov2_vit_base_14"),
-            'decoder_depth': config.get("decoder_depth", 8),
-            'bottleneck_dropout': config.get("bottleneck_dropout", 0.2),
-            'train_images': len(group_annotations),
-            'threshold': threshold,
-            'normalize_brightness': config.get("normalize_brightness", False),
-            'normalize_contrast': config.get("normalize_contrast", False),
-            'target_size': target_size,
-            'train_mode': config.get("train_mode", "by_pos_id"),
-            'category': config.get("category", ""),
-            'category_label': config.get("category_label", ""),
-        }
-
-        with open(config_path, 'w', encoding='utf-8') as f:
-            json.dump(config_data, f, ensure_ascii=False, indent=2)
-
-        threshold_data = {
-            'threshold': threshold,
-            'method': config.get("threshold_method", "percentile"),
-            'percentile': config.get("threshold_percentile", 99),
-            'score_stats': {
-                'min': float(np.min(scores)) if len(scores) else None,
-                'max': float(np.max(scores)) if len(scores) else None,
-                'mean': float(np.mean(scores)) if len(scores) else None,
-                'std': float(np.std(scores)) if len(scores) else None,
-                'n': len(scores),
-            },
-        }
-        with open(threshold_path, 'w', encoding='utf-8') as f:
-            json.dump(threshold_data, f, ensure_ascii=False, indent=2)
-
-        self._add_log(task_id, f"Config saved to: {config_path}")
-
-        # 预计算并保存24角度模板图（用于LightGlue推理加速）
-        self._precompute_and_save_template_variants(
-            task_id, save_dir, dataset_dir, group_annotations
-        )
-
-    def _precompute_and_save_template_variants(
-        self,
-        task_id: str,
-        save_dir: str,
-        dataset_dir: str,
-        group_annotations: List[Dict]
-    ):
-        """
-        预计算24角度模板图及其SuperPoint特征并保存，用于LightGlue推理加速。
-        选择最佳模板图（无翻转、角度最接近0），提取工件主体区域，
-        生成24个旋转角度（每15度一个）的模板图变体，并预提取SuperPoint特征。
-        """
-        try:
-            import cv2
-            import torch
-        except ImportError:
-            logger.warning("cv2 or torch not available, skipping template variant precomputation")
-            return
-
-        # 尝试导入LightGlue
-        try:
-            from lightglue import SuperPoint
-            from lightglue.utils import rbd
-            LIGHTGLUE_AVAILABLE = True
-        except ImportError:
-            logger.warning("lightglue not available, skipping template variant precomputation")
-            return
-
-        # 查找最佳模板图（无翻转、角度最接近0的标注）
-        best_ann = None
-
-        for ann in group_annotations:
-            # 跳过有翻转的标注
-            if ann.get('horizontal_flip', False) or ann.get('vertical_flip', False):
-                continue
-            # 选择角度最接近0的
-            angle = ann.get('angle', 0)
-            if best_ann is None or abs(angle) < abs(best_ann.get('angle', 0)):
-                best_ann = ann
-
-        if best_ann is None:
-            logger.warning("No suitable template annotation found for variant precomputation")
-            return
-
-        # 获取图片路径
-        image_id = best_ann.get('image_id')
-        dataset_path = Path(dataset_dir)
-        annotations_path = dataset_path / "annotations.json"
-
-        try:
-            with open(annotations_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            image_map = {img['id']: img['file_name'] for img in data.get('images', [])}
-            file_name = image_map.get(image_id)
-            if not file_name:
-                logger.warning(f"Image file not found for image_id={image_id}")
-                return
-
-            raw_images_dir = dataset_path / "raw_images"
-            image_path = raw_images_dir / file_name
-            if not image_path.exists():
-                logger.warning(f"Template image not found: {image_path}")
-                return
-
-            # 读取模板图
-            template_image = cv2.imread(str(image_path))
-            if template_image is None:
-                logger.warning(f"Failed to load template image: {image_path}")
-                return
-
-            # 查找工件主体标注
-            subject_ann = None
-            with open(annotations_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            for ann in data.get('annotations', []):
-                if ann.get('image_id') == image_id:
-                    label = ann.get('label', '')
-                    if label == "工件主体":
-                        subject_ann = ann
-                        break
-
-            # 提取工件主体区域
-            if subject_ann:
-                segmentation = subject_ann.get('segmentation', [])
-                if segmentation and len(segmentation) > 0:
-                    coords = segmentation[0]
-                    xs = coords[0::2]
-                    ys = coords[1::2]
-                    x_min, x_max = int(min(xs)), int(max(xs))
-                    y_min, y_max = int(min(ys)), int(max(ys))
-                    subject_img = template_image[y_min:y_max, x_min:x_max].copy()
-                    logger.info(f"Extracted subject region: ({x_min},{y_min},{x_max-x_min},{y_max-y_min})")
-                else:
-                    bbox = subject_ann.get('bbox', [])
-                    if bbox and len(bbox) >= 4:
-                        x, y, w, h = [int(v) for v in bbox]
-                        subject_img = template_image[y:y+h, x:x+w].copy()
-                        logger.info(f"Extracted subject region from bbox: ({x},{y},{w},{h})")
-                    else:
-                        subject_img = template_image.copy()
-                        logger.info("Using full template image as subject")
-            else:
-                subject_img = template_image.copy()
-                logger.info("No subject annotation found, using full template image")
-
-            # 生成24个旋转角度（每15度一个）
-            rotations = list(range(0, 360, 30))
-            variants_dir = Path(save_dir) / "template_variants"
-            variants_dir.mkdir(parents=True, exist_ok=True)
-
-            h, w = subject_img.shape[:2]
-            saved_count = 0
-
-            # 加载SuperPoint模型
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            extractor = SuperPoint(max_num_keypoints=8192).eval().to(device)
-            logger.info(f"[LightGlue] Loaded SuperPoint for feature extraction (device={device})")
-
-            # 预提取特征
-            t_start = time.time()
-
-            for angle in rotations:
-                cx, cy = w / 2, h / 2
-                M_rot = cv2.getRotationMatrix2D((cx, cy), -angle, 1.0)
-                cos_a = abs(M_rot[0, 0])
-                sin_a = abs(M_rot[0, 1])
-                canvas_w = int(h * sin_a + w * cos_a)
-                canvas_h = int(h * cos_a + w * sin_a)
-                M_rot[0, 2] += canvas_w / 2 - cx
-                M_rot[1, 2] += canvas_h / 2 - cy
-
-                rotated = cv2.warpAffine(
-                    subject_img, M_rot, (canvas_w, canvas_h),
-                    flags=cv2.INTER_LINEAR, borderValue=(0, 0, 0)
-                )
-
-                # 提取并保存SuperPoint特征（不再保存模板图，只保存特征）
-                rgb = cv2.cvtColor(rotated, cv2.COLOR_BGR2RGB)
-                tensor = torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
-                tensor = tensor.unsqueeze(0).to(device)
-
-                with torch.no_grad():
-                    feats = extractor.extract(tensor)
-                    # 将特征移到CPU并转换为numpy以便保存
-                    feats_dict = {
-                        'keypoints': feats['keypoints'].cpu().numpy(),
-                        'descriptors': feats['descriptors'].cpu().numpy(),
-                    }
-                    # SuperPoint输出可能包含scores或keypoint_scores
-                    if 'scores' in feats:
-                        feats_dict['scores'] = feats['scores'].cpu().numpy()
-                    elif 'keypoint_scores' in feats:
-                        feats_dict['scores'] = feats['keypoint_scores'].cpu().numpy()
-                    if 'scales' in feats:
-                        feats_dict['scales'] = feats['scales'].cpu().numpy()
-                    if 'oris' in feats:
-                        feats_dict['oris'] = feats['oris'].cpu().numpy()
-
-                # 保存特征
-                feature_path = variants_dir / f"features_{angle:03d}.npz"
-                np.savez_compressed(str(feature_path), **feats_dict)
-
-                saved_count += 1
-
-            # 清理SuperPoint模型
-            del extractor
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-            # 保存元数据
-            metadata = {
-                'source_image': str(image_path),
-                'source_annotation_id': best_ann.get('id'),
-                'rotations': rotations,
-                'num_variants': saved_count,
-                'original_size': {'width': w, 'height': h},
-                'features_extracted': True,
-                'feature_type': 'superpoint',
-            }
-            metadata_path = variants_dir / "metadata.json"
-            with open(metadata_path, 'w', encoding='utf-8') as f:
-                json.dump(metadata, f, ensure_ascii=False, indent=2)
-
-            elapsed = time.time() - t_start
-            self._add_log(task_id, f"Precomputed and saved {saved_count} template variants with features to {variants_dir} (took {elapsed:.2f}s)")
-
-        except Exception as e:
-            logger.warning(f"Failed to precompute template variants: {e}")
-            import traceback
-            traceback.print_exc()
-
-    # ==================== YOLO 检测训练 ====================
-
-    def _sample_normal_images(self, roi_dir: Path, num_samples: int) -> List[Path]:
-        """从正常 ROI 目录随机采样指定数量的图像（不增强）。"""
-        all_images = list(roi_dir.glob("*.png")) + list(roi_dir.glob("*.jpg"))
-        if len(all_images) <= num_samples:
-            return all_images
-        return random.sample(all_images, num_samples)
 
     def _augment_fn_images(
         self,
@@ -2080,62 +1051,65 @@ class ModelTrainer:
         fn_files: List[Path],
         output_dir: Path,
         target_total: int = 200,
+        label: str = "defect",
+        input_size: Tuple[int, int] = (320, 320),
     ) -> int:
-        """对 FN 原图预处理 (letterbox_resize) 后应用轻度增强，使总数接近 target_total。返回最终总数。"""
+        """预处理 (letterbox_resize) + albumentations 增强填满 target_total。YOLO 在线增强叠加生效。"""
         n_orig = len(fn_files)
-        self._add_log(task_id, f"[YOLO] Found {n_orig} original FN images, target={target_total}")
+        self._add_log(task_id, f"[YOLO] Found {n_orig} original {label} images, target={target_total}")
 
-        # 清理旧数据，避免上次运行的残留文件污染数据集
         if output_dir.exists():
             shutil.rmtree(str(output_dir))
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # 先对 FN 原图做预处理（与 Dinomaly 训练时 extract_roi_images 一致），再保存
-        input_size = (224, 224)
-        preprocessed_originals = []
+        preprocessed = []
         for p in fn_files:
             try:
                 img = Image.open(p).convert("RGB")
-                # letterbox_resize 保持宽高比，自适应填充色，与训练预处理一致
                 img_padded, _ = letterbox_resize(img, input_size)
-                # 用父目录+文件名作为唯一标识，避免不同来源的同名文件冲突
                 rel_name = f"{p.parent.name}_{p.name}"
                 dst = output_dir / rel_name
                 img_padded.save(str(dst), quality=95)
-                preprocessed_originals.append((dst, img_padded))
+                preprocessed.append((dst, img_padded))
             except Exception as e:
-                self._add_log(task_id, f"[YOLO] Failed to preprocess FN image {p}: {e}")
+                self._add_log(task_id, f"[YOLO] Failed to preprocess {label} image {p}: {e}")
 
-        n_valid = len(preprocessed_originals)
+        n_valid = len(preprocessed)
         if n_valid == 0:
-            self._add_log(task_id, "[YOLO] No valid FN images after preprocessing")
+            self._add_log(task_id, "[YOLO] No valid images after preprocessing")
             return 0
 
         if n_valid >= target_total:
-            self._add_log(task_id, f"[YOLO] FN images already >= target ({n_valid} >= {target_total}), skip augmentation")
+            self._add_log(task_id, f"[YOLO] {label} images already >= target ({n_valid} >= {target_total}), skip augmentation")
             return n_valid
 
-        # 计算每张原图需要的增强数量
-        aug_per_image = max(1, (target_total - n_valid) // n_valid)
-        self._add_log(task_id, f"[YOLO] Augmenting {aug_per_image}x per FN image ({(target_total - n_valid)} needed)")
+        # albumentations 几何/模糊增强 + 自适应亮度对比度（暗图不更暗，亮图不更亮）
+        aug_per_image = max(1, math.ceil((target_total - n_valid) / n_valid))
+        self._add_log(task_id, f"[YOLO] Augmenting {aug_per_image}x per {label} image (need {target_total - n_valid}, have {n_valid})")
 
         fn_aug_config = PROJECT_ROOT / "configs" / "augmentations_fn.yaml"
         transform = load_augmentation_transform(str(fn_aug_config))
+        adaptive_bc = AdaptiveBrightnessContrast(p=0.7)
 
         total = n_valid
-        for img_path, img_padded in preprocessed_originals:
+        for img_path, img_padded in preprocessed:
             for j in range(aug_per_image):
                 if total >= target_total:
                     break
                 try:
-                    aug_img = apply_augmentation(img_padded, transform) if transform else img_padded
-                except Exception:
                     aug_img = img_padded
+                    if transform:
+                        aug_img = apply_augmentation(aug_img, transform)
+                    aug_np = np.array(aug_img)
+                    aug_np = adaptive_bc(image=aug_np)['image']
+                    aug_img = Image.fromarray(aug_np)
+                except Exception:
+                    pass
                 aug_path = output_dir / f"{img_path.stem}_aug{j:04d}.jpg"
                 aug_img.save(str(aug_path), quality=95)
                 total += 1
 
-        self._add_log(task_id, f"[YOLO] FN augmentation done: {n_valid} preprocessed + {total - n_valid} augmented = {total}")
+        self._add_log(task_id, f"[YOLO] {label} done: {n_valid} originals + {total - n_valid} augmented = {total}")
         return total
 
     def _augment_yolo_fp_images(
@@ -2144,8 +1118,9 @@ class ModelTrainer:
         yolo_fp_files: List[Path],
         output_dir: Path,
         target_total: int = 30,
+        input_size: Tuple[int, int] = (320, 320),
     ) -> List[Path]:
-        """对 YOLO FP 原图预处理 (letterbox_resize) 后应用轻度增强，返回处理后的图片路径列表。"""
+        """预处理 YOLO FP 原图 (letterbox_resize) + albumentations 增强。返回处理后的图片路径列表。"""
         if not yolo_fp_files:
             return []
 
@@ -2156,10 +1131,7 @@ class ModelTrainer:
             shutil.rmtree(str(output_dir))
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        input_size = (224, 224)
         processed_paths = []
-
-        # 对每张原图做 letterbox_resize 预处理
         preprocessed = []
         for p in yolo_fp_files:
             try:
@@ -2177,11 +1149,12 @@ class ModelTrainer:
             self._add_log(task_id, f"[YOLO] YOLO FP: {n_valid} valid images, skip augmentation")
             return processed_paths
 
-        aug_per_image = max(1, (target_total - n_valid) // n_valid)
-        self._add_log(task_id, f"[YOLO] Augmenting YOLO FP {aug_per_image}x per image ({(target_total - n_valid)} needed)")
+        aug_per_image = max(1, math.ceil((target_total - n_valid) / n_valid))
+        self._add_log(task_id, f"[YOLO] Augmenting YOLO FP {aug_per_image}x per image (need {target_total - n_valid}, have {n_valid})")
 
         yolo_fp_aug_config = PROJECT_ROOT / "configs" / "augmentations_fn.yaml"
         transform = load_augmentation_transform(str(yolo_fp_aug_config))
+        adaptive_bc = AdaptiveBrightnessContrast(p=0.7)
 
         total = n_valid
         for img_path, img_padded in preprocessed:
@@ -2189,7 +1162,12 @@ class ModelTrainer:
                 if total >= target_total:
                     break
                 try:
-                    aug_img = apply_augmentation(img_padded, transform) if transform else img_padded
+                    aug_img = img_padded
+                    if transform:
+                        aug_img = apply_augmentation(aug_img, transform)
+                    aug_np = np.array(aug_img)
+                    aug_np = adaptive_bc(image=aug_np)['image']
+                    aug_img = Image.fromarray(aug_np)
                 except Exception:
                     aug_img = img_padded
                 aug_path = output_dir / f"{img_path.stem}_aug{j:04d}.jpg"
@@ -2197,41 +1175,39 @@ class ModelTrainer:
                 processed_paths.append(aug_path)
                 total += 1
 
-        self._add_log(task_id, f"[YOLO] YOLO FP augmentation done: {n_valid} preprocessed + {total - n_valid} augmented = {total}")
+        self._add_log(task_id, f"[YOLO] YOLO FP done: {n_valid} originals + {total - n_valid} augmented = {total}")
         return processed_paths
 
     def _prepare_yolo_dataset(
         self,
         task_id: str,
         normal_roi_dir: str,
-        fn_images_dir: str,
         output_dir: Path,
         config: dict,
         yolo_fp_dir: str = None,
-        historical_fn_dirs: List[str] = None,
         historical_yolo_fp_dirs: List[str] = None,
+        all_fn_files: List[Path] = None,
+        synthetic_defect_paths: List[Path] = None,
+        defect_target: int = 200,
     ) -> int:
         """
         构建 YOLO 检测二分类数据集（detection 格式）。
         - normal 图 → 空 label（无目标）+ YOLO FP 图片（如果提供）
         - defect 图 → 整图 bbox（class 0 = defect）
-        historical_fn_dirs: 历史任务中的 fn_images 目录列表，直接从中收集 FN 文件（不复制）
-        historical_yolo_fp_dirs: 历史任务中的 yolo_fp_images 目录列表
+        all_fn_files: 调用方预先收集的所有真实 FN 路径列表（不再重复收集）
+        synthetic_defect_paths: 合成缺陷图片路径列表
+        defect_target: 缺陷类目标总数
         返回 defect 类样本数；返回 0 表示跳过训练。
         """
-        # 从当前目录 + 历史目录收集所有 FN 文件
-        all_fn_files: List[Path] = []
-        fn_dir = Path(fn_images_dir)
-        if fn_dir.exists():
-            all_fn_files.extend(fn_dir.rglob("*fn_*.jpg"))
-        for hist_dir_str in (historical_fn_dirs or []):
-            hist_dir = Path(hist_dir_str)
-            if hist_dir.exists():
-                all_fn_files.extend(hist_dir.rglob("*fn_*.jpg"))
+        # 合并真实 FN + 合成缺陷（FN 由调用方预先收集，不再重复扫目录）
+        all_fn_files = list(all_fn_files or [])
+        all_fn_files.extend(synthetic_defect_paths or [])
 
         min_samples = config.get("yolo_min_samples", 1)
-        hist_info = f" + {len(historical_fn_dirs)} historical dirs" if historical_fn_dirs else ""
-        self._add_log(task_id, f"[YOLO] Preparing detection dataset: normal={normal_roi_dir}, fn={fn_images_dir}{hist_info}, min_samples={min_samples}")
+        hist_info = ""
+        if synthetic_defect_paths:
+            hist_info = f" + {len(synthetic_defect_paths)} synthetic"
+        self._add_log(task_id, f"[YOLO] Preparing detection dataset: normal={normal_roi_dir}, fn={len(all_fn_files)} files{hist_info}, min_samples={min_samples}")
 
         if len(all_fn_files) < min_samples:
             self._add_log(task_id, f"[YOLO] Insufficient FN images ({len(all_fn_files)} < {min_samples}), skipping")
@@ -2247,30 +1223,55 @@ class ModelTrainer:
         for d in [train_img_dir, train_lbl_dir, val_img_dir, val_lbl_dir]:
             d.mkdir(parents=True, exist_ok=True)
 
-        # 1. defect 类：FN 原图 + 增强（目标 200），整图作为 bbox
-        defect_aug_dir = output_dir / "_defect_aug"
-        defect_count = self._augment_fn_images(task_id, all_fn_files, defect_aug_dir, target_total=200)
+        yolo_imgsz = config.get("yolo_imgsz", 320)
+        input_size = (yolo_imgsz, yolo_imgsz)
 
-        # 2. normal 类：从 Dinomaly 训练数据随机采样（不增强），与 defect 数量匹配
+        # 1. defect 类：FN 原图 + 增强，整图作为 bbox
+        # 增强倍率限制：每张原图最多增强 max_aug_ratio 倍，且与 normal 保持平衡
+        max_aug_ratio = config.get("max_augmentation_ratio", 40)
+        defect_max = min(defect_target, len(all_fn_files) * max_aug_ratio)
+
+        # 先找到 normal ROI 目录并计算 normal 的最大可增强数量
         normal_roi_path = Path(normal_roi_dir)
-
-        # 如果当前 task_uuid 的 roi 目录不存在，向上追溯到父级 train 目录
         if not normal_roi_path.exists():
-            train_base = normal_roi_path.parent.parent.parent  # product/{project_id}/train/
-            path_id_str = normal_roi_path.name  # path_id
+            train_base = normal_roi_path.parent.parent.parent
+            path_id_str = normal_roi_path.name
             found_roi_dirs = sorted(train_base.glob(f"*/roi/{path_id_str}"), key=lambda p: p.stat().st_mtime, reverse=True)
             if found_roi_dirs:
                 normal_roi_path = found_roi_dirs[0]
                 self._add_log(task_id, f"[YOLO] Fallback to ancestor normal ROI: {normal_roi_path}")
             else:
-                self._add_log(task_id, f"[YOLO] WARNING: normal_roi_dir not found in current or any ancestor train dir: {normal_roi_dir}")
+                self._add_log(task_id, f"[YOLO] WARNING: normal_roi_dir not found: {normal_roi_dir}")
                 return 0
 
-        normal_paths = list(normal_roi_path.glob("*.png")) + list(normal_roi_path.glob("*.jpg"))
-        self._add_log(task_id, f"[YOLO] Using all {len(normal_paths)} normal images from {normal_roi_path}")
+        normal_raw = list(normal_roi_path.glob("*.png")) + list(normal_roi_path.glob("*.jpg"))
+        self._add_log(task_id, f"[YOLO] Found {len(normal_raw)} normal ROI, {len(all_fn_files)} defect originals")
 
-        # 2b. YOLO FP 图片 → 加入 normal 类，先预处理 (letterbox_resize) 再增强
-        # 从当前目录 + 历史目录收集原图
+        # ---- 验证集：从增强后数据池 80/20 拆分 ----
+        # 原图太少时无法独立预留验证集，只能从增强池拆分保证 val 样本量充足
+
+        # 平衡目标：双方都能达到的数量，且至少包含所有原始图
+        normal_max = len(normal_raw) * max_aug_ratio
+        balanced_target = min(defect_max, normal_max)
+        balanced_target = max(balanced_target, len(all_fn_files), len(normal_raw))
+        self._add_log(task_id, f"[YOLO] Balanced target: {balanced_target} (defect originals={len(all_fn_files)}, normal originals={len(normal_raw)}, defect_max={defect_max}, normal_max={normal_max})")
+
+        defect_aug_dir = output_dir / "_defect_aug"
+        defect_count = self._augment_fn_images(task_id, all_fn_files, defect_aug_dir, target_total=balanced_target, label="defect", input_size=input_size)
+
+        # 2. normal 类：统一使用 max_aug_ratio，与 defect 相同倍率
+        normal_aug_dir = output_dir / "_normal_aug"
+        normal_target = min(defect_count, normal_max)
+        normal_target = max(normal_target, len(normal_raw))
+        if len(normal_raw) < normal_target:
+            self._add_log(task_id, f"[YOLO] Augmenting normal images: {len(normal_raw)} → target {normal_target}")
+            self._augment_fn_images(task_id, normal_raw, normal_aug_dir, target_total=normal_target, label="normal", input_size=input_size)
+            normal_paths = sorted(list(normal_aug_dir.glob("*.jpg")))
+        else:
+            normal_paths = [Path(p) for p in normal_raw]
+            normal_aug_dir = None
+
+        # 2b. YOLO FP 图片 → 加入 normal 类
         yolo_fp_raw: List[Path] = []
         if yolo_fp_dir:
             yolo_fp_path = Path(yolo_fp_dir)
@@ -2287,30 +1288,32 @@ class ModelTrainer:
             yolo_fp_aug_dir = output_dir / "_yolo_fp_aug"
             yolo_fp_aug_target = min(50, max(10, len(normal_paths) // 5))
             yolo_fp_processed = self._augment_yolo_fp_images(
-                task_id, yolo_fp_raw, yolo_fp_aug_dir, target_total=yolo_fp_aug_target,
+                task_id, yolo_fp_raw, yolo_fp_aug_dir, target_total=yolo_fp_aug_target, input_size=input_size,
             )
             if yolo_fp_processed:
                 self._add_log(task_id, f"[YOLO] Adding {len(yolo_fp_processed)} preprocessed YOLO FP images to normal class "
                                f"(from {len(yolo_fp_raw)} raw, current + {len(historical_yolo_fp_dirs or [])} historical)")
                 normal_paths = normal_paths + yolo_fp_processed
 
-        # 3. 收集所有图片列表并拆分 train/val (80/20)
-        defect_paths = sorted(defect_aug_dir.iterdir())
+        # 3. 从增强池 shuffle 后 80/20 拆分 train/val
         all_normal = [p for p in normal_paths]
-        all_defect = [p for p in defect_paths if p.suffix.lower() in ('.jpg', '.png')]
+        all_defect = [p for p in defect_aug_dir.iterdir() if p.suffix.lower() in ('.jpg', '.png')]
 
         random.shuffle(all_normal)
         random.shuffle(all_defect)
 
-        n_val_normal = max(1, int(len(all_normal) * 0.2))
-        n_val_defect = max(1, int(len(all_defect) * 0.2))
+        # val 至少 3 张/类，保证 mAP 稳定
+        n_val_normal = max(3, int(len(all_normal) * 0.2))
+        n_val_defect = max(3, int(len(all_defect) * 0.2))
+        n_val_normal = min(n_val_normal, len(all_normal) - 3)  # train 至少留 3 张
+        n_val_defect = min(n_val_defect, len(all_defect) - 3)
 
         train_normals = all_normal[n_val_normal:]
         val_normals = all_normal[:n_val_normal]
         train_defects = all_defect[n_val_defect:]
         val_defects = all_defect[:n_val_defect]
 
-        # 4. 复制图片并生成 label 文件（normal=空label, defect=整图bbox）
+        # 4. 复制图片并生成 label
         def _place_images(paths, img_dir, lbl_dir, is_defect):
             for p in paths:
                 dst_name = p.name
@@ -2347,6 +1350,8 @@ names:
 
         # 清理临时目录
         shutil.rmtree(defect_aug_dir, ignore_errors=True)
+        if normal_aug_dir:
+            shutil.rmtree(normal_aug_dir, ignore_errors=True)
         if yolo_fp_raw:
             shutil.rmtree(yolo_fp_aug_dir, ignore_errors=True)
 
@@ -2367,15 +1372,16 @@ names:
             self._add_log(task_id, "[YOLO] ERROR: ultralytics not installed, skip YOLO training")
             return
 
-        pretrained_path = PROJECT_ROOT / "models" / "pretrained" / "yolov8n.pt"
+        # 始终从 yolo26n 开始训练（数据累积保证知识不丢失，避免微调遗忘）
+        pretrained_path = PROJECT_ROOT / "models" / "pretrained" / "yolo26n.pt"
         if not pretrained_path.exists():
-            self._add_log(task_id, f"[YOLO] Local detection model not found at {pretrained_path}, will try auto-download")
-            pretrained_path = "yolov8n.pt"
+            self._add_log(task_id, f"[YOLO] Local yolo26n not found at {pretrained_path}, will try auto-download")
+            pretrained_path = "yolo26n.pt"
 
-        yolo_epochs =40
-        yolo_imgsz = 320
+        yolo_epochs = config.get("yolo_epochs", 40)
+        yolo_imgsz = config.get("yolo_imgsz", 320)
         yaml_path = dataset_dir / "dataset.yaml"
-        self._add_log(task_id, f"[YOLO] Starting detection training: epochs={yolo_epochs}, patience=15, imgsz={yolo_imgsz}, lr0=0.01, cos_lr=True, data={yaml_path}")
+        self._add_log(task_id, f"[YOLO] Starting detection training: epochs={yolo_epochs}, patience=15, imgsz={yolo_imgsz}, lr0=0.005, cos_lr=True, warmup=3, data={yaml_path}")
         train_start = time.time()
 
         trainer_ref = self
@@ -2414,13 +1420,32 @@ names:
                 patience=15,
                 imgsz=yolo_imgsz,
                 batch=config.get("yolo_batch", 16),
-                workers=0,
-                lr0=0.01,
-                amp=False,
+                workers=8,
+                lr0=0.005,
+                lrf=0.01,
+                warmup_epochs=3,
+                amp=True,
                 cos_lr=True,
                 seed=42,
                 verbose=False,
                 exist_ok=True,
+                project=str(Path(save_dir) / "yolo_runs"),
+                name="train",
+                # 在线增强：模拟推理端 warpAffine 引入的角度/平移/错切扰动
+                augment=True,
+                hsv_h=0.0,
+                hsv_s=0.0,
+                hsv_v=0.3,
+                fliplr=0.5,
+                flipud=0.5,
+                degrees=15,
+                translate=0.15,
+                scale=0.15,
+                shear=5,
+                perspective=0.0005,
+                mosaic=0.0,
+                mixup=0.0,
+                copy_paste=0.0,
             )
         finally:
             sys.stdout = old_stdout
@@ -2457,9 +1482,8 @@ names:
         if hasattr(results, "save_dir") and results.save_dir:
             best_pt = Path(results.save_dir) / "weights" / "best.pt"
         else:
-            runs_dir = Path.cwd() / "runs" / "detect"
-            train_dirs = sorted(runs_dir.glob("train*"), key=lambda p: p.stat().st_mtime, reverse=True)
-            best_pt = train_dirs[0] / "weights" / "best.pt" if train_dirs else None
+            # 回退：project/name 组合路径
+            best_pt = Path(save_dir) / "yolo_runs" / "train" / "weights" / "best.pt"
 
         if best_pt and best_pt.exists():
             dst = Path(save_dir) / "yolo_model.pt"
@@ -2467,216 +1491,6 @@ names:
             self._add_log(task_id, f"[YOLO] Model saved: {dst} ({elapsed:.1f}s)")
         else:
             self._add_log(task_id, "[YOLO] WARNING: best.pt not found after training")
-
-    def _do_train_yolo_only(
-        self,
-        task_id: str,
-        dataset_dir: str,
-        config: dict,
-        path_id: str,
-        base_model_dir: str,
-    ):
-        """纯 FN 重训：复制基础 Dinomaly 模型 + 训练 YOLO 检测器。"""
-        self._add_log(task_id, f"YOLO-only training started for path_id={path_id}")
-        self._update_task_status(task_id, status="preparing", progress=10)
-
-        with self._status_lock:
-            save_dir = self.training_status[task_id]["save_dir"]
-        os.makedirs(save_dir, exist_ok=True)
-
-        # 1. 复制基础 Dinomaly 模型文件
-        self._add_log(task_id, "Stage 1/2: Copying base Dinomaly model...")
-        base_dir = Path(base_model_dir)
-        copied = []
-        for fname in ["model.ckpt", "dinomaly_model.pt", "config.json", "threshold.json"]:
-            src = base_dir / fname
-            if src.exists():
-                dst = Path(save_dir) / fname
-                shutil.copy2(str(src), str(dst))
-                copied.append(fname)
-
-        # 复制 yolo_model.pt（如果基础模型也有）
-        src_yolo = base_dir / "yolo_model.pt"
-        if src_yolo.exists():
-            shutil.copy2(str(src_yolo), str(Path(save_dir) / "yolo_model.pt"))
-            copied.append("yolo_model.pt")
-
-        # 复制 template_variants
-        src_variants = base_dir / "template_variants"
-        if src_variants.exists() and src_variants.is_dir():
-            dst_variants = Path(save_dir) / "template_variants"
-            if dst_variants.exists():
-                shutil.rmtree(str(dst_variants))
-            shutil.copytree(str(src_variants), str(dst_variants))
-            self._add_log(task_id, "Copied template_variants")
-
-        self._add_log(task_id, f"Copied base model files: {copied}")
-
-        # 2. 训练 YOLO 检测器
-        self._update_task_status(task_id, status="training", progress=30, stage="YOLO")
-        self._add_log(task_id, "Stage 2/2: Preparing YOLO detection dataset...")
-
-        fn_images_dir = Path(save_dir) / "fn_images"
-        yolo_fp_dir = Path(save_dir) / "yolo_fp_images"
-        normal_roi_dir = Path(dataset_dir) / "roi" / str(path_id)
-
-        # 找出所有历史训练任务的 FN 和 YOLO FP 目录（不复制，直接传路径给 _prepare_yolo_dataset 收集）
-        project_dir = Path(save_dir).parent.parent  # output/{project_id}/
-        current_path_id = Path(save_dir).name
-        current_task_uuid = Path(save_dir).parent.name
-
-        historical_fn_dirs: List[str] = []
-        historical_yolo_fp_dirs: List[str] = []
-        for task_dir in sorted(project_dir.iterdir()):
-            if not task_dir.is_dir() or task_dir.name == current_task_uuid:
-                continue
-            hist_dir = task_dir / current_path_id
-
-            hist_fn_dir = hist_dir / "fn_images"
-            if hist_fn_dir.exists() and list(hist_fn_dir.rglob("*fn_*.jpg")):
-                historical_fn_dirs.append(str(hist_fn_dir))
-
-            hist_yolo_fp_dir = hist_dir / "yolo_fp_images"
-            if hist_yolo_fp_dir.exists() and (
-                list(hist_yolo_fp_dir.rglob("yolo_fp_*.jpg")) or list(hist_yolo_fp_dir.rglob("yolo_fp_*.png"))
-            ):
-                historical_yolo_fp_dirs.append(str(hist_yolo_fp_dir))
-
-        if historical_fn_dirs:
-            self._add_log(task_id, f"[YOLO] Found {len(historical_fn_dirs)} historical FN dirs: {historical_fn_dirs}")
-        if historical_yolo_fp_dirs:
-            self._add_log(task_id, f"[YOLO] Found {len(historical_yolo_fp_dirs)} historical YOLO FP dirs: {historical_yolo_fp_dirs}")
-
-        has_fn = (
-            (fn_images_dir.exists() and list(fn_images_dir.rglob("*fn_*.jpg")))
-            or len(historical_fn_dirs) > 0
-        )
-        has_yolo_fp = (
-            (yolo_fp_dir.exists() and (
-                list(yolo_fp_dir.glob("yolo_fp_*.jpg")) or list(yolo_fp_dir.glob("yolo_fp_*.png"))
-            ))
-            or len(historical_yolo_fp_dirs) > 0
-        )
-
-        if has_fn or has_yolo_fp:
-            yolo_dataset_dir = Path(save_dir) / "_yolo_dataset"
-            count = self._prepare_yolo_dataset(
-                task_id=task_id,
-                normal_roi_dir=str(normal_roi_dir),
-                fn_images_dir=str(fn_images_dir),
-                output_dir=yolo_dataset_dir,
-                config=config,
-                yolo_fp_dir=str(yolo_fp_dir) if has_yolo_fp else None,
-                historical_fn_dirs=historical_fn_dirs or None,
-                historical_yolo_fp_dirs=historical_yolo_fp_dirs or None,
-            )
-            if count > 0:
-                self._add_log(task_id, "Stage 2/2: Training YOLO detector on FN images...")
-                self._train_yolo_detector(task_id, yolo_dataset_dir, save_dir, config, progress_range=(40, 98))
-                self._add_log(task_id, f"[YOLO] Dataset kept: {yolo_dataset_dir}")
-                self._add_log(task_id, f"YOLO detector training done ({count} defect samples)")
-            else:
-                self._add_log(task_id, "YOLO training skipped (insufficient FN images or missing normal ROI)")
-        else:
-            self._add_log(task_id, "No FN or YOLO FP images found, skipping YOLO training")
-
-        self._update_task_status(task_id, status="completed", progress=100, stage="completed", end_time=time.time())
-        self._persist_state_if_due(force=True)
-        self._add_log(task_id, f"YOLO-only training completed for path_id={path_id}")
-
-    def _cleanup_training_resources(self, model, engine: Engine = None, datamodule=None):
-        """清理训练资源 - 彻底释放显存"""
-        try:
-            # 删除 datamodule
-            if datamodule is not None:
-                del datamodule
-
-            # 删除 engine 和 trainer
-            if engine is not None:
-                if hasattr(engine, 'trainer') and engine.trainer is not None:
-                    # 清理 trainer 中的模型引用（使用try-except避免只读属性错误）
-                    try:
-                        if hasattr(engine.trainer, 'model'):
-                            engine.trainer.model = None
-                    except (AttributeError, TypeError):
-                        pass
-                    try:
-                        if hasattr(engine.trainer, 'lightning_module'):
-                            engine.trainer.lightning_module = None
-                    except (AttributeError, TypeError):
-                        pass
-                del engine
-
-            # 删除模型及其组件
-            if model is not None:
-                # 清理 Dinomaly 模型的各个组件
-                if hasattr(model, 'model'):
-                    inner_model = model.model
-                    if hasattr(inner_model, 'encoder'):
-                        del inner_model.encoder
-                    if hasattr(inner_model, 'decoder'):
-                        del inner_model.decoder
-                    if hasattr(inner_model, 'bottleneck'):
-                        del inner_model.bottleneck
-                    del inner_model
-                if hasattr(model, 'memory_bank'):
-                    del model.memory_bank
-                if hasattr(model, 'feature_extractor'):
-                    del model.feature_extractor
-                if hasattr(model, 'feature_pooler'):
-                    del model.feature_pooler
-                del model
-
-            # 强制垃圾回收
-            import gc
-            gc.collect()
-
-            # 清理 CUDA 显存
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-                # 重置峰值显存统计
-                torch.cuda.reset_peak_memory_stats()
-                logger.info(f"GPU memory after cleanup: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
-        except Exception as e:
-            logger.warning(f"Error during cleanup: {e}")
-
-    # ==================== GPU 显存管理 ====================
-
-    def _get_gpu_memory_info(self) -> Dict[str, Any]:
-        """获取 GPU 显存信息 (MB)"""
-        if not torch.cuda.is_available():
-            return {"available": False}
-        try:
-            free_bytes, total_bytes = torch.cuda.mem_get_info()
-            free_mb = free_bytes / 1024**2
-            total_mb = total_bytes / 1024**2
-            used_mb = total_mb - free_mb
-            return {
-                "available": True,
-                "free_mb": round(free_mb, 1),
-                "used_mb": round(used_mb, 1),
-                "total_mb": round(total_mb, 1),
-                "free_pct": round(free_mb / total_mb * 100, 1),
-            }
-        except Exception:
-            return {"available": False}
-
-    def _is_oom_error(self, error: Exception) -> bool:
-        """检查是否为 GPU 显存不足错误 (支持 PyTorch 2.0+ OOM 异常和旧版 RuntimeError)"""
-        error_str = str(error).lower()
-        if "out of memory" in error_str:
-            return True
-        if "cuda" in error_str and "memory" in error_str:
-            return True
-        try:
-            if isinstance(error, torch.cuda.OutOfMemoryError):
-                return True
-        except AttributeError:
-            pass
-        return False
-
-    # ==================== 任务管理接口 ====================
 
     def get_training_status(self, task_id: str) -> dict:
         """获取任务状态"""
@@ -2724,6 +1538,140 @@ names:
             "completed_tasks": sum(1 for s in statuses if s == "completed"),
         }
 
+
+    def _generate_synthetic_defects(
+        self,
+        task_id: str,
+        normal_roi_paths: List[Path],
+        save_dir: str,
+        per_image: int = 3,
+    ) -> List[Path]:
+        """从正常 ROI 生成合成缺陷，返回合成缺陷图片路径列表"""
+        synthetic_dir = Path(save_dir) / "_synthetic_defects"
+        if synthetic_dir.exists():
+            shutil.rmtree(str(synthetic_dir))
+        synthetic_dir.mkdir(parents=True, exist_ok=True)
+
+        synthetic_config = load_synthetic_config(None)
+        strategies = synthetic_config.get("strategies", {})
+        generator = SyntheticDefectGenerator(
+            strategies=list(strategies.keys()) if strategies else ["texture_swap", "solid_color"],
+            weights=list(strategies.values()) if strategies else [0.6, 0.4],
+            min_defect_size_ratio=synthetic_config.get("min_defect_size_ratio", 0.10),
+            max_defect_size_ratio=synthetic_config.get("max_defect_size_ratio", 0.60),
+        )
+
+        # 预加载所有正常 ROI 作为纹理替换池
+        all_roi_imgs: List[np.ndarray] = []
+        for p in normal_roi_paths:
+            img = cv2.imread(str(p))
+            if img is not None:
+                all_roi_imgs.append(img)
+
+        synthetic_paths: List[Path] = []
+        for idx, img_path in enumerate(normal_roi_paths):
+            try:
+                img = all_roi_imgs[idx] if idx < len(all_roi_imgs) else cv2.imread(str(img_path))
+                if img is None:
+                    continue
+                # 纹理替换池 = 其他正常 ROI（排除自己）
+                pool = [all_roi_imgs[i] for i in range(len(all_roi_imgs)) if i != idx]
+                generator.set_patch_pool(pool)
+                defects = generator.generate_multiple(img, per_image)
+                for j, (defect_img, bbox) in enumerate(defects):
+                    out_path = synthetic_dir / f"syn_{img_path.stem}_{j:02d}.jpg"
+                    cv2.imwrite(str(out_path), defect_img)
+                    synthetic_paths.append(out_path)
+            except Exception as e:
+                self._add_log(task_id, f"[Synthetic] Failed for {img_path.name}: {e}")
+
+        self._add_log(task_id, f"[Synthetic] Generated {len(synthetic_paths)} synthetic defects from {len(normal_roi_paths)} normal images")
+        return synthetic_paths
+
+    def _compute_yolo_threshold_and_metrics(
+        self,
+        task_id: str,
+        model_path: Path,
+        normal_roi_paths: List[Path],
+        config: dict,
+        save_dir: str,
+    ) -> Tuple[float, Dict]:
+        """阈值固定为 0.5，不做动态计算。"""
+        self._add_log(task_id, "[YOLO] Threshold fixed at 0.5 (dynamic computation disabled)")
+        return 0.5, {"n_samples": len(normal_roi_paths)}
+
+    def _save_yolo_model(
+        self,
+        task_id: str,
+        save_dir: str,
+        dataset_dir: str,
+        config: dict,
+        threshold: float,
+        metrics: Dict,
+        group_annotations: List[Dict],
+    ):
+        """保存 YOLO 模型配置和阈值"""
+        save_path = Path(save_dir)
+        config_path = save_path / "config.json"
+        threshold_path = save_path / "threshold.json"
+
+        # Compute ROI size stats
+        roi_sizes = []
+        padding = 10
+        for ann in group_annotations:
+            segmentation = ann.get("segmentation", [])
+            if segmentation and len(segmentation) > 0:
+                coords = segmentation[0]
+                if len(coords) >= 8:
+                    xs = coords[0::2]
+                    ys = coords[1::2]
+                    x_min, x_max = min(xs), max(xs)
+                    y_min, y_max = min(ys), max(ys)
+                    w = int(x_max - x_min + 2 * padding)
+                    h = int(y_max - y_min + 2 * padding)
+                    roi_sizes.append({"width": w, "height": h})
+
+        if roi_sizes:
+            avg_width = sum(s["width"] for s in roi_sizes) / len(roi_sizes)
+            avg_height = sum(s["height"] for s in roi_sizes) / len(roi_sizes)
+            target_size = (int(avg_width), int(avg_height))
+        else:
+            target_size = (224, 224)
+
+        config_data = {
+            "model_type": "yolo",
+            "train_mode": config.get("train_mode", "by_pos_id"),
+            "category": config.get("category", ""),
+            "category_label": config.get("category_label", ""),
+            "threshold": threshold,
+            "target_size": target_size,
+            "normalize_brightness": config.get("normalize_brightness", False),
+            "normalize_contrast": config.get("normalize_contrast", False),
+            "train_images": len(group_annotations),
+            "yolo_imgsz": config.get("yolo_imgsz", 320),
+            "yolo_epochs": config.get("yolo_epochs", 100),
+            "yolo_batch": config.get("yolo_batch", 16),
+        }
+
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(config_data, f, ensure_ascii=False, indent=2)
+
+        threshold_data = {
+            "threshold": threshold,
+            "method": config.get("threshold_method", "percentile"),
+            "percentile": config.get("threshold_percentile", 99),
+            "score_stats": {
+                "min": metrics.get("score_min"),
+                "max": metrics.get("score_max"),
+                "mean": metrics.get("score_mean"),
+                "std": metrics.get("score_std"),
+                "n": metrics.get("n_samples"),
+            },
+        }
+        with open(threshold_path, "w", encoding="utf-8") as f:
+            json.dump(threshold_data, f, ensure_ascii=False, indent=2)
+
+        self._add_log(task_id, f"Model config saved to: {config_path}")
     def stop_task(self, task_id: str) -> bool:
         """停止单个任务"""
         with self._status_lock:

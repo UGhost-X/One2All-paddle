@@ -1,19 +1,8 @@
 import os
 from pathlib import Path
 
-# 设置模型缓存目录（必须在导入 timm/anomalib 之前）
 PROJECT_ROOT = Path(__file__).parent
-PRETRAINED_DIR = PROJECT_ROOT / "models" / "pretrained"
-HUB_DIR = PRETRAINED_DIR / "hub"
-os.environ["TIMM_HOME"] = str(PRETRAINED_DIR)
-os.environ["HF_HOME"] = str(PRETRAINED_DIR)
-os.environ["TRANSFORMERS_CACHE"] = str(PRETRAINED_DIR / "transformers")
-os.environ["HUGGINGFACE_HUB_CACHE"] = str(HUB_DIR)  # 指向 hub 子目录
-# 使用 Hugging Face 镜像站
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-# 允许联网下载
-os.environ["HF_HUB_OFFLINE"] = "0"
-os.environ["TRANSFORMERS_OFFLINE"] = "0"
+
 # PyTorch 2.6+ 兼容性：允许加载包含 numpy 的模型文件
 os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
 
@@ -140,13 +129,13 @@ class TrainRequest(BaseModel):
     parallel_train: bool = False
     train_mode: str = "by_pos_id"  # "by_pos_id" | "by_category"
 
-    # Dinomaly 参数
-    encoder_name: str = "dinov2_vit_base_14"
-    decoder_depth: int = 8
-    bottleneck_dropout: float = 0.2
-    epochs: int = 12
-    batch_size: int = 2
-    freeze_encoder: bool = True
+    # YOLO 参数
+    yolo_epochs: int = 100
+    yolo_batch: int = 16
+    yolo_imgsz: int = 320
+    synthetic_defects: bool = True
+    synthetic_per_normal: int = 3
+    synthetic_config: Optional[str] = None
 
     # 通用参数
     augment: bool = True
@@ -348,9 +337,9 @@ def train_anomaly(request: TrainRequest):
                 key = ann.get("label", "unknown")
             groups_for_trainer[key].append(ann)
 
-        # 构建训练配置（仅支持 Dinomaly）
+        # 构建训练配置（YOLO）
         base_train_config = {
-            "model_name": "Dinomaly",
+            "model_name": "YOLO",
             "use_pos_id": use_pos_id,
             "project_id": request.project_id,
             "task_uuid": task_uuid,
@@ -364,12 +353,12 @@ def train_anomaly(request: TrainRequest):
             "threshold_buffer": request.threshold_buffer,
             "save_images": request.save_images,
             "max_concurrent": request.max_concurrent,
-            "encoder_name": request.encoder_name,
-            "decoder_depth": request.decoder_depth,
-            "bottleneck_dropout": request.bottleneck_dropout,
-            "epochs": request.epochs,
-            "batch_size":  request.batch_size,
-            "freeze_encoder": request.freeze_encoder,
+            "yolo_epochs": request.yolo_epochs,
+            "yolo_batch": request.yolo_batch,
+            "yolo_imgsz": request.yolo_imgsz,
+            "synthetic_defects": request.synthetic_defects,
+            "synthetic_per_normal": request.synthetic_per_normal,
+            "synthetic_config": request.synthetic_config,
         }
 
         t0 = time.time()
@@ -616,12 +605,10 @@ class RetrainRequest(BaseModel):
     project_id: str
     base_task_uuid: str  # 基础模型的 task_uuid
     feedback_groups: List[FeedbackGroup]  # 按 path_id 分组的反馈数据
-    # Dinomaly 训练参数（可选，默认继承基础模型配置）
-    encoder_name: Optional[str] = None
-    decoder_depth: Optional[int] = None
-    epochs: Optional[int] = None
-    batch_size: Optional[int] = None
-    freeze_encoder: Optional[bool] = None
+    # YOLO 训练参数（可选，默认继承基础模型配置）
+    yolo_epochs: Optional[int] = None
+    yolo_batch: Optional[int] = None
+    yolo_imgsz: Optional[int] = None
 
 
 @app.post("/train/anomaly/retrain")
@@ -672,7 +659,7 @@ async def incremental_retrain(request: RetrainRequest):
             new_model_dir.mkdir(parents=True, exist_ok=True)
             
             # 复制所有模型相关文件
-            model_files = ["model.ckpt", "dinomaly_model.pt", "config.json"]
+            model_files = ["yolo_model.pt", "config.json"]
             copied_files = []
             for file_name in model_files:
                 src_file = base_model_dir / file_name
@@ -732,9 +719,9 @@ async def incremental_retrain(request: RetrainRequest):
                 continue
 
             # 查找基础模型文件（支持多种格式）
-            base_model_path = base_model_dir / "model.ckpt"
+            base_model_path = base_model_dir / "yolo_model.pt"
             if not base_model_path.exists():
-                base_model_path = base_model_dir / "dinomaly_model.pt"
+                base_model_path = base_model_dir / "model.ckpt"  # legacy
             base_config_path = base_model_dir / "config.json"
             
             if not base_model_path.exists():
@@ -855,72 +842,39 @@ async def incremental_retrain(request: RetrainRequest):
                         logger.error(f"Failed to decode YOLO FP image[{idx}] for path_id={path_id}: {e}")
                 logger.info(f"path_id={path_id}: Saved {len(yolo_fp_images)} YOLO FP images to {yolo_fp_dir}")
 
-            # ========== 处理 False Positives：微调 Dinomaly ==========
-            if fp_images:
-                num_fp = len(fp_images)
-
-                # FP 重训策略：基础 ROI 原样复制，FP 图做 30 张增强
-                num_fp_augmentations = 30
-                finetune_epochs = request.epochs or base_config.get("epochs", 12)
-                logger.info(f"path_id={path_id}: Processing {num_fp} FP for retraining ({num_fp_augmentations}x augmentation, {finetune_epochs} epochs)")
-
-                # 基础模型的 ROI 目录
-                base_roi_dir = base_product_train_dir / "roi" / str(path_id)
+            # ========== YOLO 重训 ==========
+            if fp_images or fn_images or yolo_fp_images:
+                logger.info(f"path_id={path_id}: Retraining YOLO ({len(fp_images)} FP + {len(fn_images)} FN + {len(yolo_fp_images)} YOLO FP)")
 
                 train_config = {
-                    "model_name": "Dinomaly",
+                    "model_name": "YOLO",
                     "project_id": request.project_id,
                     "task_uuid": new_task_uuid,
                     "path_id": path_id,
                     "train_mode": base_config.get("train_mode", "by_category"),
                     "category": base_config.get("category", ""),
                     "category_label": base_config.get("category_label", "unknown"),
-                    "encoder_name": request.encoder_name or base_config.get("encoder_name", "dinov2_vit_base_14"),
-                    "decoder_depth": request.decoder_depth or base_config.get("decoder_depth", 8),
-                    "bottleneck_dropout": base_config.get("bottleneck_dropout", 0.2),
-                    "epochs": request.epochs or base_config.get("epochs", 12),
-                    "finetune_epochs": finetune_epochs,
-                    "batch_size": request.batch_size or base_config.get("batch_size", 2),
-                    "freeze_encoder": request.freeze_encoder if request.freeze_encoder is not None else base_config.get("freeze_encoder", True),
+                    "yolo_epochs": request.yolo_epochs or base_config.get("yolo_epochs", 100),
+                    "yolo_batch": request.yolo_batch or base_config.get("yolo_batch", 16),
+                    "yolo_imgsz": request.yolo_imgsz or base_config.get("yolo_imgsz", 320),
                     "normalize_brightness": base_config.get("normalize_brightness", False),
                     "normalize_contrast": base_config.get("normalize_contrast", False),
-                    "checkpoint_path": str(base_model_path),
-                    "base_roi_dir": str(base_roi_dir),
-                    "num_fp_augmentations": num_fp_augmentations,
+                    "base_model_dir": str(base_model_dir),
+                    "synthetic_defects": True,
                     "augmentation_config": str(PROJECT_ROOT / "configs" / "augmentations.yaml"),
                 }
 
-                # 重训练时不需要group_annotations，ROI图片已直接保存
                 path_group_id = f"retrain_{int(time.time())}_{path_id}"
                 path_task_ids, _ = trainer.run_batch_training_async(
                     str(train_base_dir),
                     train_config,
-                    {path_id: []},  # 空列表，因为ROI已直接保存
+                    {path_id: []},
                     group_id=path_group_id,
                 )
                 all_task_ids.extend(path_task_ids)
-                total_fp += num_fp
-            elif fn_images or yolo_fp_images:
-                # 没有 FP 数据，但存在 FN 或 YOLO FP 数据 → 创建纯 YOLO 训练任务
-                logger.info(f"path_id={path_id}: No FP data, but {len(fn_images)} FN + {len(yolo_fp_images)} YOLO FP images found. Launching YOLO-only training task.")
-                yolo_task_id = trainer._create_yolo_only_training_task(
-                    dataset_dir=str(train_base_dir),
-                    config={
-                        "model_name": "Dinomaly",
-                        "project_id": request.project_id,
-                        "task_uuid": new_task_uuid,
-                        "path_id": path_id,
-                        "train_mode": base_config.get("train_mode", "by_category"),
-                        "category": base_config.get("category", ""),
-                        "category_label": base_config.get("category_label", "unknown"),
-                        "yolo_batch": request.batch_size or base_config.get("batch_size", 8),
-                    },
-                    path_id=str(path_id),
-                    base_model_dir=str(base_model_dir),
-                )
-                path_task_ids = [yolo_task_id]
-                all_task_ids.append(yolo_task_id)
-                path_group_id = f"yolo_only_{int(time.time())}_{path_id}"
+                total_fp += len(fp_images)
+                total_fn += len(fn_images)
+                total_yolo_fp += len(yolo_fp_images)
             else:
                 # 既没有 FP 也没有 FN，直接复制原模型
                 logger.info(f"path_id={path_id}: No FP/FN data, copying model from base version")
@@ -1109,14 +1063,45 @@ def _scan_model_files(label_path: str, rel_label_path: str) -> tuple:
     memory_bank_path = os.path.join(label_path, "memory_bank.npz")
     has_memory_bank = os.path.exists(memory_bank_path)
 
-    # 检查 Dinomaly 模型格式
+    # 检查 YOLO 模型格式（优先）
+    yolo_model_path = os.path.join(label_path, "yolo_model.pt")
+    has_yolo_model = os.path.exists(yolo_model_path)
+
+    # 检查 Dinomaly 模型格式（兼容旧版）
     dinomaly_model_path = os.path.join(label_path, "model.ckpt")
     has_dinomaly_model = os.path.exists(dinomaly_model_path)
 
     config_path = os.path.join(label_path, "config.json")
     has_config = os.path.exists(config_path)
 
-    # 检查 Dinomaly 模型
+    # 检查 YOLO 模型（优先）
+    if has_yolo_model and has_config:
+        model_type = "yolo"
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+            model_files.append({
+                "name": "config.json",
+                "url": f"/static/{rel_label_path}/config.json",
+                "type": "config",
+            })
+            model_files.append({
+                "name": "yolo_model.pt",
+                "url": f"/static/{rel_label_path}/yolo_model.pt",
+                "type": "model",
+            })
+            threshold_path = os.path.join(label_path, "threshold.json")
+            if os.path.exists(threshold_path):
+                model_files.append({
+                    "name": "threshold.json",
+                    "url": f"/static/{rel_label_path}/threshold.json",
+                    "type": "threshold",
+                })
+        except Exception as e:
+            logger.error(f"Error scanning YOLO model files: {e}")
+        return model_files, True, None, -1, model_type
+
+    # 检查 Dinomaly 模型（兼容旧版）
     if has_dinomaly_model and has_config:
         model_type = "dinomaly"
         try:

@@ -1,0 +1,12 @@
+# 合成缺陷生成配置
+
+strategies:
+  texture_swap: 0.6     # 纹理替换（从其他正常ROI取一块贴过来）
+  solid_color: 0.4      # 纯色异常（整图填充背景相近的纯色）
+
+# 缺陷尺寸（相对于 ROI 面积的比例）
+min_defect_size_ratio: 0.10
+max_defect_size_ratio: 0.60
+
+# 每张正常图生成的合成缺陷数量
+synthetic_per_normal: 3

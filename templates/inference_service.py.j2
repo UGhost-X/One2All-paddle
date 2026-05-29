@@ -15,11 +15,10 @@ from pathlib import Path
 from datetime import datetime
 from contextlib import contextmanager
 from PIL import Image, ImageOps
+import torch
+import torch.nn.functional as F_torch
 
-# 设置 anomalib 预训练模型缓存目录为本地路径（必须在导入 anomalib 之前设置）
 PROJECT_ROOT = Path(__file__).parent.parent
-PRETRAINED_DIR = PROJECT_ROOT / "models" / "pretrained"
-os.environ["ANOMALIB_CACHE_DIR"] = str(PRETRAINED_DIR)
 
 # 导入 TurboJPEG 解码工具
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -93,7 +92,7 @@ def letterbox_resize_cv2(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     cv2/numpy 版 letterbox_resize，避免 PIL Image 创建/粘贴开销。
-    直接操作 numpy 数组，在热路径 (_preprocess_rois_to_batch) 中替代 PIL 版本。
+    直接操作 numpy 数组，在热路径中替代 PIL 版本。
 
     填充色默认为图片自身的平均颜色（自适应），避免固定黑色填充让模型学到
     "暗色=padding=可忽略"。
@@ -224,9 +223,6 @@ from pydantic import BaseModel
 import uvicorn
 import numpy as np
 import cv2
-import torch
-import torch.nn.functional as F_torch
-from torchvision import transforms
 
 app = FastAPI(
     title="Inference Service",
@@ -335,650 +331,122 @@ def cv2_put_chinese_text(img, text, position, color, font_size=20):
     return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Dinomaly 推理模型
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-# 打补丁：修改 DinoV2Loader 的默认缓存目录为本地路径
-try:
-    # 尝试新版本的导入路径
-    from anomalib.models.components.dinov2.dinov2_loader import DinoV2Loader as _DinoV2Loader
-except ImportError:
-    # 回退到旧版本的导入路径
-    from anomalib.models.image.dinomaly.components.dinov2_loader import DinoV2Loader as _DinoV2Loader
-_original_dinov2loader_init = _DinoV2Loader.__init__
-def _patched_dinov2loader_init(self, cache_dir=None, vit_factory=None):
-    if cache_dir is None:
-        cache_dir = str(PRETRAINED_DIR / "dinov2")
-    _original_dinov2loader_init(self, cache_dir, vit_factory)
-_DinoV2Loader.__init__ = _patched_dinov2loader_init
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Dinomaly 推理包装器
-# ─────────────────────────────────────────────────────────────────────────────
-
-class DinomalyWrapper:
-    """Dinomaly 推理包装器"""
-
-    # YOLO 检测置信度阈值（bbox confidence）
-    YOLO_CONFIDENCE_THRESHOLD = 0.9
+class YOLOWrapper:
+    """YOLO 推理包装器"""
 
     def __init__(self, device: str = "cuda"):
-        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
+        self.device = device if torch.cuda.is_available() else "cpu"
         self.model = None
-        self.engine = None
         self.config: Dict[str, Any] = {}
-        self.input_size = (224, 224)
-        self.normalize_brightness_config = False
-        self.normalize_contrast_config = False
         self.threshold = 0.5
-        self.yolo_model = None  # YOLO 检测模型（可选）
+        self.imgsz = 320
 
     def load_from_checkpoint(self, model_path: str, config_path: str = None):
-        """从 checkpoint 加载模型"""
-        from anomalib.models import Dinomaly
-        from anomalib.engine import Engine
-
-        # 加载配置
-        if config_path and os.path.exists(config_path):
-            self.load_config(config_path)
-
-        try:
-            import torch
-            checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
-            self.model = Dinomaly.load_from_checkpoint(model_path, map_location=self.device, weights_only=False)
-        except TypeError:
-            # 旧版本 PyTorch 不支持 weights_only 参数
-            try:
-                self.model = Dinomaly.load_from_checkpoint(model_path, map_location=self.device)
-            except TypeError:
-                # 更旧版本不支持 map_location
-                self.model = Dinomaly.load_from_checkpoint(model_path)
-
-        self.model = self.model.to(self.device)
-        self.model.eval()
-
-        # 创建 engine 用于推理
-        self.engine = Engine(
-            accelerator='gpu' if torch.cuda.is_available() else 'cpu',
-            devices=1,
-        )
-
-        # 获取阈值
-        self.threshold = self._get_threshold()
-
-        # 加载 YOLO 检测模型（如果存在）
-        self._load_yolo_model(model_path)
-
-        yolo_status = "loaded" if self.yolo_model is not None else "not found"
-        logger.info(f"Dinomaly model loaded. Threshold: {self.threshold:.4f}, YOLO: {yolo_status}")
-
-    def _load_yolo_model(self, model_path: str):
-        """如果存在则加载 YOLO 检测模型。"""
+        """从 yolo_model.pt 加载模型"""
         try:
             from ultralytics import YOLO
         except ImportError:
-            logger.warning("[YOLO] ultralytics not installed, skip YOLO model loading")
-            return
+            logger.error("[YOLO] ultralytics not installed")
+            raise
 
-        yolo_path = Path(model_path).parent / "yolo_model.pt"
-        if yolo_path.exists():
-            self.yolo_model = YOLO(str(yolo_path))
-            logger.info(f"[YOLO] Detection model loaded from {yolo_path}")
-        else:
-            logger.info(f"[YOLO] No yolo_model.pt found at {yolo_path}, YOLO secondary check disabled")
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"YOLO model not found: {model_path}")
 
-    def check_yolo_anomaly(self, roi: np.ndarray) -> Tuple[bool, float]:
-        """对单个 ROI 运行 YOLO 检测。返回 (is_anomaly, max_confidence)。"""
-        if self.yolo_model is None:
-            return False, 0.0
-        results = self.check_yolo_anomaly_batch([roi])
-        return results[0] if results else (False, 0.0)
+        self.model = YOLO(str(model_path))
 
-    def check_yolo_anomaly_batch(self, rois: List[np.ndarray]) -> List[Tuple[bool, float]]:
-        """对一批 ROI 运行 YOLO 检测。返回 [(is_anomaly, max_confidence), ...]。"""
-        if self.yolo_model is None:
-            return [(False, 0.0)] * len(rois)
-        if not rois:
-            return []
+        if config_path and os.path.exists(config_path):
+            self.load_config(config_path)
 
-        try:
-            rois_rgb = [cv2.cvtColor(roi, cv2.COLOR_BGR2RGB) for roi in rois]
-            results = self.yolo_model.predict(
-                rois_rgb, verbose=False, imgsz=320, conf=self.YOLO_CONFIDENCE_THRESHOLD
-            )
-
-            output = []
-            for i, result in enumerate(results):
-                boxes = result.boxes
-                if boxes is not None and len(boxes) > 0:
-                    max_conf = float(boxes.conf.max())
-                    logger.debug(f"[YOLO] ROI[{i}] Detected {len(boxes)} box(es), max_conf={max_conf:.4f}")
-                    output.append((True, max_conf))
-                else:
-                    output.append((False, 0.0))
-            return output
-        except Exception as e:
-            logger.warning(f"[YOLO] Batch detection failed: {e}")
-            return [(False, 0.0)] * len(rois)
+        self.threshold = self.config.get("threshold", 0.5)
+        self.imgsz = self.config.get("yolo_imgsz", 320)
+        logger.info(f"YOLO model loaded from {model_path}. Threshold: {self.threshold:.4f}, imgsz: {self.imgsz}")
 
     def load_config(self, config_path: str):
         """加载配置文件"""
         if os.path.exists(config_path):
             with open(config_path, "r", encoding="utf-8") as f:
                 self.config = json.load(f)
-                self.normalize_brightness_config = self.config.get("normalize_brightness", False)
-                self.normalize_contrast_config = self.config.get("normalize_contrast", False)
-                self.target_size = self.config.get("target_size", None)
-                self.threshold = self.config.get("threshold", 0.5)
-                if self.target_size:
-                    logger.info(f"Loaded target_size from config: {self.target_size}")
 
-    def _get_threshold(self) -> float:
-        """获取模型阈值"""
-        if self.model is None:
-            return 0.5
-        for attr in ('image_threshold', 'threshold'):
-            obj = getattr(self.model, attr, None)
-            if obj is not None:
-                val = getattr(obj, 'value', None)
-                if val is not None:
-                    return float(val)
-        return self.threshold
-
-    def infer_single(self, roi: np.ndarray, target_size: Tuple[int, int] = None,
-                     normalize_brightness: bool = None, normalize_contrast: bool = None,
-                     pos_id: str = None) -> Dict[str, Any]:
+    def infer_single(self, roi: np.ndarray) -> Dict[str, Any]:
         """单张推理"""
         if self.model is None:
-            return {"error": 0.0, "infer_failed": True}
+            return {"error": 0.0, "infer_failed": True, "is_anomaly": False}
 
-        if normalize_brightness is None:
-            normalize_brightness = self.normalize_brightness_config
-        if normalize_contrast is None:
-            normalize_contrast = self.normalize_contrast_config
-        if target_size is None:
-            target_size = getattr(self, 'target_size', None)
-
-        # 首先使用 Dinomaly 进行推理
         try:
-            # 直接预处理为 tensor，跳过磁盘 I/O
-            image_batch, masks = self._preprocess_rois_to_batch(
-                [roi], target_size, normalize_brightness, normalize_contrast
-            )
+            roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
+            results = self.model.predict(roi_rgb, verbose=False, imgsz=self.imgsz, conf=0.0)
 
-            if image_batch is None:
-                raise RuntimeError("_preprocess_rois_to_batch returned None")
+            max_conf = 0.0
+            for r in results:
+                if r.boxes is not None and len(r.boxes) > 0:
+                    max_conf = max(max_conf, float(r.boxes.conf.max()))
 
-            # 直接调用 torch model（与 predict_step 一致，不经过 post_processor）
-            with torch.no_grad():
-                output = self.model.model(image_batch)
-
-            # 提取分数
-            score = self._extract_score_with_mask([output], masks[0])
-            dinomaly_score = float(score)
-
-            # 如果 Dinomaly 已判定为异常，跳过 YOLO 检查
-            if dinomaly_score > self.threshold:
-                logger.info(f"[Dinomaly] Anomaly detected: dinomaly={dinomaly_score:.4f} > threshold={self.threshold:.4f}, skip YOLO")
-                return {"error": dinomaly_score, "infer_failed": False, "yolo_score": 0.0, "dinomaly_score": dinomaly_score}
-
-            # Dinomaly 判定正常，再使用 YOLO 检测二次确认
-            is_yolo_anomaly, yolo_conf = self.check_yolo_anomaly(roi)
-            if is_yolo_anomaly:
-                logger.info(f"[YOLO] Anomaly detected: dinomaly={dinomaly_score:.4f}, yolo_conf={yolo_conf:.4f} > {self.YOLO_CONFIDENCE_THRESHOLD}")
-                return {"error": 1.0, "infer_failed": False, "yolo_score": float(yolo_conf), "yolo_anomaly": True, "dinomaly_score": dinomaly_score}
-
-            return {"error": dinomaly_score, "infer_failed": False, "yolo_score": float(yolo_conf), "dinomaly_score": dinomaly_score}
-
+            is_anomaly = max_conf > self.threshold
+            return {
+                "error": max_conf,
+                "infer_failed": False,
+                "is_anomaly": is_anomaly,
+                "anomaly_score": max_conf,
+                "threshold": self.threshold,
+            }
         except Exception as e:
-            logger.error(f"[DinomalyWrapper] inference failed: {e}")
-            return {"error": 0.0, "infer_failed": True}
+            logger.error(f"[YOLOWrapper] inference failed: {e}")
+            return {"error": 0.0, "infer_failed": True, "is_anomaly": False}
 
-    def infer_batch(self, rois: List[np.ndarray],
-                    target_size: Tuple[int, int] = None,
-                    normalize_brightness: bool = None,
-                    normalize_contrast: bool = None,
-                    pos_ids: List[str] = None) -> List[Dict[str, Any]]:
+    def infer_batch(self, rois: List[np.ndarray]) -> List[Dict[str, Any]]:
         """批量推理"""
         if self.model is None:
-            return [{"error": 0.0, "infer_failed": True}] * len(rois)
+            return [{"error": 0.0, "infer_failed": True, "is_anomaly": False}] * len(rois)
 
         if len(rois) == 0:
             return []
 
-        if normalize_brightness is None:
-            normalize_brightness = self.normalize_brightness_config
-        if normalize_contrast is None:
-            normalize_contrast = self.normalize_contrast_config
-        if target_size is None:
-            target_size = getattr(self, 'target_size', None)
+        results = [{"error": 0.0, "infer_failed": True, "is_anomaly": False} for _ in range(len(rois))]
 
-        # 初始化结果列表
-        results = [{"error": 0.0, "infer_failed": True, "yolo_score": 0.0} for _ in range(len(rois))]
-
-        # 首先使用 Dinomaly 对所有 ROI 进行批量推理
-        t_total = time.time()
         try:
-            # Phase A: 预处理
-            t_pre = time.time()
-            image_batch, masks = self._preprocess_rois_to_batch(
-                rois, target_size, normalize_brightness, normalize_contrast
-            )
-            t_pre = time.time() - t_pre
+            rois_rgb = [cv2.cvtColor(roi, cv2.COLOR_BGR2RGB) for roi in rois]
+            yolo_results = self.model.predict(rois_rgb, verbose=False, imgsz=self.imgsz, conf=0.0)
 
-            if image_batch is None:
-                raise RuntimeError("_preprocess_rois_to_batch returned None")
+            for i, r in enumerate(yolo_results):
+                max_conf = 0.0
+                if r.boxes is not None and len(r.boxes) > 0:
+                    max_conf = float(r.boxes.conf.max())
 
-            # Phase B: GPU 推理
-            t_gpu = time.time()
-            with torch.no_grad():
-                output = self.model.model(image_batch)
-            t_gpu = time.time() - t_gpu
-
-            # Phase C: 使用模型内置 pred_score（与训练时一致：GaussianBlur → 256×256 → top-1% mean）
-            t_post = time.time()
-            pred_score = getattr(output, 'pred_score', None)
-            if pred_score is None and isinstance(output, dict):
-                pred_score = output.get('pred_score')
-            if pred_score is not None:
-                scores = pred_score.detach().cpu().numpy().flatten().tolist()
-            else:
-                # 回退：手动从 anomaly_map 提取（兼容旧版模型输出）
-                anomaly_maps = self._get_anomaly_maps(output)
-                scores = self._extract_scores_from_tensor(anomaly_maps, masks[:len(rois)])
-            t_post = time.time() - t_post
-
-            # 填充 Dinomaly 推理结果
-            for i in range(len(rois)):
-                if i < len(scores):
-                    dinomaly_score = float(scores[i])
-                    results[i] = {
-                        "error": dinomaly_score,
-                        "infer_failed": False,
-                        "yolo_score": 0.0,
-                        "dinomaly_score": dinomaly_score
-                    }
-
+                is_anomaly = max_conf > self.threshold
+                results[i] = {
+                    "error": max_conf,
+                    "infer_failed": False,
+                    "is_anomaly": is_anomaly,
+                    "anomaly_score": max_conf,
+                    "threshold": self.threshold,
+                }
         except Exception as e:
-            logger.error(f"[DinomalyWrapper] batch inference failed: {e}")
-            return results
-
-        # Phase D: YOLO 二次确认（批量推理）
-        yolo_check_indices: List[int] = []
-        yolo_check_rois: List[np.ndarray] = []
-        for i, roi in enumerate(rois):
-            if results[i].get("infer_failed", True):
-                continue
-            if results[i]["error"] > self.threshold:
-                continue
-            yolo_check_indices.append(i)
-            yolo_check_rois.append(roi)
-
-        t_yolo = 0.0
-        if yolo_check_rois:
-            t_yolo = time.time()
-            yolo_batch_results = self.check_yolo_anomaly_batch(yolo_check_rois)
-            t_yolo = time.time() - t_yolo
-            for idx, (is_yolo_anomaly, yolo_conf) in zip(yolo_check_indices, yolo_batch_results):
-                dinomaly_score = results[idx]["dinomaly_score"]
-                results[idx]["yolo_score"] = float(yolo_conf)
-                if is_yolo_anomaly:
-                    logger.info(f"[YOLO] ROI[{idx}] anomaly detected: dinomaly={dinomaly_score:.4f}, yolo_conf={yolo_conf:.4f} > {self.YOLO_CONFIDENCE_THRESHOLD}")
-                    results[idx] = {
-                        "error": 1.0,
-                        "infer_failed": False,
-                        "yolo_score": float(yolo_conf),
-                        "yolo_anomaly": True,
-                        "dinomaly_score": dinomaly_score
-                    }
-
-            yolo_anomaly_count = sum(1 for r in results if r.get("yolo_anomaly", False))
-            logger.info(f"[YOLO] Batch checked {len(yolo_check_rois)} Dinomaly-normal ROIs, {yolo_anomaly_count} YOLO anomalies found")
-
-        t_total = time.time() - t_total
-        amap_shape = "N/A"
-        try:
-            if hasattr(output, 'anomaly_map'):
-                amap_shape = str(list(output.anomaly_map.shape))
-            elif hasattr(output, 'anomaly_maps'):
-                amap_shape = str(list(output.anomaly_maps.shape))
-            elif isinstance(output, torch.Tensor):
-                amap_shape = str(list(output.shape))
-        except Exception:
-            pass
-        logger.info(f"[TIMING] infer_batch n={len(rois)} amap={amap_shape} | "
-                    f"pre={t_pre*1000:.0f}ms gpu={t_gpu*1000:.0f}ms "
-                    f"post={t_post*1000:.0f}ms yolo={t_yolo*1000:.0f}ms "
-                    f"total={t_total*1000:.0f}ms")
+            logger.error(f"[YOLOWrapper] batch inference failed: {e}")
 
         return results
 
     def infer_batch_direct(self, rois: List[np.ndarray],
-                           target_size: Tuple[int, int] = None,
-                           normalize_brightness: bool = None,
-                           normalize_contrast: bool = None,
-                           pos_ids: List[str] = None) -> List[Dict[str, Any]]:
-        """批量推理 - 直接调用模型 forward，跳过磁盘 I/O 和 engine.predict。"""
-        # 直接复用 infer_batch 的实现，确保一致性
-        return self.infer_batch(rois, target_size, normalize_brightness, normalize_contrast, pos_ids=pos_ids)
-
-    @staticmethod
-    def _normalize_brightness_pil(img: Image.Image, target_mean: float = 168.0, threshold: int = 10) -> Image.Image:
-        """对 PIL Image 进行亮度归一化，与训练时的 normalize_brightness 保持一致"""
-        arr = np.array(img).astype(np.float32)
-        brightness = arr.mean(axis=2) if len(arr.shape) == 3 else arr
-        hole_mask = brightness > threshold
-        if np.sum(hole_mask) == 0:
-            return img
-        current_mean = arr[hole_mask].mean()
-        if current_mean > 0:
-            scale = target_mean / current_mean
-            arr[hole_mask] = np.clip(arr[hole_mask] * scale, 0, 255)
-        return Image.fromarray(arr.astype(np.uint8))
-
-    @staticmethod
-    def _normalize_brightness_np(img_np: np.ndarray, target_mean: float = 168.0, threshold: int = 10) -> np.ndarray:
-        """numpy 原生亮度归一化，避免 PIL 往返。热路径优化版。"""
-        arr = img_np.astype(np.float32)
-        brightness = arr.mean(axis=2) if len(arr.shape) == 3 else arr
-        hole_mask = brightness > threshold
-        if np.sum(hole_mask) == 0:
-            return img_np
-        current_mean = arr[hole_mask].mean()
-        if current_mean > 0:
-            scale = target_mean / current_mean
-            arr[hole_mask] = np.clip(arr[hole_mask] * scale, 0, 255)
-        return arr.astype(np.uint8)
-
-    @staticmethod
-    def _autocontrast_np(img_np: np.ndarray, cutoff: float = 0.0) -> np.ndarray:
-        """numpy 原生自动对比度，等价于 PIL ImageOps.autocontrast。热路径优化版。"""
-        arr = img_np.astype(np.float32)
-        for c in range(arr.shape[2]):
-            channel = arr[:, :, c]
-            if cutoff > 0:
-                lo, hi = np.percentile(channel, [cutoff, 100 - cutoff])
-            else:
-                lo, hi = channel.min(), channel.max()
-            if hi > lo:
-                channel = np.clip((channel - lo) * 255.0 / (hi - lo), 0, 255)
-            arr[:, :, c] = channel
-        return arr.astype(np.uint8)
-
-    def _preprocess_for_save(self, roi: np.ndarray, target_size: Tuple[int, int] = None,
-                             normalize_brightness: bool = False, normalize_contrast: bool = False) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        预处理 ROI 用于保存，返回处理后的图像和 mask。
-        使用 letterbox_resize 保持宽高比，与训练时一致。
-
-        Returns:
-            processed_roi: 预处理后的图像
-            mask: 有效区域 mask (H, W) bool
-        """
-        # 转换为 PIL Image 格式以使用 letterbox_resize
-        if len(roi.shape) == 2:
-            roi_rgb = cv2.cvtColor(roi, cv2.COLOR_GRAY2RGB)
-        elif roi.shape[2] == 4:
-            roi_rgb = cv2.cvtColor(roi, cv2.COLOR_RGBA2RGB)
-        elif roi.shape[2] == 3:
-            roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
-        else:
-            roi_rgb = roi
-
-        pil_img = Image.fromarray(roi_rgb)
-
-        # 应用亮度和对比度归一化（在 letterbox_resize 之前）
-        if normalize_brightness:
-            pil_img = self._normalize_brightness_pil(pil_img)
-        if normalize_contrast:
-            pil_img = self._normalize_contrast_pil(pil_img)
-
-        # 使用 letterbox_resize 保持宽高比（与训练时一致）
-        if target_size is not None:
-            img_padded, mask = letterbox_resize(pil_img, target_size)
-        else:
-            img_padded, mask = letterbox_resize(pil_img, self.input_size)
-
-        # 转换为 numpy 数组并 resize 到模型输入尺寸
-        roi_np = np.array(img_padded)
-        roi_resized = cv2.resize(roi_np, self.input_size, interpolation=cv2.INTER_LINEAR)
-
-        # resize mask 到 input_size
-        mask_resized = cv2.resize(mask.astype(np.uint8), self.input_size, interpolation=cv2.INTER_NEAREST)
-        mask = mask_resized.astype(bool)
-
-        return roi_resized, mask
-
-    def _preprocess_rois_to_batch(
-        self,
-        rois: List[np.ndarray],
-        target_size: Tuple[int, int] = None,
-        normalize_brightness: bool = False,
-        normalize_contrast: bool = False,
-    ) -> Tuple[Optional[torch.Tensor], List[np.ndarray]]:
-        """将 ROI 列表预处理为可直接送入模型的归一化 tensor batch。
-
-        跳过磁盘 I/O：letterbox + 亮度/对比度归一化 + Resize→CenterCrop→Normalize。
-        返回 (image_batch_on_device, masks_list)。
-        """
-        if self.model is None:
-            return None, []
-
-        # 从模型的 pre_processor 提取变换参数，回退到 DinoV2 默认值
-        try:
-            pre_transform = self.model.pre_processor.transform
-            resize_size = None
-            crop_size = 392  # DinoV2 default
-            for t in pre_transform.transforms:
-                if isinstance(t, transforms.Resize):
-                    resize_size = t.size  # (H, W) or int
-                elif isinstance(t, transforms.CenterCrop):
-                    crop_size = t.size  # int or (H, W)
-            if resize_size is None:
-                resize_size = (448, 448)
-            if isinstance(resize_size, int):
-                resize_size = (resize_size, resize_size)
-            if isinstance(crop_size, (list, tuple)):
-                crop_size = crop_size[0]
-        except Exception:
-            resize_size = (448, 448)
-            crop_size = 392
-
-        imagenet_mean = torch.tensor([0.485, 0.456, 0.406])
-        imagenet_std = torch.tensor([0.229, 0.224, 0.225])
-
-        tensors = []
-        masks_out = []
-
-        for roi in rois:
-            # BGR → RGB（保持 numpy，避免 PIL 创建/销毁开销）
-            if len(roi.shape) == 2:
-                roi_rgb = cv2.cvtColor(roi, cv2.COLOR_GRAY2RGB)
-            elif roi.shape[2] == 4:
-                roi_rgb = cv2.cvtColor(roi, cv2.COLOR_RGBA2RGB)
-            elif roi.shape[2] == 3:
-                roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
-            else:
-                roi_rgb = roi
-
-            # 亮度/对比度归一化（numpy 原生实现，避免 PIL 往返）
-            if normalize_brightness:
-                roi_rgb = self._normalize_brightness_np(roi_rgb)
-            if normalize_contrast:
-                roi_rgb = self._autocontrast_np(roi_rgb)
-
-            # letterbox_resize（cv2 版本，避免 PIL Image.new/paste 开销）
-            _ts = target_size if target_size is not None else self.input_size
-            img_padded, mask = letterbox_resize_cv2(roi_rgb, _ts)
-
-            # Resize → CenterCrop → ToTensor → Normalize
-            # F.to_tensor 直接接受 numpy (H,W,C) uint8，无需 PIL 中转
-            t = transforms.functional.to_tensor(img_padded)  # (3, H, W) float [0,1]
-            t = transforms.functional.resize(t, list(resize_size), antialias=True)
-            t = transforms.functional.center_crop(t, crop_size)
-            t = transforms.functional.normalize(
-                t, mean=imagenet_mean.tolist(), std=imagenet_std.tolist()
-            )
-
-            tensors.append(t)
-            masks_out.append(mask)
-
-        batch = torch.stack(tensors).to(self.device)
-        return batch, masks_out
-
-    def _extract_score_with_mask(self, predictions, mask: np.ndarray) -> float:
-        """
-        从预测结果中提取单个分数，使用 mask 处理 anomaly_map。
-        参考 anomalib_benchmark.py 中的实现，将 mask 区域外的 anomaly_map 清零。
-        """
-        score_keys = ['pred_score', 'anomaly_score', 'pred_scores', 'anomaly_scores']
-        anomaly_map_keys = ['anomaly_map', 'anomaly_maps']
-
-        for batch in predictions:
-            # 尝试获取 anomaly_map
-            anomaly_map = None
-            for key in anomaly_map_keys:
-                val = getattr(batch, key, None)
-                if val is None and isinstance(batch, dict):
-                    val = batch.get(key)
-                if val is not None and isinstance(val, torch.Tensor):
-                    # 取第一个样本的 anomaly_map
-                    amap = val[0].squeeze().detach().cpu().numpy()
-                    mask_resized = cv2.resize(
-                        mask.astype(np.uint8),
-                        (amap.shape[1], amap.shape[0]),
-                        interpolation=cv2.INTER_NEAREST
-                    ).astype(bool)
-                    # 将 mask 外的区域清零
-                    amap_masked = np.where(mask_resized, amap, 0.0)
-                    # 使用有效区域的 top-1% 均值作为分数
-                    valid_values = amap_masked[mask_resized]
-                    if len(valid_values) > 0:
-                        return float(np.percentile(valid_values, 99))
-                    else:
-                        return float(amap_masked.max())
-            
-            # 如果没有 anomaly_map，使用 pred_score
-            for key in score_keys:
-                val = getattr(batch, key, None)
-                if val is None and isinstance(batch, dict):
-                    val = batch.get(key)
-                if val is not None:
-                    if isinstance(val, torch.Tensor):
-                        return float(val.detach().cpu().item())
-                    else:
-                        return float(val)
-        
-        return 0.0
-
-    @staticmethod
-    def _get_anomaly_maps(output) -> Optional[torch.Tensor]:
-        """从模型输出中提取 anomaly_map tensor（触发可能的惰性计算）。"""
-        for key in ('anomaly_map', 'anomaly_maps'):
-            val = getattr(output, key, None)
-            if val is None and isinstance(output, dict):
-                val = output.get(key)
-            if val is not None and isinstance(val, torch.Tensor):
-                return val
-        return None
-
-    def _extract_scores_from_tensor(
-        self, anomaly_maps: torch.Tensor, masks: List[np.ndarray]
-    ) -> List[float]:
-        """从 anomaly_map tensor 批量提取分数。全部在 GPU 上完成。"""
-        batch_size = anomaly_maps.shape[0]
-        device = anomaly_maps.device
-        amap_h, amap_w = anomaly_maps.shape[-2:]
-        n_actual = min(batch_size, len(masks))
-
-        # Step 1: 构建 mask batch (CPU)
-        t1 = time.time()
-        mask_list = []
-        for i in range(n_actual):
-            m = torch.from_numpy(masks[i].astype(np.float32))
-            m = m.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
-            mask_list.append(m)
-        mask_batch = torch.cat(mask_list, dim=0)
-        t1 = time.time() - t1
-
-        # Step 2: 上传 GPU + resize（先同步排除隐式等待）
-        t2_start = time.time()
-        if device.type == 'cuda':
-            torch.cuda.synchronize(device)
-        t2_sync_done = time.time()
-        mask_batch = mask_batch.to(device, non_blocking=True)
-        t2_copy_done = time.time()
-        mask_batch = F_torch.interpolate(
-            mask_batch, size=(amap_h, amap_w), mode='nearest'
-        )
-        t2_interp_done = time.time()
-
-        # Step 3: mask fill + reshape
-        t3 = time.time()
-        masked = anomaly_maps[:n_actual].masked_fill(mask_batch == 0, float('-inf'))
-        masked_flat = masked.reshape(n_actual, -1)
-        t3 = time.time() - t3
-
-        # Step 4: topk
-        t4 = time.time()
-        n = amap_h * amap_w
-        k_top = max(1, n - int(n * 0.99))
-        top_vals, _ = torch.topk(masked_flat, k_top, dim=1)
-        t4 = time.time() - t4
-
-        # Step 5: CPU 取回结果
-        t5 = time.time()
-        result = top_vals[:, -1].cpu().tolist()
-        t5 = time.time() - t5
-
-        logger.info(f"[TIMING] extract_scores n={n_actual} amap={amap_h}x{amap_w} "
-                    f"mask={list(masks[0].shape)} | "
-                    f"t1_build={t1*1000:.0f}ms "
-                    f"t2_sync={(t2_sync_done-t2_start)*1000:.0f}ms "
-                    f"t2_copy={(t2_copy_done-t2_sync_done)*1000:.0f}ms "
-                    f"t2_interp={(t2_interp_done-t2_copy_done)*1000:.0f}ms "
-                    f"t3_fill={t3*1000:.0f}ms t4_topk={t4*1000:.0f}ms "
-                    f"t5_back={t5*1000:.0f}ms")
-        return result
-
-    def _extract_scores_with_masks(self, predictions, masks: List[np.ndarray]) -> List[float]:
-        """向后兼容：从 predictions 列表中提取分数。"""
-        anomaly_maps = None
-        for batch in predictions:
-            anomaly_maps = self._get_anomaly_maps(batch)
-            if anomaly_maps is not None:
-                return self._extract_scores_from_tensor(anomaly_maps, masks)
-
-        # 回退到 pred_score
-        for batch in predictions:
-            for key in ('pred_score', 'anomaly_score', 'pred_scores', 'anomaly_scores'):
-                val = getattr(batch, key, None)
-                if val is None and isinstance(batch, dict):
-                    val = batch.get(key)
-                if val is not None:
-                    if isinstance(val, torch.Tensor):
-                        return val.detach().cpu().numpy().flatten().tolist()
-                    else:
-                        return [float(val)]
-        return []
+                           target_size=None, normalize_brightness=None,
+                           normalize_contrast=None, pos_ids=None) -> List[Dict[str, Any]]:
+        """批量推理接口（兼容旧调用方式）"""
+        return self.infer_batch(rois)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 多模型管理器
 # ─────────────────────────────────────────────────────────────────────────────
 # 多模型管理器
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _load_single_model(pos_id_dir: Path) -> Optional[Tuple[str, Any, Dict[str, Any]]]:
     """
-    加载单个模型的辅助函数（用于并行加载），仅支持 Dinomaly。
+    加载单个模型的辅助函数（用于并行加载），仅支持 YOLO。
 
     Returns:
         (pos_id, wrapper, config) 元组，加载失败返回 None
     """
     pos_id = pos_id_dir.name
 
-    # 加载配置
     config_path = pos_id_dir / "config.json"
     config = {}
     if config_path.exists():
@@ -988,34 +456,20 @@ def _load_single_model(pos_id_dir: Path) -> Optional[Tuple[str, Any, Dict[str, A
         except Exception:
             pass
 
-    # 查找 Dinomaly 模型文件
-    # 首先检查 model.ckpt（训练时保存的格式）
-    model_path = pos_id_dir / "model.ckpt"
+    # 查找 YOLO 模型文件
+    model_path = pos_id_dir / "yolo_model.pt"
     if not model_path.exists():
-        # 兼容旧格式 dinomaly_model.pt
-        model_path = pos_id_dir / "dinomaly_model.pt"
-    if not model_path.exists():
-        best = pos_id_dir / "best_model"
-        if best.exists():
-            model_path = best / "model.ckpt"
-            if not model_path.exists():
-                model_path = best / "dinomaly_model.pt"
+        # 兼容旧格式
+        model_path = pos_id_dir / "model.ckpt"
 
     if not model_path.exists():
-        logger.warning(f"Model not found for pos_id={pos_id}, skipping")
+        logger.warning(f"YOLO model not found for pos_id={pos_id}, skipping")
         return None
 
     try:
-        # 加载 Dinomaly 模型
-        wrapper = DinomalyWrapper(device="cuda" if torch.cuda.is_available() else "cpu")
+        wrapper = YOLOWrapper(device="cuda" if torch.cuda.is_available() else "cpu")
         wrapper.load_from_checkpoint(str(model_path), str(config_path) if config_path.exists() else None)
-
-        logger.info(
-            f"Loaded Dinomaly model: pos_id={pos_id} "
-            f"(threshold={wrapper.threshold}, "
-            f"target_size={config.get('target_size', 'N/A')})"
-        )
-
+        logger.info(f"Loaded YOLO model: pos_id={pos_id} (threshold={wrapper.threshold})")
         return pos_id, wrapper, config
     except Exception as e:
         logger.error(f"Failed to load model pos_id={pos_id}: {e}")
@@ -1027,7 +481,7 @@ def _load_single_model(pos_id_dir: Path) -> Optional[Tuple[str, Any, Dict[str, A
 class MultiModelDetector:
     def __init__(self, models_dir: Path, lazy_load: bool = True, max_workers: int = 4):
         self.models_dir = models_dir
-        self.models: Dict[str, Any] = {}  # 仅支持 Dinomaly 模型
+        self.models: Dict[str, Any] = {}  # pos_id → YOLOWrapper
         self.configs: Dict[str, Dict[str, Any]] = {}
         self._model_metadata: Dict[str, Dict[str, Any]] = {}  # 懒加载用：存储模型元数据
         self._lazy_load = lazy_load
@@ -1057,20 +511,13 @@ class MultiModelDetector:
                 continue
 
             pos_id = pos_id_dir.name
-            # 首先检查 model.ckpt（训练时保存的格式）
-            model_path = pos_id_dir / "model.ckpt"
+            # 首先检查 yolo_model.pt
+            model_path = pos_id_dir / "yolo_model.pt"
             if not model_path.exists():
-                # 兼容旧格式 dinomaly_model.pt
-                model_path = pos_id_dir / "dinomaly_model.pt"
+                # 兼容旧格式
+                model_path = pos_id_dir / "model.ckpt"
 
             logger.info(f"[_scan_model_metadata] 检查: {pos_id}, model_path={model_path}, exists={model_path.exists()}")
-
-            if not model_path.exists():
-                best = pos_id_dir / "best_model"
-                if best.exists():
-                    model_path = best / "model.ckpt"
-                    if not model_path.exists():
-                        model_path = best / "dinomaly_model.pt"
 
             if not model_path.exists():
                 logger.warning(f"[_scan_model_metadata] 模型文件不存在: {pos_id}")
@@ -1120,7 +567,7 @@ class MultiModelDetector:
         elapsed = time.time() - start_time
         logger.info(f"Parallel model loading completed: {len(self.models)} models in {elapsed:.2f}s")
 
-    async def _load_model_async(self, pos_id: str) -> Optional[DinomalyWrapper]:
+    async def _load_model_async(self, pos_id: str) -> Optional[YOLOWrapper]:
         """异步加载单个模型（懒加载模式），带缓存。"""
         if pos_id in self.models:
             return self.models[pos_id]
@@ -1237,17 +684,16 @@ class MultiModelDetector:
             model = self.models[pos_id]
             config = self.configs[pos_id]
 
-            # 获取阈值：Dinomaly 模型从 wrapper 获取
+            # 获取阈值
             threshold = model.threshold
 
-            def make_result(error: float, infer_failed: bool = False, yolo_anomaly: bool = False) -> Dict[str, Any]:
+            def make_result(error: float, infer_failed: bool = False) -> Dict[str, Any]:
                 return {
                     "is_anomaly": (not infer_failed) and (error > threshold),
                     "anomaly_score": error,
                     "error": error,
                     "threshold": threshold,
                     "infer_failed": infer_failed,
-                    "yolo_anomaly": yolo_anomaly,
                 }
 
             rois_for_model = [roi for _, roi, _ in group]
@@ -1270,23 +716,15 @@ class MultiModelDetector:
                     batch_items = group[start:end]
                     for (idx, roi, ann), result in zip(batch_items, batch_results):
                         score = result["error"]
-                        dinomaly_score = result.get("dinomaly_score", score)
-                        yolo_score = result.get("yolo_score", 0.0)
-                        is_yolo_anomaly = result.get("yolo_anomaly", False)
-                        dinomaly_info = f" dinomaly={dinomaly_score:.4f}"
-                        if dinomaly_score > threshold:
-                            yolo_info = " yolo=-(skipped)"
-                        elif is_yolo_anomaly:
-                            yolo_info = f" yolo={yolo_score:.4f}(anomaly)"
-                        else:
-                            yolo_info = " yolo=-(no_detect)"
+                        is_anomaly = result.get("is_anomaly", False)
+                        anomaly_info = f" anomaly={'yes' if is_anomaly else 'no'}"
                         real_pos_id = str(ann.get('pos_id', pos_id))
                         logger.info(
                             f"[{request_id}] [{category}] ROI {idx+1}/{total_rois} "
                             f"pos_id={real_pos_id} roi_size={roi.shape[1]}x{roi.shape[0]} "
-                            f"score={score:.4f} threshold={threshold:.4f}{dinomaly_info}{yolo_info} (batch)"
+                            f"score={score:.4f} threshold={threshold:.4f}{anomaly_info} (batch)"
                         )
-                        result_pairs[idx] = (make_result(score, result["infer_failed"], is_yolo_anomaly), False)
+                        result_pairs[idx] = (make_result(score, result["infer_failed"]), False)
 
             except Exception as e:
                 logger.error(f"[{request_id}] [{category}] Batch inference error pos_id={pos_id}: {e}")
@@ -1294,24 +732,16 @@ class MultiModelDetector:
                 for (roi, idx, ann) in zip(rois_for_model, indices_for_model, [a for _, _, a in group]):
                     try:
                         real_pos_id = str(ann.get('pos_id', pos_id))
-                        result = model.infer_single(roi, pos_id=real_pos_id)
+                        result = model.infer_single(roi)
                         score = result["error"]
-                        dinomaly_score = result.get("dinomaly_score", score)
-                        yolo_score = result.get("yolo_score", 0.0)
-                        is_yolo_anomaly = result.get("yolo_anomaly", False)
-                        dinomaly_info = f" dinomaly={dinomaly_score:.4f}"
-                        if dinomaly_score > threshold:
-                            yolo_info = " yolo=-(skipped)"
-                        elif is_yolo_anomaly:
-                            yolo_info = f" yolo={yolo_score:.4f}(anomaly)"
-                        else:
-                            yolo_info = " yolo=-(no_detect)"
+                        is_anomaly = result.get("is_anomaly", False)
+                        anomaly_info = f" anomaly={'yes' if is_anomaly else 'no'}"
                         logger.info(
                             f"[{request_id}] [{category}] ROI {idx+1}/{total_rois} "
                             f"pos_id={real_pos_id} roi_size={roi.shape[1]}x{roi.shape[0]} "
-                            f"score={score:.4f} threshold={threshold:.4f}{dinomaly_info}{yolo_info} (single)"
+                            f"score={score:.4f} threshold={threshold:.4f}{anomaly_info} (single)"
                         )
-                        result_pairs[idx] = (make_result(score, result["infer_failed"], is_yolo_anomaly), False)
+                        result_pairs[idx] = (make_result(score, result["infer_failed"]), False)
                     except Exception as e2:
                         logger.error(f"[{request_id}] [{category}] Error ROI {idx+1} pos_id={pos_id}: {e2}")
                         result_pairs[idx] = (make_result(0.0, True), True)
@@ -1425,13 +855,13 @@ def _extract_roi_from_bbox(img: np.ndarray, bbox: List[float]) -> np.ndarray:
 
 
 def _extract_roi_from_segmentation(img: np.ndarray, segmentation: List[List[float]],
-                                   target_size: Optional[Tuple[int, int]] = (224, 224)) -> Optional[np.ndarray]:
+                                   target_size: Optional[Tuple[int, int]] = (320, 320)) -> Optional[np.ndarray]:
     """从 segmentation 提取 ROI 并缩放到固定大小
 
     Args:
         img: 原始图片 (numpy array)
         segmentation: 多边形坐标列表
-        target_size: 目标尺寸 (width, height)，默认 (224, 224)；如果为 None，则返回原始ROI不做缩放
+        target_size: 目标尺寸 (width, height)，默认 (320, 320)；如果为 None，则返回原始ROI不做缩放
 
     Returns:
         裁剪后的 ROI 图片，如果 target_size 不为空则缩放到指定大小，否则返回原始大小
@@ -1470,7 +900,7 @@ def _extract_roi_from_segmentation(img: np.ndarray, segmentation: List[List[floa
     if target_size is None:
         return roi
 
-    # 使用 letterbox_resize 保持宽高比，与训练预处理和 FN 图片保存一致
+    # 使用 letterbox_resize 保持宽高比，与训练预处理一致
     roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
     pil_img = Image.fromarray(roi_rgb)
     img_padded, _ = letterbox_resize(pil_img, (target_size[1], target_size[0]))
@@ -2564,8 +1994,7 @@ def _build_workpiece_result(
             "threshold": det_res.get("threshold", 0.0),
             "infer_failed": det_res.get("infer_failed", False),
             "anomaly_type": (
-                "yolo_defect" if det_res.get("yolo_anomaly", False)
-                else "dinomaly_defect" if det_res.get("is_anomaly", False)
+                "defect" if det_res.get("is_anomaly", False)
                 else "normal"
             ),
         }
@@ -3295,10 +2724,10 @@ def load_models():
     DINORMALY_DETECTOR = MultiModelDetector(base_dir)
     if DINORMALY_DETECTOR.get_loaded_categories():
         MODELS = {
-            cat: {'loaded': True, 'detector_type': 'dinomaly'}
+            cat: {'loaded': True, 'detector_type': 'yolo'}
             for cat in DINORMALY_DETECTOR.get_loaded_categories()
         }
-        logger.info(f"Loaded Dinomaly models: {list(MODELS.keys())}")
+        logger.info(f"Loaded YOLO models: {list(MODELS.keys())}")
 
         # by_category 模式下：建立 category_name -> category_id 的映射
         if TRAIN_MODE == "by_category":
