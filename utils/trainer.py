@@ -626,9 +626,7 @@ class ModelTrainer:
                     str(path_id),
                 )
                 external_group_id = config.get("external_group_id")
-                # 判断任务类型：有 base_model_dir 说明是重训，否则是首次训练
-                is_retrain = bool(config.get("base_model_dir"))
-                task_type = "yolo_retrain" if is_retrain else "yolo_initial"
+                task_type = "yolo"
                 self.training_status[task_id] = {
                     "status": "starting",
                     "progress": 0,
@@ -817,7 +815,6 @@ class ModelTrainer:
         category_label = config.get("category_label", "unknown")
         use_synthetic = config.get("synthetic_defects", True)
         synthetic_per_normal = config.get("synthetic_per_normal", 3)
-        is_retrain = bool(config.get("base_model_dir"))
 
         self._update_task_status(task_id, progress=10)
 
@@ -838,17 +835,6 @@ class ModelTrainer:
         mask_save_dir = Path(dataset_dir) / "masks" / str(path_id)
         roi_save_dir.mkdir(parents=True, exist_ok=True)
         mask_save_dir.mkdir(parents=True, exist_ok=True)
-
-        if is_retrain:
-            base_model_dir = Path(config.get("base_model_dir"))
-            base_roi_dir = Path(dataset_dir) / "roi" / str(path_id)
-            for img_path in sorted(list(base_roi_dir.glob("*.png")) + list(base_roi_dir.glob("*.jpg"))):
-                if img_path.name.startswith("fp_"):
-                    continue
-                dst = roi_save_dir / img_path.name
-                if not dst.exists():
-                    shutil.copy2(img_path, dst)
-            self._add_log(task_id, f"Copied base ROI images from {base_roi_dir}")
 
         yolo_imgsz = config.get("yolo_imgsz", 320)
         image_paths = extract_roi_images(
@@ -875,19 +861,9 @@ class ModelTrainer:
         all_fn_files: List[Path] = []
         if fn_images_dir.exists():
             all_fn_files.extend(fn_images_dir.rglob("*fn_*.jpg"))
-        if is_retrain:
-            project_dir = Path(save_dir).parent.parent
-            current_path_id_val = Path(save_dir).name
-            current_task_uuid = Path(save_dir).parent.name
-            for task_dir in project_dir.iterdir():
-                if not task_dir.is_dir() or task_dir.name == current_task_uuid:
-                    continue
-                hd = task_dir / current_path_id_val / "fn_images"
-                if hd.exists():
-                    all_fn_files.extend(hd.rglob("*fn_*.jpg"))
 
         n_real_fn = len(all_fn_files)
-        self._add_log(task_id, f"Stage 2/5: Found {n_real_fn} real FN images (current + historical)")
+        self._add_log(task_id, f"Stage 2/5: Found {n_real_fn} real FN images")
 
         # 计算缺陷目标数量
         max_aug_ratio = config.get("max_augmentation_ratio", 40)
@@ -920,22 +896,6 @@ class ModelTrainer:
 
         yolo_dataset_dir = Path(save_dir) / "_yolo_dataset"
         historical_yolo_fp_dirs: List[str] = []
-
-        if is_retrain:
-            project_dir = Path(save_dir).parent.parent
-            current_path_id_val = Path(save_dir).name
-            current_task_uuid = Path(save_dir).parent.name
-            for task_dir in sorted(project_dir.iterdir()):
-                if not task_dir.is_dir() or task_dir.name == current_task_uuid:
-                    continue
-                hist_dir = task_dir / current_path_id_val
-                hist_yolo_fp_dir = hist_dir / "yolo_fp_images"
-                if hist_yolo_fp_dir.exists() and (
-                    list(hist_yolo_fp_dir.rglob("yolo_fp_*.jpg")) or list(hist_yolo_fp_dir.rglob("yolo_fp_*.png"))
-                ):
-                    historical_yolo_fp_dirs.append(str(hist_yolo_fp_dir))
-            if historical_yolo_fp_dirs:
-                self._add_log(task_id, f"[YOLO] Found {len(historical_yolo_fp_dirs)} historical YOLO FP dirs")
 
         count = self._prepare_yolo_dataset(
             task_id=task_id,
@@ -1059,7 +1019,7 @@ class ModelTrainer:
         self._add_log(task_id, f"[YOLO] Found {n_orig} original {label} images, target={target_total}")
 
         if output_dir.exists():
-            shutil.rmtree(str(output_dir))
+            shutil.rmtree(str(output_dir), ignore_errors=True)
         output_dir.mkdir(parents=True, exist_ok=True)
 
         preprocessed = []
@@ -1128,7 +1088,7 @@ class ModelTrainer:
         self._add_log(task_id, f"[YOLO] Found {n_orig} original YOLO FP images, target={target_total}")
 
         if output_dir.exists():
-            shutil.rmtree(str(output_dir))
+            shutil.rmtree(str(output_dir), ignore_errors=True)
         output_dir.mkdir(parents=True, exist_ok=True)
 
         processed_paths = []
@@ -1549,7 +1509,7 @@ names:
         """从正常 ROI 生成合成缺陷，返回合成缺陷图片路径列表"""
         synthetic_dir = Path(save_dir) / "_synthetic_defects"
         if synthetic_dir.exists():
-            shutil.rmtree(str(synthetic_dir))
+            shutil.rmtree(str(synthetic_dir), ignore_errors=True)
         synthetic_dir.mkdir(parents=True, exist_ok=True)
 
         synthetic_config = load_synthetic_config(None)

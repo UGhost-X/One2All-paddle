@@ -363,33 +363,6 @@ class ModelDeployer:
                 "message": f"Failed to start service: {str(e)}"
             }
     
-    def stop_service(self, service_id: str) -> Dict:
-        with self._lock:
-            if service_id not in self.services:
-                return {"status": "error", "message": "Service not found"}
-            
-            service = self.services[service_id]
-            
-            if service.status == ServiceStatus.STOPPED.value:
-                return {"status": "success", "message": "Service already stopped"}
-            
-            if service.pid and self._is_process_alive(service.pid):
-                try:
-                    self._kill_process_tree(service.pid)
-                    time.sleep(1)
-                except Exception as e:
-                    logger.warning(f"Error killing process: {e}")
-            
-            service.status = ServiceStatus.STOPPED.value
-            service.pid = None
-            
-            if service.port in self.port_index:
-                del self.port_index[service.port]
-            
-            self._save_state()
-            
-            return {"status": "success", "message": f"Service {service_id} stopped"}
-    
     def delete_service(self, service_id: str) -> Dict:
         with self._lock:
             if service_id not in self.services:
@@ -397,7 +370,7 @@ class ModelDeployer:
             
             service = self.services[service_id]
             
-            # 直接停止进程，避免死锁（stop_service也在同一个锁内）
+            # 停止进程（在锁内直接操作，避免死锁）
             if service.pid and self._is_process_alive(service.pid):
                 try:
                     self._kill_process_tree(service.pid)

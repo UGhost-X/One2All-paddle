@@ -20,6 +20,7 @@ import logging
 import cv2
 import numpy as np
 import base64
+import io
 import shutil
 import tempfile
 import random
@@ -120,12 +121,34 @@ class COCOData(BaseModel):
 
 
 
+class FeedbackGroup(BaseModel):
+    """
+    单个 path_id 的反馈数据分组
+
+    每个 path_id 对应一个位置/类别，包含该位置收集的所有训练数据
+    前端负责聚合所有数据（当前 + 历史），后端不再自动从磁盘收集
+    """
+    path_id: str  # 位置/类别 ID
+    false_positive_images: List[str] = []  # base64 编码的正常样本（被误检为异常）
+    false_negative_images: List[str] = []  # base64 编码的异常样本 ROI（被漏检）
+    false_negative_pos_ids: List[str] = []  # 每个 FN 图片对应的 pos_id，用于按位置组织 YOLO 训练
+    yolo_false_positive_images: List[str] = []  # base64 编码的正常样本（被 YOLO 误检，Dinomaly 判定正确）
+    base_roi_images: List[str] = []  # base64 编码的额外正常 ROI 图片（前端收集的历史数据，叠加到训练集）
+
+
 class TrainRequest(BaseModel):
-    images: List[str]
-    coco_data: COCOData
-    base_path: str
+    """统一训练请求 — 每次训练都是全量训练，前端负责聚合所有数据"""
     project_id: str
+
+    # 训练数据（必传）
+    images: List[str] = []
+    coco_data: Optional[COCOData] = None
     label_names: Optional[List[str]] = None
+
+    # 用户反馈数据（可选：叠加 FN/FP/YOLO_FP 到训练集）
+    feedback_groups: List[FeedbackGroup] = []
+
+    # 训练模式
     parallel_train: bool = False
     train_mode: str = "by_pos_id"  # "by_pos_id" | "by_category"
 
@@ -140,7 +163,7 @@ class TrainRequest(BaseModel):
     # 通用参数
     augment: bool = True
     num_augmentations: int = 1
-    augmentation_config: Optional[str] = None  # 数据增强配置文件路径
+    augmentation_config: Optional[str] = None
     normalize_brightness: bool = False
     normalize_contrast: bool = False
     threshold_buffer: float = 1.0
@@ -152,23 +175,26 @@ class TrainRequest(BaseModel):
 @app.post("/train/anomaly")
 def train_anomaly(request: TrainRequest):
     """
-    接收 COCO 数据，按照位置+类型组合保存裁剪信息并启动训练
-    层级结构: {base_path}/product/{project_id}/train/{uuid}/
-    输出路径: output/{project_id}/{uuid}/
+    统一训练接口 — 每次都是全量训练，前端负责聚合所有数据。
+    - images + coco_data → 解码、保存、构建 annotations（必传）
+    - feedback_groups → 叠加 FN/FP/YOLO_FP 到训练集（可选）
+    - trainer 自动合成缺陷（无 FN 时兜底）
     """
     task_uuid = uuid_lib.uuid4().hex[:8]
-
-    cat_map = (
-        {cat.id: cat.name for cat in request.coco_data.categories}
-        if request.coco_data.categories
-        else {}
-    )
-
-    # 使用环境变量配置的产品数据目录
     storage_base = path_config.get_project_product_path(request.project_id, task_uuid)
 
     try:
-        # ── 1. 解码所有图片 ────────────────────────────────────────────────
+        # ========== Phase 1: 处理原始训练数据 ==========
+        if not request.images or not request.coco_data:
+            raise HTTPException(status_code=400, detail="images and coco_data are required")
+
+        coco_data = request.coco_data
+        cat_map = {cat.id: cat.name for cat in coco_data.categories} if coco_data.categories else {}
+        labels_processed: set = set()
+        annotations_data: Dict[str, Any] = {"images": [], "annotations": [], "categories": []}
+
+        raw_images_dir = storage_base / "raw_images"
+        raw_images_dir.mkdir(parents=True, exist_ok=True)
         decoded_images: Dict[Any, np.ndarray] = {}
 
         for idx, img_b64 in enumerate(request.images):
@@ -176,157 +202,79 @@ def train_anomaly(request: TrainRequest):
                 img_data = base64.b64decode(img_b64)
                 nparr = np.frombuffer(img_data, np.uint8)
                 img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-
                 if img is not None:
-                    if request.coco_data.images and idx < len(request.coco_data.images):
-                        image_id = request.coco_data.images[idx].id
-                    else:
-                        image_id = idx + 1
+                    image_id = coco_data.images[idx].id if coco_data.images and idx < len(coco_data.images) else idx + 1
                     decoded_images[image_id] = img
             except Exception as e:
                 logger.error(f"Failed to decode image[{idx}]: {e}")
 
-        # ── 2. 保存原始完整图像 ────────────────────────────────────────────
-        raw_images_dir = storage_base / "raw_images"
-        raw_images_dir.mkdir(parents=True, exist_ok=True)
-
-        annotations_data: Dict[str, Any] = {
-            "images": [],
-            "annotations": [],
-            "categories": [],
-        }
-
-        if request.coco_data.categories:
-            for cat in request.coco_data.categories:
-                annotations_data["categories"].append({
-                    "id": cat.id,
-                    "name": cat.name,
-                    "supercategory": cat.supercategory or "",
-                })
+        if coco_data.categories:
+            for cat in coco_data.categories:
+                annotations_data["categories"].append({"id": cat.id, "name": cat.name, "supercategory": cat.supercategory or ""})
 
         for img_id, img in decoded_images.items():
-            coco_img_info = None
-            if request.coco_data.images:
-                for coco_img in request.coco_data.images:
-                    if coco_img.id == img_id:
-                        coco_img_info = coco_img
-                        break
-
-            raw_filename = (
-                f"raw_{coco_img_info.file_name}" if coco_img_info else f"raw_{img_id}.jpg"
-            )
-            cv2.imwrite(str(raw_images_dir / raw_filename), img)
-
+            ci = next((c for c in (coco_data.images or []) if c.id == img_id), None)
+            raw_fn = f"raw_{ci.file_name}" if ci else f"raw_{img_id}.jpg"
+            cv2.imwrite(str(raw_images_dir / raw_fn), img)
             h, w = img.shape[:2]
-            annotations_data["images"].append({
-                "id": img_id,
-                "width": w,
-                "height": h,
-                "file_name": raw_filename,
-            })
+            annotations_data["images"].append({"id": img_id, "width": w, "height": h, "file_name": raw_fn})
 
-        # ── 3. 构建 annotations.json（不裁剪，裁剪在训练时完成）──────────────
         crop_count = 0
-        labels_processed: set = set()
-
-        for ann in request.coco_data.annotations:
+        for ann in coco_data.annotations:
             base_label = ann.label or cat_map.get(ann.category_id, f"class_{ann.category_id}")
-
             if request.label_names and base_label not in request.label_names:
                 continue
-
-            image_id = ann.image_id
-            if image_id not in decoded_images:
+            img_id = ann.image_id
+            if img_id not in decoded_images:
                 continue
-
-            img = decoded_images[image_id]
-            h, w = img.shape[:2]
-
-            label_name = base_label
-            labels_processed.add(label_name)
-
-            # 使用原始 bbox（不进行裁剪）
+            labels_processed.add(base_label)
             crop_bbox = None
             if ann.bbox:
                 crop_bbox = [int(x) for x in ann.bbox]
             elif ann.rbbox and len(ann.rbbox) >= 5:
-                # 从 rbbox 计算 bbox
                 if len(ann.rbbox) >= 8:
-                    xs = ann.rbbox[0::2]
-                    ys = ann.rbbox[1::2]
-                    crop_bbox = [int(min(xs)), int(min(ys)), int(max(xs) - min(xs)), int(max(ys) - min(ys))]
+                    xs, ys = ann.rbbox[0::2], ann.rbbox[1::2]
+                    crop_bbox = [int(min(xs)), int(min(ys)), int(max(xs)-min(xs)), int(max(ys)-min(ys))]
                 else:
                     cx, cy, bw, bh, angle = ann.rbbox
                     angle_rad = np.deg2rad(angle)
                     cos_a, sin_a = np.cos(angle_rad), np.sin(angle_rad)
-                    hw, hh = bw / 2, bh / 2
-                    corners = np.array([[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]])
-                    rot_matrix = np.array([[cos_a, -sin_a], [sin_a, cos_a]])
-                    rotated = np.dot(corners, rot_matrix.T) + np.array([cx, cy])
-                    xs, ys = rotated[:, 0], rotated[:, 1]
-                    crop_bbox = [int(min(xs)), int(min(ys)), int(max(xs) - min(xs)), int(max(ys) - min(ys))]
+                    corners = np.array([[-bw/2,-bh/2],[bw/2,-bh/2],[bw/2,bh/2],[-bw/2,bh/2]])
+                    rotated = np.dot(corners, np.array([[cos_a,-sin_a],[sin_a,cos_a]]).T) + np.array([cx,cy])
+                    xs, ys = rotated[:,0], rotated[:,1]
+                    crop_bbox = [int(min(xs)), int(min(ys)), int(max(xs)-min(xs)), int(max(ys)-min(ys))]
             elif ann.segmentation and len(ann.segmentation) > 0:
-                # 从 segmentation 计算 bbox
-                seg = ann.segmentation[0]
-                xs = seg[0::2]
-                ys = seg[1::2]
-                crop_bbox = [int(min(xs)), int(min(ys)), int(max(xs) - min(xs)), int(max(ys) - min(ys))]
-
+                seg = ann.segmentation[0]; xs, ys = seg[0::2], seg[1::2]
+                crop_bbox = [int(min(xs)), int(min(ys)), int(max(xs)-min(xs)), int(max(ys)-min(ys))]
             if crop_bbox is None:
-                crop_bbox = [0, 0, w, h]
+                h2, w2 = decoded_images[img_id].shape[:2]
+                crop_bbox = [0, 0, w2, h2]
 
             ann_data: Dict[str, Any] = {
-                "id": len(annotations_data["annotations"]) + 1,
-                "image_id": image_id,
-                "category_id": ann.category_id or 0,
-                "bbox": crop_bbox,
-                "area": crop_bbox[2] * crop_bbox[3],
-                "label": label_name,
+                "id": len(annotations_data["annotations"])+1, "image_id": img_id,
+                "category_id": ann.category_id or 0, "bbox": crop_bbox,
+                "area": crop_bbox[2]*crop_bbox[3], "label": base_label,
             }
-            if ann.pos_id is not None:
-                ann_data["pos_id"] = ann.pos_id
-            if ann.rbbox is not None:
-                ann_data["rbbox"] = ann.rbbox
-            if ann.segmentation is not None:
-                ann_data["segmentation"] = ann.segmentation
-            if ann.angle is not None:
-                ann_data["angle"] = ann.angle
-            if ann.horizontal_flip is not None:
-                ann_data["horizontal_flip"] = ann.horizontal_flip
-            if ann.vertical_flip is not None:
-                ann_data["vertical_flip"] = ann.vertical_flip
-
+            for fld in ("pos_id","rbbox","segmentation","angle","horizontal_flip","vertical_flip"):
+                if getattr(ann, fld, None) is not None: ann_data[fld] = getattr(ann, fld)
             annotations_data["annotations"].append(ann_data)
             crop_count += 1
 
         if crop_count == 0:
             raise HTTPException(status_code=400, detail="No valid annotations found")
 
-        # ── 4. 保存 annotations.json ───────────────────────────────────────
-        annotations_path = storage_base / "annotations.json"
-        with open(annotations_path, "w", encoding="utf-8") as f:
+        with open(storage_base / "annotations.json", "w", encoding="utf-8") as f:
             json.dump(annotations_data, f, ensure_ascii=False, indent=2)
-        logger.info(
-            f"Saved annotations.json: {len(annotations_data['images'])} images, "
-            f"{len(annotations_data['annotations'])} annotations"
-        )
-
-        # ── 5. 保存 labels.txt ────────────────────────────────────────────
         with open(storage_base / "labels.txt", "w") as f:
-            for label in sorted(labels_processed):
-                f.write(f"{label}\n")
+            for label in sorted(labels_processed): f.write(f"{label}\n")
+        logger.info(f"Saved annotations: {crop_count} crops, {len(decoded_images)} images")
 
-        # ── 6. 确定 pos_id 分组 ───────────────────────────────────────────
+        # ========== Phase 2: 构建 pos_id 分组 ==========
         train_mode = request.train_mode
-
-        pos_ids_in_request: set = set()
-        for ann in request.coco_data.annotations:
-            if ann.pos_id is not None:
-                pos_ids_in_request.add(ann.pos_id)
+        pos_ids_in_request = {ann.get("pos_id") for ann in annotations_data["annotations"] if ann.get("pos_id") is not None}
         use_pos_id = len(pos_ids_in_request) > 0
 
         group_id = f"group_{int(time.time())}_{request.project_id}"
-
         groups_for_trainer: Dict[Any, List[Dict]] = defaultdict(list)
         for ann in annotations_data["annotations"]:
             if train_mode == "by_category":
@@ -337,53 +285,112 @@ def train_anomaly(request: TrainRequest):
                 key = ann.get("label", "unknown")
             groups_for_trainer[key].append(ann)
 
-        # 构建训练配置（YOLO）
+        # ========== Phase 3: 叠加用户反馈数据（可选）==========
+        if request.feedback_groups:
+            for group in request.feedback_groups:
+                path_id = group.path_id
+
+                roi_dir = storage_base / "roi" / str(path_id)
+                roi_dir.mkdir(parents=True, exist_ok=True)
+
+                # base_roi_images → roi/{path_id}/base_*.jpg
+                for idx, img_b64 in enumerate(group.base_roi_images or []):
+                    try:
+                        img_data = base64.b64decode(img_b64)
+                        nparr = np.frombuffer(img_data, np.uint8)
+                        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                        if img is not None:
+                            cv2.imwrite(str(roi_dir / f"base_{idx:04d}.jpg"), img)
+                    except Exception as e:
+                        logger.error(f"base_roi[{idx}] path_id={path_id}: {e}")
+
+                # false_positive_images → roi/{path_id}/fp_*.jpg
+                for idx, img_b64 in enumerate(group.false_positive_images or []):
+                    try:
+                        img_data = base64.b64decode(img_b64)
+                        nparr = np.frombuffer(img_data, np.uint8)
+                        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                        if img is not None:
+                            cv2.imwrite(str(roi_dir / f"fp_{idx:04d}.jpg"), img)
+                    except Exception as e:
+                        logger.error(f"FP[{idx}] path_id={path_id}: {e}")
+
+                # false_negative_images → output/{pid}/{uuid}/{path_id}/fn_images/
+                if group.false_negative_images:
+                    new_model_dir = path_config.get_project_output_path(request.project_id, task_uuid) / str(path_id)
+                    fn_dir = new_model_dir / "fn_images"
+                    fn_dir.mkdir(parents=True, exist_ok=True)
+                    fn_pos_ids = group.false_negative_pos_ids or []
+                    batch_ts = int(time.time() * 1000) % 1000000
+                    for idx, img_b64 in enumerate(group.false_negative_images):
+                        try:
+                            img_data = base64.b64decode(img_b64)
+                            img = Image.open(io.BytesIO(img_data)).convert("RGB")
+                            pos_id = fn_pos_ids[idx] if idx < len(fn_pos_ids) else "unknown"
+                            (fn_dir / str(pos_id)).mkdir(parents=True, exist_ok=True)
+                            img.save(str(fn_dir / str(pos_id) / f"fn_{batch_ts}_{idx:04d}.jpg"), "JPEG", quality=95)
+                        except Exception as e:
+                            logger.error(f"FN[{idx}] path_id={path_id}: {e}")
+
+                # yolo_false_positive_images → output/{pid}/{uuid}/{path_id}/yolo_fp_images/
+                if group.yolo_false_positive_images:
+                    new_model_dir = path_config.get_project_output_path(request.project_id, task_uuid) / str(path_id)
+                    yolo_fp_dir = new_model_dir / "yolo_fp_images"
+                    yolo_fp_dir.mkdir(parents=True, exist_ok=True)
+                    batch_ts = int(time.time() * 1000) % 1000000
+                    for idx, img_b64 in enumerate(group.yolo_false_positive_images):
+                        try:
+                            img_data = base64.b64decode(img_b64)
+                            nparr = np.frombuffer(img_data, np.uint8)
+                            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                            if img is not None:
+                                cv2.imwrite(str(yolo_fp_dir / f"yolo_fp_{batch_ts}_{idx:04d}.jpg"), img)
+                        except Exception as e:
+                            logger.error(f"YOLO_FP[{idx}] path_id={path_id}: {e}")
+
+                logger.info(f"path_id={path_id}: feedback (base_roi={len(group.base_roi_images)}, fp={len(group.false_positive_images)}, fn={len(group.false_negative_images)}, yolo_fp={len(group.yolo_false_positive_images)})")
+
+                # 将 feedback path_id 映射到正确的 group key
+                # by_category 模式下 path_id 是 category_id（数字），需要映射回 label
+                trainer_key = path_id
+                if train_mode == "by_category":
+                    # 从 annotations 中查找 category_id 对应的 label
+                    for ann in annotations_data["annotations"]:
+                        if str(ann.get("category_id")) == str(path_id):
+                            trainer_key = ann.get("label", path_id)
+                            break
+
+                if trainer_key not in groups_for_trainer:
+                    groups_for_trainer[trainer_key] = []
+
+        # ========== Phase 4: 启动训练 ==========
         base_train_config = {
-            "model_name": "YOLO",
-            "use_pos_id": use_pos_id,
-            "project_id": request.project_id,
-            "task_uuid": task_uuid,
-            "parallel_train": request.parallel_train,
-            "train_mode": train_mode,
-            "augment": request.augment,
-            "num_augmentations": request.num_augmentations,
+            "model_name": "YOLO", "use_pos_id": use_pos_id,
+            "project_id": request.project_id, "task_uuid": task_uuid,
+            "parallel_train": request.parallel_train, "train_mode": train_mode,
+            "augment": request.augment, "num_augmentations": request.num_augmentations,
             "augmentation_config": request.augmentation_config,
             "normalize_brightness": request.normalize_brightness,
             "normalize_contrast": request.normalize_contrast,
-            "threshold_buffer": request.threshold_buffer,
-            "save_images": request.save_images,
+            "threshold_buffer": request.threshold_buffer, "save_images": request.save_images,
             "max_concurrent": request.max_concurrent,
-            "yolo_epochs": request.yolo_epochs,
-            "yolo_batch": request.yolo_batch,
-            "yolo_imgsz": request.yolo_imgsz,
-            "synthetic_defects": request.synthetic_defects,
+            "yolo_epochs": request.yolo_epochs, "yolo_batch": request.yolo_batch,
+            "yolo_imgsz": request.yolo_imgsz, "synthetic_defects": request.synthetic_defects,
             "synthetic_per_normal": request.synthetic_per_normal,
             "synthetic_config": request.synthetic_config,
         }
 
         t0 = time.time()
         all_task_ids, filtered_keys = trainer.run_batch_training_async(
-            str(storage_base),
-            base_train_config,
-            dict(groups_for_trainer),
-            group_id=group_id,
+            str(storage_base), base_train_config, dict(groups_for_trainer), group_id=group_id,
         )
-        logger.info(
-            f"[TrainAnomaly] {len(all_task_ids)} tasks launched in {time.time() - t0:.3f}s"
-        )
+        logger.info(f"[TrainAnomaly] {len(all_task_ids)} tasks launched in {time.time()-t0:.3f}s")
 
         task_results = []
         for pid, tid in zip(filtered_keys, all_task_ids):
-            group_annotations = groups_for_trainer.get(int(pid) if pid.isdigit() else pid, [])
-            first_ann = group_annotations[0] if group_annotations else {}
-            label = first_ann.get("label", str(pid))
-            task_results.append({
-                "pos_id": pid,
-                "task_id": tid,
-                "label": label
-            })
-
-        pos_ids_processed = filtered_keys
+            anns = groups_for_trainer.get(int(pid) if str(pid).isdigit() else pid, [])
+            label = anns[0].get("label", str(pid)) if anns else str(pid)
+            task_results.append({"pos_id": pid, "task_id": tid, "label": label})
 
         return {
             "status": "success",
@@ -393,11 +400,13 @@ def train_anomaly(request: TrainRequest):
             "storage_path": str(storage_base),
             "total_crops": crop_count,
             "labels": sorted(list(labels_processed)),
-            "pos_ids": [str(p) for p in pos_ids_processed],
+            "pos_ids": [str(p) for p in filtered_keys],
             "use_pos_id": use_pos_id,
             "tasks": task_results,
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -574,367 +583,6 @@ async def get_train_data(task_id: str):
         "label": status.get("label"),
         "total": len(result),
         "images": result,
-    }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 增量训练接口（同时接收正常样本和异常 ROI）
-# ─────────────────────────────────────────────────────────────────────────────
-
-class FeedbackGroup(BaseModel):
-    """
-    单个 path_id 的反馈数据分组
-    
-    每个 path_id 对应一个位置/类别，包含该位置收集的 FP 和 FN 样本
-    """
-    path_id: str  # 位置/类别 ID
-    false_positive_images: List[str] = []  # base64 编码的正常样本（被 Dinomaly 误检为异常）
-    false_negative_images: List[str] = []  # base64 编码的异常样本 ROI（被漏检）
-    false_negative_pos_ids: List[str] = []  # 每个 FN 图片对应的 pos_id，用于按位置组织 YOLO 训练
-    yolo_false_positive_images: List[str] = []  # base64 编码的正常样本（被 YOLO 误检为异常，Dinomaly 判定正确）
-
-
-class RetrainRequest(BaseModel):
-    """
-    增量训练请求
-    
-    前端在重新训练时发送：
-    - feedback_groups: 按 path_id 分组的反馈数据列表
-      每个分组包含该位置的 FP 样本（用于微调）和 FN 样本（用于原型库）
-    """
-    project_id: str
-    base_task_uuid: str  # 基础模型的 task_uuid
-    feedback_groups: List[FeedbackGroup]  # 按 path_id 分组的反馈数据
-    # YOLO 训练参数（可选，默认继承基础模型配置）
-    yolo_epochs: Optional[int] = None
-    yolo_batch: Optional[int] = None
-    yolo_imgsz: Optional[int] = None
-
-
-@app.post("/train/anomaly/retrain")
-async def incremental_retrain(request: RetrainRequest):
-    """
-    增量训练：处理多个 path_id 的用户反馈数据
-    
-    保证新版本模型完整：
-    - 有反馈的 path_id：微调/更新原型库
-    - 无反馈的 path_id：直接复制原模型文件
-    """
-    from PIL import Image
-    import io
-    import shutil
-
-    if not request.feedback_groups:
-        raise HTTPException(status_code=400, detail="No feedback groups provided")
-
-    # 生成新的 task_uuid（所有 path_id 共享）
-    new_task_uuid = uuid_lib.uuid4().hex[:8]
-    
-    # 获取基础模型的所有 path_id
-    base_output_dir = path_config.get_project_output_path(request.project_id, request.base_task_uuid)
-    if not base_output_dir.exists():
-        raise HTTPException(status_code=404, detail=f"Base model directory not found: {base_output_dir}")
-    
-    all_base_path_ids = [d.name for d in base_output_dir.iterdir() if d.is_dir() and d.name != "temp"]
-    logger.info(f"Found {len(all_base_path_ids)} path_ids in base model: {all_base_path_ids}")
-    
-    # 有反馈的 path_id 集合
-    feedback_path_ids = {g.path_id for g in request.feedback_groups}
-    
-    # 需要复制的 path_id（无反馈）
-    copy_path_ids = set(all_base_path_ids) - feedback_path_ids
-    logger.info(f"Path_ids to copy (no feedback): {copy_path_ids}")
-    
-    results = []
-    all_task_ids = []
-    total_fp = 0
-    total_fn = 0
-    total_yolo_fp = 0
-
-    # ========== 第一步：复制无反馈的 path_id ==========
-    for path_id in copy_path_ids:
-        try:
-            base_model_dir = base_output_dir / path_id
-            new_model_dir = path_config.get_project_output_path(request.project_id, new_task_uuid) / path_id
-            new_model_dir.mkdir(parents=True, exist_ok=True)
-            
-            # 复制所有模型相关文件
-            model_files = ["yolo_model.pt", "config.json"]
-            copied_files = []
-            for file_name in model_files:
-                src_file = base_model_dir / file_name
-                if src_file.exists():
-                    shutil.copy2(str(src_file), str(new_model_dir / file_name))
-                    copied_files.append(file_name)
-            
-            # 复制 template_variants 目录（推理服务模板变体）
-            template_variants_src = base_model_dir / "template_variants"
-            if template_variants_src.exists() and template_variants_src.is_dir():
-                template_variants_dst = new_model_dir / "template_variants"
-                if template_variants_dst.exists():
-                    shutil.rmtree(str(template_variants_dst))
-                shutil.copytree(str(template_variants_src), str(template_variants_dst))
-                logger.info(f"path_id={path_id}: Copied template_variants directory")
-
-            # 复制 yolo_model.pt（如果基础模型有 YOLO 分类器）
-            yolo_src = base_model_dir / "yolo_model.pt"
-            if yolo_src.exists():
-                shutil.copy2(str(yolo_src), str(new_model_dir / "yolo_model.pt"))
-                logger.info(f"path_id={path_id}: Copied yolo_model.pt from base version")
-
-            # 如果没有找到任何模型文件，记录警告
-            if not copied_files:
-                logger.warning(f"path_id={path_id}: No model files found in {base_model_dir}")
-            
-            results.append({
-                "path_id": path_id,
-                "status": "copied",
-                "message": f"Model copied from base version (files: {copied_files})"
-            })
-            logger.info(f"path_id={path_id}: Copied files {copied_files} from base version")
-            
-        except Exception as e:
-            logger.error(f"Failed to copy path_id={path_id}: {e}")
-            results.append({
-                "path_id": path_id,
-                "status": "error",
-                "message": f"Failed to copy: {str(e)}"
-            })
-
-    # ========== 第二步：处理有反馈的 path_id ==========
-    for group in request.feedback_groups:
-        path_id = group.path_id
-        logger.info(f"Processing feedback group for path_id={path_id}")
-
-        try:
-            # 定位该 path_id 的基础模型目录
-            base_model_dir = base_output_dir / path_id
-            if not base_model_dir.exists():
-                logger.error(f"Base model directory not found: {base_model_dir}")
-                results.append({
-                    "path_id": path_id,
-                    "status": "error",
-                    "message": f"Base model directory not found: {base_model_dir}"
-                })
-                continue
-
-            # 查找基础模型文件（支持多种格式）
-            base_model_path = base_model_dir / "yolo_model.pt"
-            if not base_model_path.exists():
-                base_model_path = base_model_dir / "model.ckpt"  # legacy
-            base_config_path = base_model_dir / "config.json"
-            
-            if not base_model_path.exists():
-                logger.error(f"Base model checkpoint not found in {base_model_dir}")
-                results.append({
-                    "path_id": path_id,
-                    "status": "error",
-                    "message": f"Base model checkpoint not found in {base_model_dir}"
-                })
-                continue
-
-            # 读取基础模型配置
-            base_config = {}
-            if base_config_path.exists():
-                with open(base_config_path, "r", encoding="utf-8") as f:
-                    base_config = json.load(f)
-
-            # 创建统一的训练目录（所有 path_id 共享）
-            # 结构：train/{new_task_uuid}/raw_images/, train/{new_task_uuid}/roi/{path_id}/
-            train_base_dir = path_config.get_project_product_path(request.project_id, new_task_uuid)
-            train_base_dir.mkdir(parents=True, exist_ok=True)
-            new_model_dir = path_config.get_project_output_path(request.project_id, new_task_uuid) / str(path_id)
-            new_model_dir.mkdir(parents=True, exist_ok=True)
-
-            # 复制父模型的 raw_images 和 annotations.json 到新的训练目录（只在第一次处理时复制）
-            # 基础模型的文件在 product/{project_id}/train/{base_task_uuid}/ 下
-            base_product_train_dir = path_config.get_project_product_path(request.project_id, request.base_task_uuid)
-            base_raw_images_dir = base_product_train_dir / "raw_images"
-            base_annotations_path = base_product_train_dir / "annotations.json"
-            new_raw_images_dir = train_base_dir / "raw_images"
-            new_annotations_path = train_base_dir / "annotations.json"
-            
-            if base_raw_images_dir.exists() and base_raw_images_dir.is_dir() and not new_raw_images_dir.exists():
-                shutil.copytree(str(base_raw_images_dir), str(new_raw_images_dir), ignore=shutil.ignore_patterns("temp"))
-                logger.info(f"Copied {len(list(base_raw_images_dir.glob('*.jpg')))} raw images from base model to {new_raw_images_dir}")
-            elif not new_raw_images_dir.exists():
-                new_raw_images_dir.mkdir(parents=True, exist_ok=True)
-                logger.warning(f"No raw_images found in {base_raw_images_dir}, creating empty directory")
-            
-            # 复制 annotations.json
-            if base_annotations_path.exists() and not new_annotations_path.exists():
-                shutil.copy2(str(base_annotations_path), str(new_annotations_path))
-                logger.info(f"Copied annotations.json from base model to {new_annotations_path}")
-
-            # 复制基础 ROI 目录（用于 YOLO 训练的 normal 类数据源）
-            # 排除 fp_* 文件（这些是 FP 重训时加入的异常样本）
-            base_roi_dir = base_product_train_dir / "roi" / str(path_id)
-            new_roi_dir = train_base_dir / "roi" / str(path_id)
-            if base_roi_dir.exists() and base_roi_dir.is_dir() and not new_roi_dir.exists():
-                new_roi_dir.mkdir(parents=True, exist_ok=True)
-                roi_copied = 0
-                for f in base_roi_dir.iterdir():
-                    if f.is_file() and not f.name.startswith("fp_"):
-                        shutil.copy2(str(f), str(new_roi_dir / f.name))
-                        roi_copied += 1
-                logger.info(f"path_id={path_id}: Copied {roi_copied} normal ROI images from base to {new_roi_dir}")
-
-            # 解码 False Positive 图片
-            # FP 图片已经是 ROI，直接保存到 roi/{path_id}/ 目录
-            fp_images: List[np.ndarray] = []
-            if group.false_positive_images:
-                # ROI 目录：roi/{path_id}/
-                new_roi_dir = train_base_dir / "roi" / str(path_id)
-                new_roi_dir.mkdir(parents=True, exist_ok=True)
-
-                for idx, img_b64 in enumerate(group.false_positive_images):
-                    try:
-                        img_data = base64.b64decode(img_b64)
-                        nparr = np.frombuffer(img_data, np.uint8)
-                        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                        if img is not None:
-                            fp_images.append(img)
-                            cv2.imwrite(str(new_roi_dir / f"fp_{idx:04d}.jpg"), img)
-                            logger.info(f"Saved FP ROI to {new_roi_dir / f'fp_{idx:04d}.jpg'}")
-                    except Exception as e:
-                        logger.error(f"Failed to decode FP image[{idx}] for path_id={path_id}: {e}")
-
-            # 解码 False Negative 图片，同时记录每个图片的 pos_id
-            fn_images: List[Tuple[Image.Image, str]] = []  # (image, pos_id)
-            fn_pos_ids = group.false_negative_pos_ids if group.false_negative_pos_ids else []
-            for idx, img_b64 in enumerate(group.false_negative_images):
-                try:
-                    img_data = base64.b64decode(img_b64)
-                    img = Image.open(io.BytesIO(img_data)).convert("RGB")
-                    pos_id = fn_pos_ids[idx] if idx < len(fn_pos_ids) else "unknown"
-                    fn_images.append((img, pos_id))
-                except Exception as e:
-                    logger.error(f"Failed to decode FN image[{idx}] for path_id={path_id}: {e}")
-
-            # ========== 保存 FN 图像到模型目录（用于 YOLO 训练） ==========
-            if fn_images:
-                fn_images_dir = new_model_dir / "fn_images"
-                batch_ts = int(time.time() * 1000) % 1000000  # 批次时间戳，避免多轮重训命名冲突
-                for idx, (fn_img, fn_pos_id) in enumerate(fn_images):
-                    pos_dir = fn_images_dir / str(fn_pos_id)
-                    pos_dir.mkdir(parents=True, exist_ok=True)
-                    try:
-                        fn_img.save(str(pos_dir / f"fn_{batch_ts}_{idx:04d}.jpg"), "JPEG", quality=95)
-                    except Exception as e:
-                        logger.error(f"Failed to save FN image for pos_id={fn_pos_id}: {e}")
-                logger.info(f"path_id={path_id}: Saved {len(fn_images)} FN images to {fn_images_dir}")
-
-            # ========== 保存 YOLO FP 图像到模型目录（用于 YOLO normal 类训练） ==========
-            yolo_fp_images: List[np.ndarray] = []
-            if group.yolo_false_positive_images:
-                yolo_fp_dir = new_model_dir / "yolo_fp_images"
-                batch_ts = int(time.time() * 1000) % 1000000
-                for idx, img_b64 in enumerate(group.yolo_false_positive_images):
-                    try:
-                        img_data = base64.b64decode(img_b64)
-                        nparr = np.frombuffer(img_data, np.uint8)
-                        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                        if img is not None:
-                            yolo_fp_images.append(img)
-                            yolo_fp_dir.mkdir(parents=True, exist_ok=True)
-                            cv2.imwrite(str(yolo_fp_dir / f"yolo_fp_{batch_ts}_{idx:04d}.jpg"), img)
-                    except Exception as e:
-                        logger.error(f"Failed to decode YOLO FP image[{idx}] for path_id={path_id}: {e}")
-                logger.info(f"path_id={path_id}: Saved {len(yolo_fp_images)} YOLO FP images to {yolo_fp_dir}")
-
-            # ========== YOLO 重训 ==========
-            if fp_images or fn_images or yolo_fp_images:
-                logger.info(f"path_id={path_id}: Retraining YOLO ({len(fp_images)} FP + {len(fn_images)} FN + {len(yolo_fp_images)} YOLO FP)")
-
-                train_config = {
-                    "model_name": "YOLO",
-                    "project_id": request.project_id,
-                    "task_uuid": new_task_uuid,
-                    "path_id": path_id,
-                    "train_mode": base_config.get("train_mode", "by_category"),
-                    "category": base_config.get("category", ""),
-                    "category_label": base_config.get("category_label", "unknown"),
-                    "yolo_epochs": request.yolo_epochs or base_config.get("yolo_epochs", 100),
-                    "yolo_batch": request.yolo_batch or base_config.get("yolo_batch", 16),
-                    "yolo_imgsz": request.yolo_imgsz or base_config.get("yolo_imgsz", 320),
-                    "normalize_brightness": base_config.get("normalize_brightness", False),
-                    "normalize_contrast": base_config.get("normalize_contrast", False),
-                    "base_model_dir": str(base_model_dir),
-                    "synthetic_defects": True,
-                    "augmentation_config": str(PROJECT_ROOT / "configs" / "augmentations.yaml"),
-                }
-
-                path_group_id = f"retrain_{int(time.time())}_{path_id}"
-                path_task_ids, _ = trainer.run_batch_training_async(
-                    str(train_base_dir),
-                    train_config,
-                    {path_id: []},
-                    group_id=path_group_id,
-                )
-                all_task_ids.extend(path_task_ids)
-                total_fp += len(fp_images)
-                total_fn += len(fn_images)
-                total_yolo_fp += len(yolo_fp_images)
-            else:
-                # 既没有 FP 也没有 FN，直接复制原模型
-                logger.info(f"path_id={path_id}: No FP/FN data, copying model from base version")
-                path_task_ids = []
-                for file_name in ["model.ckpt", "dinomaly_model.pt", "config.json"]:
-                    src_file = base_model_dir / file_name
-                    if src_file.exists():
-                        shutil.copy2(str(src_file), str(new_model_dir / file_name))
-
-                # 复制 yolo_model.pt（如果基础模型有）
-                yolo_src = base_model_dir / "yolo_model.pt"
-                if yolo_src.exists():
-                    shutil.copy2(str(yolo_src), str(new_model_dir / "yolo_model.pt"))
-
-                # 复制 template_variants 目录
-                template_variants_src = base_model_dir / "template_variants"
-                if template_variants_src.exists() and template_variants_src.is_dir():
-                    template_variants_dst = new_model_dir / "template_variants"
-                    if template_variants_dst.exists():
-                        shutil.rmtree(str(template_variants_dst))
-                    shutil.copytree(str(template_variants_src), str(template_variants_dst))
-
-            total_fn += len(fn_images)
-            total_yolo_fp += len(yolo_fp_images)
-
-            # 构建 group_ids 列表（用于前端轮询组状态）
-            path_group_ids = []
-            if path_task_ids:
-                path_group_ids.append(path_group_id)
-
-            results.append({
-                "path_id": path_id,
-                "status": "success",
-                "num_fp": len(fp_images),
-                "num_fn": len(fn_images),
-                "num_yolo_fp": len(yolo_fp_images),
-                "fp_task_ids": path_task_ids,
-                "task_ids": path_task_ids,
-                "group_ids": path_group_ids,
-            })
-
-        except Exception as e:
-            logger.error(f"Failed to process path_id={path_id}: {e}", exc_info=True)
-            results.append({
-                "path_id": path_id,
-                "status": "error",
-                "message": str(e)
-            })
-
-    return {
-        "status": "success",
-        "project_id": request.project_id,
-        "base_task_uuid": request.base_task_uuid,
-        "new_task_uuid": new_task_uuid,
-        "total_fp": total_fp,
-        "total_fn": total_fn,
-        "total_yolo_fp": total_yolo_fp,
-        "task_ids": all_task_ids,
-        "results": results,
-        "message": f"Retraining completed. Total path_ids: {len(results)}, FP: {total_fp}, FN: {total_fn}, YOLO_FP: {total_yolo_fp}",
     }
 
 
@@ -1346,6 +994,82 @@ async def delete_project_model(
         raise HTTPException(status_code=500, detail=f"Failed to delete model: {e}")
 
 
+class DeleteTaskRequest(BaseModel):
+    task_uuids: List[str]
+
+
+@app.delete("/project/{project_id}/tasks")
+async def delete_project_task(
+    project_id: str,
+    request: DeleteTaskRequest,
+):
+    """批量删除任务文件夹（由前端明确指定 task_uuid 列表），包括 output（模型）和 product（训练数据）"""
+    results = []
+    all_deleted_paths = []
+
+    for task_uuid in request.task_uuids:
+        deleted_paths = []
+        error = None
+
+        # ── 1. 检查并清理关联的部署服务 ──
+        if task_uuid in http_deployer.uuid_index:
+            service_id = http_deployer.uuid_index[task_uuid]
+            try:
+                http_deployer.delete_service(service_id)
+                logger.info(f"Deleted deployed service {service_id} for task_uuid={task_uuid}")
+            except Exception as e:
+                logger.warning(f"Failed to delete service {service_id}: {e}")
+
+        # ── 2. 删除 output 目录 ──
+        output_path = path_config.output_dir / str(project_id) / task_uuid
+        if output_path.exists():
+            try:
+                shutil.rmtree(str(output_path))
+                deleted_paths.append(str(output_path))
+                # 清理空的 project 父目录
+                output_parent = output_path.parent
+                if output_parent.exists() and not any(output_parent.iterdir()):
+                    shutil.rmtree(str(output_parent))
+            except Exception as e:
+                error = f"Failed to delete output directory: {e}"
+
+        # ── 3. 删除 product 目录（训练数据） ──
+        product_path = path_config.product_dir / str(project_id) / "train" / task_uuid
+        if product_path.exists():
+            try:
+                shutil.rmtree(str(product_path))
+                deleted_paths.append(str(product_path))
+                # 清理空的 train 父目录
+                product_parent = product_path.parent
+                if product_parent.exists() and not any(product_parent.iterdir()):
+                    shutil.rmtree(str(product_parent))
+            except Exception as e:
+                if not error:
+                    error = f"Failed to delete product directory: {e}"
+
+        if not deleted_paths and not error:
+            error = "Task folder not found"
+
+        results.append({
+            "task_uuid": task_uuid,
+            "success": error is None,
+            "deleted_paths": deleted_paths,
+            "error": error,
+        })
+        all_deleted_paths.extend(deleted_paths)
+
+    success_count = sum(1 for r in results if r["success"])
+    fail_count = len(results) - success_count
+
+    return {
+        "success": fail_count == 0,
+        "message": f"{success_count} tasks deleted, {fail_count} failed",
+        "total": len(results),
+        "deleted_paths": all_deleted_paths,
+        "results": results,
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 部署接口
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1419,15 +1143,6 @@ async def get_http_service(service_id: str):
         raise HTTPException(status_code=404, detail="服务不存在")
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/deploy/http/service/{service_id}/stop")
-async def stop_http_service(service_id: str):
-    try:
-        result = http_deployer.stop_service(service_id)
-        return {"success": True, "message": f"服务已停止: {service_id}", "result": result}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
